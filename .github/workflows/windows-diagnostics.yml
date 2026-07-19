@@ -1,4 +1,4 @@
-name: Temporary Windows Diagnostics
+name: Remove Temporary Windows Diagnostics
 
 on:
   push:
@@ -8,28 +8,18 @@ permissions:
   contents: write
 
 jobs:
-  capture:
+  cleanup:
     if: github.actor != 'github-actions[bot]'
-    runs-on: windows-2025
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: bootstrap/csv-mvp
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - name: Capture final Windows workspace diagnostics
-        shell: pwsh
+      - name: Remove temporary Windows diagnostic files
+        shell: bash
         run: |
-          $ErrorActionPreference = 'Continue'
-          $PSNativeCommandUseErrorActionPreference = $false
-          cargo clippy --workspace --all-targets -- -D warnings *> diagnostics-full.txt
-          $status = $LASTEXITCODE
-          Get-Content diagnostics-full.txt -Tail 220 | Set-Content windows-diagnostics.txt
-          Set-Content windows-diagnostics-status.txt $status
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add windows-diagnostics.txt windows-diagnostics-status.txt
-          git commit -m "chore: capture Windows diagnostics"
+          git rm .github/workflows/windows-diagnostics.yml windows-diagnostics.txt windows-diagnostics-status.txt
+          git commit -m "chore: remove temporary Windows diagnostics"
           git push origin HEAD:bootstrap/csv-mvp
-          exit 0
