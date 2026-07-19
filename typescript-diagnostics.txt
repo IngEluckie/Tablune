@@ -6,6 +6,3 @@
 > @tablune/desktop@0.1.0 check /home/runner/work/Tablune/Tablune/apps/desktop
 > tsc -b --pretty false
 
-src/main.tsx(4,8): error TS2882: Cannot find module or type declarations for side-effect import of './styles.css'.
- ELIFECYCLE  Command failed with exit code 1.
- ELIFECYCLE  Command failed with exit code 1.
