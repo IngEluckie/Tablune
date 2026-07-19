@@ -18,7 +18,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Capture Windows workspace diagnostics
+      - name: Capture final Windows workspace diagnostics
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
