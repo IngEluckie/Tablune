@@ -1,4 +1,4 @@
-name: Temporary Diagnostics
+name: Remove Temporary Diagnostics
 
 on:
   push:
@@ -8,28 +8,18 @@ permissions:
   contents: write
 
 jobs:
-  capture:
+  cleanup:
     if: github.actor != 'github-actions[bot]'
-    runs-on: macos-14
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: bootstrap/csv-mvp
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - name: Capture workspace diagnostics
+      - name: Remove temporary diagnostic files
         shell: bash
         run: |
-          set +e
-          cargo clippy --workspace --all-targets -- -D warnings > diagnostics-full.txt 2>&1
-          status=$?
-          set -e
-          tail -n 160 diagnostics-full.txt > diagnostics.txt
-          printf '%s\n' "$status" > diagnostics-status.txt
-          rm diagnostics-full.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add diagnostics.txt diagnostics-status.txt
-          git commit -m "chore: capture workspace diagnostics"
+          git rm .github/workflows/diagnostics.yml diagnostics.txt diagnostics-status.txt
+          git commit -m "chore: remove temporary workspace diagnostics"
           git push origin HEAD:bootstrap/csv-mvp
