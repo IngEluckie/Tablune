@@ -1,4 +1,4 @@
-name: Clippy Capture
+name: Remove Temporary Diagnostics
 
 on:
   push:
@@ -8,26 +8,18 @@ permissions:
   contents: write
 
 jobs:
-  capture:
+  cleanup:
     if: github.actor != 'github-actions[bot]'
-    runs-on: macos-14
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: bootstrap/csv-mvp
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - name: Capture core Clippy output
+      - name: Remove temporary diagnostic files
         shell: bash
         run: |
-          set +e
-          cargo clippy -p tablune-core -p tablune-csv -p tablune-history --all-targets -- -D warnings > clippy-output.txt 2>&1
-          status=$?
-          set -e
-          printf '%s\n' "$status" > clippy-status.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add clippy-output.txt clippy-status.txt
-          git commit -m "chore: capture Clippy diagnostics"
+          git rm .github/workflows/clippy-capture.yml clippy-output.txt clippy-status.txt
+          git commit -m "chore: remove temporary Clippy diagnostics"
           git push origin HEAD:bootstrap/csv-mvp
