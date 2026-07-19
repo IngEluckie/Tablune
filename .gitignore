@@ -10,6 +10,7 @@ node_modules/
 
 # Tauri
 **/src-tauri/gen/
+apps/desktop/src-tauri/icons/icon.png
 
 # IDE and OS
 .DS_Store
