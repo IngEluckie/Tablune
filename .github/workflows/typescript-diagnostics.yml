@@ -1,0 +1,37 @@
+name: Temporary TypeScript Diagnostics
+
+on:
+  push:
+    branches: [bootstrap/csv-mvp]
+
+permissions:
+  contents: write
+
+jobs:
+  capture:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/csv-mvp
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.14.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: pnpm install --no-frozen-lockfile
+      - name: Capture TypeScript output
+        shell: bash
+        run: |
+          set +e
+          pnpm check > typescript-diagnostics.txt 2>&1
+          status=$?
+          set -e
+          printf '%s\n' "$status" > typescript-status.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add typescript-diagnostics.txt typescript-status.txt
+          git commit -m "chore: capture TypeScript diagnostics"
+          git push origin HEAD:bootstrap/csv-mvp
