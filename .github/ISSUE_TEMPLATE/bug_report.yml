@@ -1,0 +1,33 @@
+name: Bug report
+description: Report incorrect CSV behavior or a desktop application defect
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Include the expected behavior and the actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: sample
+    attributes:
+      label: Minimal CSV sample
+      description: Remove sensitive data. Attach or paste the smallest file that reproduces the problem.
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS Apple Silicon
+        - macOS Intel
+        - Windows 11
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Tablune version or commit
+    validations:
+      required: true
