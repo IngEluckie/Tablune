@@ -1,0 +1,19 @@
+[workspace]
+members = [
+  "apps/desktop/src-tauri",
+  "crates/tablune-core",
+  "crates/tablune-csv",
+  "crates/tablune-history",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+rust-version = "1.85"
+
+[workspace.dependencies]
+csv = "1.3"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"

@@ -1,0 +1,27 @@
+# Rust
+/target/
+**/target/
+
+# Node
+node_modules/
+**/node_modules/
+**/dist/
+.pnpm-store/
+
+# Tauri
+**/src-tauri/gen/
+apps/desktop/src-tauri/icons/icon.png
+apps/desktop/src-tauri/icons/icon.ico
+
+# IDE and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local files
+*.log
+*.tmp
+.env
+.env.*
+!.env.example

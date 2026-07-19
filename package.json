@@ -1,0 +1,11 @@
+{
+  "name": "tablune",
+  "private": true,
+  "packageManager": "pnpm@10.14.0",
+  "scripts": {
+    "dev": "pnpm --dir apps/desktop tauri dev",
+    "build": "pnpm --dir apps/desktop tauri build",
+    "check": "pnpm --dir apps/desktop check",
+    "frontend:build": "pnpm --dir apps/desktop build:web"
+  }
+}
