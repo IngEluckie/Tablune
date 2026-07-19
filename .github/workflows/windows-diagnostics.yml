@@ -1,0 +1,33 @@
+name: Temporary Windows Diagnostics
+
+on:
+  push:
+    branches: [bootstrap/csv-mvp]
+
+permissions:
+  contents: write
+
+jobs:
+  capture:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/csv-mvp
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Capture Windows workspace diagnostics
+        shell: pwsh
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings *> diagnostics-full.txt
+          $status = $LASTEXITCODE
+          Get-Content diagnostics-full.txt -Tail 180 | Set-Content windows-diagnostics.txt
+          Set-Content windows-diagnostics-status.txt $status
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add windows-diagnostics.txt windows-diagnostics-status.txt
+          git commit -m "chore: capture Windows diagnostics"
+          git push origin HEAD:bootstrap/csv-mvp
+          exit 0
