@@ -96,12 +96,16 @@ mod tests {
         assert!(previous.is_empty());
         assert_eq!(document.row_count(), 3);
         assert_eq!(document.column_count(), 4);
-        assert_eq!(document.cell(CellPosition { row: 2, column: 3 }), Some("value"));
+        assert_eq!(
+            document.cell(CellPosition { row: 2, column: 3 }),
+            Some("value")
+        );
     }
 
     #[test]
     fn ragged_rows_are_supported() {
-        let document = TableDocument::from_rows(vec![vec!["a".into()], vec!["b".into(), "c".into()]]);
+        let document =
+            TableDocument::from_rows(vec![vec!["a".into()], vec!["b".into(), "c".into()]]);
         assert_eq!(document.column_count(), 2);
     }
 }
