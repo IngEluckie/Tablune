@@ -1,4 +1,4 @@
-name: Temporary TypeScript Diagnostics
+name: Remove Temporary TypeScript Diagnostics
 
 on:
   push:
@@ -8,30 +8,18 @@ permissions:
   contents: write
 
 jobs:
-  capture:
+  cleanup:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: bootstrap/csv-mvp
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10.14.0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - run: pnpm install --no-frozen-lockfile
-      - name: Capture TypeScript output
+      - name: Remove temporary TypeScript diagnostic files
         shell: bash
         run: |
-          set +e
-          pnpm check > typescript-diagnostics.txt 2>&1
-          status=$?
-          set -e
-          printf '%s\n' "$status" > typescript-status.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add typescript-diagnostics.txt typescript-status.txt
-          git commit -m "chore: capture TypeScript diagnostics"
+          git rm .github/workflows/typescript-diagnostics.yml typescript-diagnostics.txt typescript-status.txt
+          git commit -m "chore: remove temporary TypeScript diagnostics"
           git push origin HEAD:bootstrap/csv-mvp
