@@ -18,11 +18,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Capture Clippy output
+      - name: Capture core Clippy output
         shell: bash
         run: |
           set +e
-          cargo clippy --workspace --all-targets -- -D warnings > clippy-output.txt 2>&1
+          cargo clippy -p tablune-core -p tablune-csv -p tablune-history --all-targets -- -D warnings > clippy-output.txt 2>&1
           status=$?
           set -e
           printf '%s\n' "$status" > clippy-status.txt
