@@ -1,8 +1,0 @@
-
-> tablune@ check /home/runner/work/Tablune/Tablune
-> pnpm --dir apps/desktop check
-
-
-> @tablune/desktop@0.1.0 check /home/runner/work/Tablune/Tablune/apps/desktop
-> tsc -b --pretty false
-
