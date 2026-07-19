@@ -18,10 +18,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Capture Windows workspace diagnostics
+      - name: Capture Windows CSV diagnostics
         shell: pwsh
         run: |
-          cargo clippy --workspace --all-targets -- -D warnings *> diagnostics-full.txt
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          cargo clippy -p tablune-csv --all-targets -- -D warnings *> diagnostics-full.txt
           $status = $LASTEXITCODE
           Get-Content diagnostics-full.txt -Tail 180 | Set-Content windows-diagnostics.txt
           Set-Content windows-diagnostics-status.txt $status
