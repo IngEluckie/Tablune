@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tablune_core::TableDocument;
 use thiserror::Error;
 
-const DELIMITER_CANDIDATES: [u8; 4] = [b',', b';', b'\t', b'|'];
+const DELIMITER_CANDIDATES: [u8; 4] = *b",;\t|";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
