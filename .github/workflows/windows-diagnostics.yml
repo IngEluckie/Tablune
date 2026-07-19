@@ -18,14 +18,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Capture Windows CSV diagnostics
+      - name: Capture Windows workspace diagnostics
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
           $PSNativeCommandUseErrorActionPreference = $false
-          cargo clippy -p tablune-csv --all-targets -- -D warnings *> diagnostics-full.txt
+          cargo clippy --workspace --all-targets -- -D warnings *> diagnostics-full.txt
           $status = $LASTEXITCODE
-          Get-Content diagnostics-full.txt -Tail 180 | Set-Content windows-diagnostics.txt
+          Get-Content diagnostics-full.txt -Tail 220 | Set-Content windows-diagnostics.txt
           Set-Content windows-diagnostics-status.txt $status
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
