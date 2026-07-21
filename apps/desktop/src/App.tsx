@@ -1,6 +1,7 @@
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { useMemo, useState } from "react";
 import CsvGrid from "./CsvGrid";
+import RibbonHeader from "./RibbonHeader";
 import { readCsvDocument, writeCsvDocument } from "./ipc";
 import type { CsvPayload } from "./types";
 
@@ -94,44 +95,21 @@ export default function App() {
 
   return (
     <main className="app-shell">
-      <header className="titlebar">
-        <div className="brand-mark" aria-hidden="true">T</div>
-        <div className="brand-name"><strong>Tablune</strong> Sheets</div>
-        <div className="document-name">{dirty ? "• " : ""}{fileName(path)}</div>
-      </header>
-
-      <nav className="menu-tabs" aria-label="Application sections">
-        <button className="menu-tab active">File</button>
-        <button className="menu-tab">Edit</button>
-        <button className="menu-tab">Data</button>
-        <button className="menu-tab">View</button>
-        <span className="menu-spacer" />
-        <span className="mvp-badge">CSV MVP</span>
-      </nav>
-
-      <section className="toolbar" aria-label="Document actions">
-        <button onClick={createNew} disabled={busy}>New</button>
-        <button onClick={openDocument} disabled={busy}>Open</button>
-        <button onClick={() => void saveDocument(false)} disabled={busy}>Save</button>
-        <button onClick={() => void saveDocument(true)} disabled={busy}>Save As</button>
-        <span className="toolbar-divider" />
-        <label>
-          Delimiter
-          <select
-            value={document.delimiter}
-            onChange={(event) => {
-              setDocument((current) => ({ ...current, delimiter: event.target.value }));
-              setDirty(true);
-            }}
-          >
-            <option value=",">Comma</option>
-            <option value=";">Semicolon</option>
-            <option value={"\t"}>Tab</option>
-            <option value="|">Pipe</option>
-          </select>
-        </label>
-        <span className="status-message">{busy ? "Working…" : error ?? "Ready"}</span>
-      </section>
+      <RibbonHeader
+        documentName={fileName(path)}
+        dirty={dirty}
+        busy={busy}
+        error={error}
+        delimiter={document.delimiter}
+        onNew={createNew}
+        onOpen={() => void openDocument()}
+        onSave={() => void saveDocument(false)}
+        onSaveAs={() => void saveDocument(true)}
+        onDelimiterChange={(delimiter) => {
+          setDocument((current) => ({ ...current, delimiter }));
+          setDirty(true);
+        }}
+      />
 
       <CsvGrid rows={document.rows} onCellChange={updateCell} />
 
