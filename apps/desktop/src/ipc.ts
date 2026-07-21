@@ -54,3 +54,4 @@ export const writeSessionRecovery = () => invoke<void>("session_write_recovery")
 export const recoveryAvailable = () => invoke<boolean>("session_recovery_available");
 export const restoreRecovery = () => invoke<DocumentSummary>("session_restore_recovery");
 export const discardRecovery = () => invoke<void>("session_discard_recovery");
+export const exitApplication = () => invoke<void>("exit_application");

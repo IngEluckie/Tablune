@@ -80,6 +80,11 @@ fn rename_csv_document(path: String, new_name: String) -> Result<String, String>
     Ok(destination.to_string_lossy().into_owned())
 }
 
+#[tauri::command]
+fn exit_application(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -89,6 +94,7 @@ pub fn run() {
             read_csv_document,
             write_csv_document,
             rename_csv_document,
+            exit_application,
             session::session_summary,
             session::session_new,
             session::session_open,

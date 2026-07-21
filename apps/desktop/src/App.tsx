@@ -8,6 +8,7 @@ import RibbonHeader from "./RibbonHeader";
 import {
   applySessionEdit,
   discardRecovery,
+  exitApplication,
   exportSessionView,
   getSessionSummary,
   newSession,
@@ -68,7 +69,7 @@ export default function App() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [explorerOpen, setExplorerOpen] = useState(false);
   const [reveal, setReveal] = useState<{ viewRow: number; column: number; nonce: number } | null>(null);
-  const closingAllowed = useRef(false);
+  const closingInProgress = useRef(false);
   const lastRecovery = useRef(0);
 
   const handleError = useCallback((message: string) => setError(message), []);
@@ -148,16 +149,23 @@ export default function App() {
     const appWindow = getCurrentWindow();
     let unlisten: (() => void) | undefined;
     void appWindow.onCloseRequested(async (event) => {
-      if (closingAllowed.current || !summary.dirty) return;
       event.preventDefault();
-      const completed = await protectChanges(async () => {});
-      if (completed) {
-        closingAllowed.current = true;
-        await appWindow.close();
+      if (closingInProgress.current) return;
+      closingInProgress.current = true;
+      try {
+        const completed = await protectChanges(async () => {});
+        if (!completed) {
+          closingInProgress.current = false;
+          return;
+        }
+        await exitApplication();
+      } catch (reason) {
+        closingInProgress.current = false;
+        setError(String(reason));
       }
     }).then((dispose) => { unlisten = dispose; });
     return () => unlisten?.();
-  }, [protectChanges, summary.dirty]);
+  }, [protectChanges]);
 
   useEffect(() => {
     const handleShortcuts = (event: globalThis.KeyboardEvent) => {
