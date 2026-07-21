@@ -4,7 +4,7 @@ Tablune Sheets is a performance-first desktop CSV editor built with Rust, Tauri,
 
 The initial release targets macOS for development and validation, while preserving a cross-platform architecture for Windows 11.
 
-## MVP scope
+## Current scope (0.3)
 
 - Create a new CSV document
 - Open and inspect UTF-8 CSV, TSV, and semicolon-delimited files
@@ -14,6 +14,12 @@ The initial release targets macOS for development and validation, while preservi
 - Undo and redo edits
 - Save and Save As without silently coercing textual values
 - Detect and retain the delimiter and line-ending convention when practical
+- Find and replace values with document, range, and cell scopes
+- Suggest and persist a non-destructive header row
+- Protect unsaved work and restore a recovery snapshot after an unexpected exit
+- Sort and filter without mutating the source document
+- Explore facets, inferred column types, and column quality profiles
+- Export the current view or explicitly apply a sort to the document
 
 The MVP deliberately excludes formulas, cell formatting, multiple worksheets, and XLSX support.
 
@@ -52,4 +58,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Current milestone
 
-The first milestone is a macOS application that can create, open, edit, save, close, and reopen a CSV file without altering its textual cell values. Exact byte-for-byte preservation of the original quoting layout is not an MVP guarantee; saved files are normalized into valid CSV using the detected dialect.
+Tablune 0.3 is a trustworthy CSV editor and non-destructive data explorer. Rust owns the document session and sends windowed grid data to React, keeping the browser layer independent of total row count. Exact byte-for-byte preservation of the original quoting layout is not guaranteed; saved files are normalized into valid CSV using the detected dialect.

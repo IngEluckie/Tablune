@@ -23,10 +23,29 @@ interface RibbonHeaderProps {
   busy: boolean;
   error: string | null;
   delimiter: string;
+  headerEnabled: boolean;
+  canUndo: boolean;
+  canRedo: boolean;
+  canChangeRows: boolean;
+  hasView: boolean;
   onNew: () => void;
   onOpen: () => void;
   onSave: () => void;
   onSaveAs: () => void;
+  onExportView: () => void;
+  onUndo: () => void;
+  onRedo: () => void;
+  onCut: () => void;
+  onCopy: () => void;
+  onPaste: () => void;
+  onInsertRow: () => void;
+  onDeleteRow: () => void;
+  onInsertColumn: () => void;
+  onDeleteColumn: () => void;
+  onFind: () => void;
+  onHeaderChange: (enabled: boolean) => void;
+  onToggleExplorer: () => void;
+  onClearView: () => void;
   onDelimiterChange: (delimiter: string) => void;
   onDocumentNameCommit: (documentName: string) => Promise<boolean>;
 }
@@ -53,10 +72,29 @@ export default function RibbonHeader({
   busy,
   error,
   delimiter,
+  headerEnabled,
+  canUndo,
+  canRedo,
+  canChangeRows,
+  hasView,
   onNew,
   onOpen,
   onSave,
   onSaveAs,
+  onExportView,
+  onUndo,
+  onRedo,
+  onCut,
+  onCopy,
+  onPaste,
+  onInsertRow,
+  onDeleteRow,
+  onInsertColumn,
+  onDeleteColumn,
+  onFind,
+  onHeaderChange,
+  onToggleExplorer,
+  onClearView,
   onDelimiterChange,
   onDocumentNameCommit,
 }: RibbonHeaderProps) {
@@ -230,17 +268,20 @@ export default function RibbonHeader({
                 <button onClick={onOpen} disabled={busy}>Open</button>
                 <button onClick={onSave} disabled={busy}>Save</button>
                 <button onClick={onSaveAs} disabled={busy}>Save As</button>
+                <button onClick={onExportView} disabled={busy}>Export View</button>
               </div>
             )}
 
             {activeMenu === "edit" && (
               <div className="ribbon-group" aria-label="Edit actions">
-                <button disabled>Undo</button>
-                <button disabled>Redo</button>
+                <button onClick={onUndo} disabled={busy || !canUndo}>Undo</button>
+                <button onClick={onRedo} disabled={busy || !canRedo}>Redo</button>
                 <span className="ribbon-divider" aria-hidden="true" />
-                <button disabled>Cut</button>
-                <button disabled>Copy</button>
-                <button disabled>Paste</button>
+                <button onClick={onCut} disabled={busy}>Cut</button>
+                <button onClick={onCopy} disabled={busy}>Copy</button>
+                <button onClick={onPaste} disabled={busy}>Paste</button>
+                <span className="ribbon-divider" aria-hidden="true" />
+                <button onClick={onFind}>Find</button>
               </div>
             )}
 
@@ -259,19 +300,22 @@ export default function RibbonHeader({
                   </select>
                 </label>
                 <span className="ribbon-divider" aria-hidden="true" />
-                <button disabled>Insert Row</button>
-                <button disabled>Delete Row</button>
-                <button disabled>Insert Column</button>
-                <button disabled>Delete Column</button>
+                <button onClick={onInsertRow} disabled={busy || !canChangeRows}>Insert Row</button>
+                <button onClick={onDeleteRow} disabled={busy || !canChangeRows}>Delete Row</button>
+                <button onClick={onInsertColumn} disabled={busy}>Insert Column</button>
+                <button onClick={onDeleteColumn} disabled={busy}>Delete Column</button>
+                <span className="ribbon-divider" aria-hidden="true" />
+                <button onClick={onToggleExplorer}>Explore</button>
+                <button onClick={onClearView} disabled={!hasView}>Clear View</button>
               </div>
             )}
 
             {activeMenu === "view" && (
               <div className="ribbon-group" aria-label="View actions">
-                <button disabled aria-label="Zoom out">−</button>
-                <button disabled>100%</button>
-                <button disabled aria-label="Zoom in">+</button>
+                <label className="ribbon-check"><input type="checkbox" checked={headerEnabled} onChange={(event) => onHeaderChange(event.target.checked)} /> First row is header</label>
                 <span className="ribbon-divider" aria-hidden="true" />
+                <button onClick={onFind}>Find</button>
+                <button onClick={onToggleExplorer}>Data Explorer</button>
                 <button disabled>Fit Columns</button>
               </div>
             )}

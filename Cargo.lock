@@ -2926,14 +2926,14 @@ dependencies = [
 
 [[package]]
 name = "tablune-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "tablune-csv"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "csv",
  "serde",
@@ -2943,11 +2943,13 @@ dependencies = [
 
 [[package]]
 name = "tablune-desktop"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "serde",
+ "serde_json",
  "tablune-core",
  "tablune-csv",
+ "tablune-history",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -2955,7 +2957,7 @@ dependencies = [
 
 [[package]]
 name = "tablune-history"
-version = "0.1.0"
+version = "0.3.0"
 
 [[package]]
 name = "tao"

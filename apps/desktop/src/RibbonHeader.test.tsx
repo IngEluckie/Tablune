@@ -10,10 +10,29 @@ const defaultProps = {
   busy: false,
   error: null,
   delimiter: ",",
+  headerEnabled: false,
+  canUndo: false,
+  canRedo: false,
+  canChangeRows: true,
+  hasView: false,
   onNew: vi.fn(),
   onOpen: vi.fn(),
   onSave: vi.fn(),
   onSaveAs: vi.fn(),
+  onExportView: vi.fn(),
+  onUndo: vi.fn(),
+  onRedo: vi.fn(),
+  onCut: vi.fn(),
+  onCopy: vi.fn(),
+  onPaste: vi.fn(),
+  onInsertRow: vi.fn(),
+  onDeleteRow: vi.fn(),
+  onInsertColumn: vi.fn(),
+  onDeleteColumn: vi.fn(),
+  onFind: vi.fn(),
+  onHeaderChange: vi.fn(),
+  onToggleExplorer: vi.fn(),
+  onClearView: vi.fn(),
   onDelimiterChange: vi.fn(),
   onDocumentNameCommit: vi.fn().mockResolvedValue(true),
 };
@@ -70,15 +89,15 @@ describe("RibbonHeader", () => {
     expect(window.localStorage.getItem("tablune.ribbonPinned")).toBe("false");
   });
 
-  it("switches contextual content and keeps future commands disabled", () => {
+  it("switches contextual content and exposes implemented commands", () => {
     render(<RibbonHeader {...defaultProps} />);
 
     fireEvent.mouseEnter(screen.getByRole("button", { name: "Edit" }));
     expect((screen.getByRole("button", { name: "Undo" }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole("button", { name: "Paste" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Paste" }) as HTMLButtonElement).disabled).toBe(false);
 
     fireEvent.mouseEnter(screen.getByRole("button", { name: "Data" }));
-    expect((screen.getByRole("button", { name: "Insert Row" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Insert Row" }) as HTMLButtonElement).disabled).toBe(false);
     fireEvent.change(screen.getByRole("combobox", { name: "Delimiter" }), {
       target: { value: ";" },
     });

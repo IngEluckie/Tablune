@@ -1,8 +1,8 @@
-# CSV MVP product scope
+# CSV editor and explorer product scope
 
 ## Product statement
 
-Tablune Sheets 0.1 is a desktop editor for creating, viewing, and editing delimited text files. It is not yet a general spreadsheet application.
+Tablune Sheets 0.3 is a desktop editor and non-destructive explorer for delimited text files. It is not a general spreadsheet application.
 
 ## Included
 
@@ -18,6 +18,13 @@ Tablune Sheets 0.1 is a desktop editor for creating, viewing, and editing delimi
 - Unsaved-change indication
 - Delimiter and line-ending detection
 - UTF-8 and UTF-8 BOM input
+- Continuous range and whole row/column selection
+- Find and replace
+- Optional first-row headers
+- Unsaved-change protection and crash recovery
+- Stable multi-column sorting and typed filters
+- Facets, inferred types, and column profiles
+- Export current view and apply sort explicitly
 
 ## Excluded
 
@@ -31,4 +38,4 @@ Tablune Sheets 0.1 is a desktop editor for creating, viewing, and editing delimi
 
 ## Acceptance criterion
 
-On macOS, a user can create a document, enter values, save it as CSV, close it, reopen it, edit it, and save it again without losing or coercing textual cell values.
+On macOS, a user can safely edit and recover a CSV, inspect up to 100,000 rows through a windowed canvas, create non-destructive views, and export results without losing or coercing textual cell values.

@@ -22,11 +22,11 @@ crates/tablune-csv
   Dialect detection, reader, writer, safe replacement
 
 crates/tablune-history
-  Undo and redo state transitions
+  Bounded transaction history and state checkpoints
 ```
 
 ## Performance direction
 
-The first implementation loads the complete document into memory. That is intentional for correctness and iteration speed. The public APIs must remain compatible with later row indexing, streaming reads, and patch-based edits for larger files.
+Rust keeps the complete CSV document in memory while the frontend requests bounded `GridWindow` slices. Edits are revision-checked transactions with compact inverse operations; the frontend never receives the entire document.
 
-The canvas grid renders only visible cells. CSV parsing and serialization stay in Rust. Before advertising large-file support, benchmarks must define realistic limits on Apple Silicon and Windows 11 hardware.
+Sorting and filtering create a derived row index keyed by stable internal row identifiers. The canvas renders only visible cells, and facets and profiles are calculated in Rust. The current validation target is 100,000 rows by 50 columns on Apple Silicon; streaming input and million-row files remain future work.

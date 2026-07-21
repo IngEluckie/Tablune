@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use tablune_core::TableDocument;
 use tablune_csv::{CsvDialect, LineEnding};
 
+mod session;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CsvPayload {
@@ -82,10 +84,32 @@ fn rename_csv_document(path: String, new_name: String) -> Result<String, String>
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(session::SessionState::default())
         .invoke_handler(tauri::generate_handler![
             read_csv_document,
             write_csv_document,
-            rename_csv_document
+            rename_csv_document,
+            session::session_summary,
+            session::session_new,
+            session::session_open,
+            session::session_save,
+            session::session_rename,
+            session::session_grid_window,
+            session::session_apply_edit,
+            session::session_undo,
+            session::session_redo,
+            session::session_set_view,
+            session::session_set_header,
+            session::session_set_column_type,
+            session::session_search,
+            session::session_replace,
+            session::session_column_profile,
+            session::session_facets,
+            session::session_export_view,
+            session::session_write_recovery,
+            session::session_recovery_available,
+            session::session_restore_recovery,
+            session::session_discard_recovery
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tablune Sheets");

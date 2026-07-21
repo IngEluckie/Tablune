@@ -18,7 +18,9 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 serde.workspace = true
+serde_json = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tablune-core = { path = "../../../crates/tablune-core" }
 tablune-csv = { path = "../../../crates/tablune-csv" }
+tablune-history = { path = "../../../crates/tablune-history" }
