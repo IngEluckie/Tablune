@@ -48,6 +48,16 @@ describe("RibbonHeader", () => {
     vi.useRealTimers();
   });
 
+  it("shows the official Tablune Sheets icon and wordmark", () => {
+    const { container } = render(<RibbonHeader {...defaultProps} />);
+
+    const brand = screen.getByRole("img", { name: "Tablune Sheets" });
+    expect(brand.querySelector(".compact-brand-icon")?.getAttribute("src")).toBe("/brand/tablune-icon.png");
+    expect(brand.querySelector(".compact-brand-wordmark")?.getAttribute("src")).toBe("/brand/tablune-wordmark.png");
+    expect(container.querySelector(".compact-brand-mark")).toBeNull();
+    expect(container.querySelector(".compact-brand-name")).toBeNull();
+  });
+
   it("opens from a menu hover and closes after leaving the top region", () => {
     vi.useFakeTimers();
     render(<RibbonHeader {...defaultProps} />);

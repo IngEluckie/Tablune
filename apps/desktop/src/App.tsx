@@ -125,7 +125,7 @@ export default function App() {
     void getSessionSummary().then((current) => { if (active) setSummary(current); }).catch((reason) => setError(String(reason)));
     void recoveryAvailable().then(async (available) => {
       if (!active || !available) return;
-      const restore = await ask("Tablune found unsaved work from the previous session. Restore it?", {
+      const restore = await ask("Tablune Sheets found unsaved work from the previous session. Restore it?", {
         title: "Recover document",
         kind: "info",
       });

@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="apps/desktop/public/brand/tablune-icon.png" alt="" width="128" />
+  <img src="apps/desktop/public/brand/tablune-wordmark.png" alt="Tablune Sheets" width="420" />
+</p>
+
 # Tablune Sheets
 
 Tablune Sheets is a performance-first desktop CSV editor built with Rust, Tauri, React, and TypeScript.

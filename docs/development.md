@@ -22,9 +22,9 @@ pnpm install
 pnpm dev
 ```
 
-## Bootstrap icon
+## Application icons
 
-Until the approved Tablune application icon assets are committed, the Rust build script creates a small temporary icon locally so Tauri development builds can compile on macOS and Windows. The generated file is ignored by Git and must be replaced before packaging a release.
+The approved Tablune Sheets assets are committed under `apps/desktop/public/brand`, and the platform-specific application icons live under `apps/desktop/src-tauri/icons`. Regenerate the latter from `tablune-icon.png` with the Tauri icon command whenever the master artwork changes.
 
 ## Commands
 

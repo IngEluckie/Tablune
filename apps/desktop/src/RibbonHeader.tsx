@@ -248,8 +248,22 @@ export default function RibbonHeader({
             </button>
           )}
           <span className="identity-divider" aria-hidden="true" />
-          <span className="compact-brand-mark" aria-hidden="true">T</span>
-          <span className="compact-brand-name"><strong>Tablune</strong> Sheets</span>
+          <span className="compact-brand-lockup" role="img" aria-label="Tablune Sheets">
+            <img
+              className="compact-brand-icon"
+              src="/brand/tablune-icon.png"
+              alt=""
+              draggable={false}
+            />
+            <span className="compact-brand-wordmark-frame" aria-hidden="true">
+              <img
+                className="compact-brand-wordmark"
+                src="/brand/tablune-wordmark.png"
+                alt=""
+                draggable={false}
+              />
+            </span>
+          </span>
         </div>
       </header>
 
