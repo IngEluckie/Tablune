@@ -15,6 +15,7 @@ const defaultProps = {
   canRedo: false,
   canChangeRows: true,
   hasView: false,
+  theme: "light" as const,
   onNew: vi.fn(),
   onOpen: vi.fn(),
   onSave: vi.fn(),
@@ -33,6 +34,7 @@ const defaultProps = {
   onHeaderChange: vi.fn(),
   onToggleExplorer: vi.fn(),
   onClearView: vi.fn(),
+  onThemeChange: vi.fn(),
   onDelimiterChange: vi.fn(),
   onDocumentNameCommit: vi.fn().mockResolvedValue(true),
 };
@@ -115,6 +117,19 @@ describe("RibbonHeader", () => {
 
     fireEvent.mouseEnter(screen.getByRole("button", { name: "View" }));
     expect((screen.getByRole("button", { name: "Fit Columns" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("reflects and changes the dark mode preference", () => {
+    const { rerender } = render(<RibbonHeader {...defaultProps} />);
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "View" }));
+
+    const darkMode = screen.getByRole("checkbox", { name: "Dark mode" });
+    expect((darkMode as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(darkMode);
+    expect(defaultProps.onThemeChange).toHaveBeenCalledWith("dark");
+
+    rerender(<RibbonHeader {...defaultProps} theme="dark" />);
+    expect((screen.getByRole("checkbox", { name: "Dark mode" }) as HTMLInputElement).checked).toBe(true);
   });
 
   it("preserves the working file actions", () => {

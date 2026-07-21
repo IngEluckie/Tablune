@@ -8,6 +8,7 @@ import {
   useState,
 } from "react";
 import { getGridWindow } from "./ipc";
+import { GRID_PALETTES, type ThemeMode } from "./theme";
 import type {
   CellCoordinate,
   DocumentSummary,
@@ -27,6 +28,7 @@ const WINDOW_OVERSCAN = 12;
 
 interface CsvGridProps {
   summary: DocumentSummary;
+  theme: ThemeMode;
   onApplyEdit: (command: EditCommand) => Promise<void>;
   onSelectionChange: (selection: SelectionRange) => void;
   onError: (message: string) => void;
@@ -122,7 +124,7 @@ async function writeClipboard(text: string): Promise<void> {
   if (!copied) throw new Error("Clipboard access is unavailable.");
 }
 
-export default function CsvGrid({ summary, onApplyEdit, onSelectionChange, onError, reveal, onHeaderSort }: CsvGridProps) {
+export default function CsvGrid({ summary, theme, onApplyEdit, onSelectionChange, onError, reveal, onHeaderSort }: CsvGridProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dragAnchor = useRef<GridTarget | null>(null);
@@ -201,20 +203,21 @@ export default function CsvGrid({ summary, onApplyEdit, onSelectionChange, onErr
     const firstRow = Math.max(0, Math.floor((viewport.scrollTop - COLUMN_HEADER_HEIGHT) / ROW_HEIGHT));
     const lastRow = Math.min(rowCount - 1, Math.ceil((viewport.scrollTop + height - COLUMN_HEADER_HEIGHT) / ROW_HEIGHT));
     const range = normalizeSelection(selection);
-    context.fillStyle = "#ffffff";
+    const palette = GRID_PALETTES[theme];
+    context.fillStyle = palette.background;
     context.fillRect(0, 0, width, height);
 
     for (let column = firstColumn; column <= lastColumn; column += 1) {
       const x = ROW_HEADER_WIDTH + column * COLUMN_WIDTH - viewport.scrollLeft;
       const selected = selection.mode === "columns" && column >= range.startColumn && column <= range.endColumn;
-      context.fillStyle = selected || column === selection.focus.column ? "#e7f4ec" : "#f5f6f7";
+      context.fillStyle = selected || column === selection.focus.column ? palette.activeHeader : palette.header;
       context.fillRect(x, 0, COLUMN_WIDTH, COLUMN_HEADER_HEIGHT);
-      context.fillStyle = "#3b4148";
+      context.fillStyle = palette.headerText;
       context.textAlign = "center";
       const label = summary.headerEnabled ? summary.headerNames[column] ?? columnName(column) : columnName(column);
       context.fillText(label, x + COLUMN_WIDTH / 2, COLUMN_HEADER_HEIGHT / 2);
       if (column < summary.headerNames.length) {
-        context.fillStyle = "#6d7a72";
+        context.fillStyle = palette.headerIcon;
         context.textAlign = "right";
         context.fillText("↕", x + COLUMN_WIDTH - 9, COLUMN_HEADER_HEIGHT / 2);
       }
@@ -223,9 +226,9 @@ export default function CsvGrid({ summary, onApplyEdit, onSelectionChange, onErr
     for (let row = firstRow; row <= lastRow; row += 1) {
       const y = COLUMN_HEADER_HEIGHT + row * ROW_HEIGHT - viewport.scrollTop;
       const rowSelected = selection.mode === "rows" && row >= range.startRow && row <= range.endRow;
-      context.fillStyle = rowSelected || row === selection.focus.row ? "#e7f4ec" : "#f7f8f9";
+      context.fillStyle = rowSelected || row === selection.focus.row ? palette.activeHeader : palette.header;
       context.fillRect(0, y, ROW_HEADER_WIDTH, ROW_HEIGHT);
-      context.fillStyle = "#5a6169";
+      context.fillStyle = palette.rowHeaderText;
       context.textAlign = "center";
       const sourceRow = cachedRow(row)?.sourceRow;
       context.fillText(String((sourceRow ?? row) + 1), ROW_HEADER_WIDTH / 2, y + ROW_HEIGHT / 2);
@@ -234,10 +237,10 @@ export default function CsvGrid({ summary, onApplyEdit, onSelectionChange, onErr
         const selected = row >= range.startRow && row <= range.endRow
           && column >= range.startColumn && column <= range.endColumn;
         if (selected) {
-          context.fillStyle = "#eef8f2";
+          context.fillStyle = palette.selectionFill;
           context.fillRect(x, y, COLUMN_WIDTH, ROW_HEIGHT);
         }
-        context.fillStyle = "#161a1f";
+        context.fillStyle = palette.cellText;
         context.textAlign = "left";
         context.save();
         context.beginPath();
@@ -248,7 +251,7 @@ export default function CsvGrid({ summary, onApplyEdit, onSelectionChange, onErr
       }
     }
 
-    context.strokeStyle = "#dfe3e7";
+    context.strokeStyle = palette.gridLine;
     context.lineWidth = 1;
     context.beginPath();
     for (let column = firstColumn; column <= lastColumn + 1; column += 1) {
@@ -269,7 +272,7 @@ export default function CsvGrid({ summary, onApplyEdit, onSelectionChange, onErr
 
     const selectedX = ROW_HEADER_WIDTH + range.startColumn * COLUMN_WIDTH - viewport.scrollLeft;
     const selectedY = COLUMN_HEADER_HEIGHT + range.startRow * ROW_HEIGHT - viewport.scrollTop;
-    context.strokeStyle = "#0f8a50";
+    context.strokeStyle = palette.selectionStroke;
     context.lineWidth = 2;
     context.strokeRect(
       selectedX + 1,
@@ -277,7 +280,7 @@ export default function CsvGrid({ summary, onApplyEdit, onSelectionChange, onErr
       (range.endColumn - range.startColumn + 1) * COLUMN_WIDTH - 2,
       (range.endRow - range.startRow + 1) * ROW_HEIGHT - 2,
     );
-  }, [cachedRow, columnCount, getCell, rowCount, selection, summary.headerEnabled, summary.headerNames]);
+  }, [cachedRow, columnCount, getCell, rowCount, selection, summary.headerEnabled, summary.headerNames, theme]);
 
   useLayoutEffect(() => {
     draw();

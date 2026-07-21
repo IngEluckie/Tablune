@@ -5,6 +5,7 @@ import CsvGrid, { normalizeSelection } from "./CsvGrid";
 import ExplorerPanel from "./ExplorerPanel";
 import SearchBar from "./SearchBar";
 import RibbonHeader from "./RibbonHeader";
+import { readThemePreference, writeThemePreference, type ThemeMode } from "./theme";
 import {
   applySessionEdit,
   discardRecovery,
@@ -68,11 +69,24 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [explorerOpen, setExplorerOpen] = useState(false);
+  const [theme, setTheme] = useState<ThemeMode>(readThemePreference);
   const [reveal, setReveal] = useState<{ viewRow: number; column: number; nonce: number } | null>(null);
   const closingInProgress = useRef(false);
   const lastRecovery = useRef(0);
 
   const handleError = useCallback((message: string) => setError(message), []);
+
+  const changeTheme = useCallback((nextTheme: ThemeMode) => {
+    setTheme(nextTheme);
+    writeThemePreference(nextTheme);
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.style.colorScheme = theme;
+    void getCurrentWindow().setTheme(theme).catch(() => {
+      // CSS theming remains available if native window theming is unsupported.
+    });
+  }, [theme]);
 
   const saveDocument = useCallback(async (saveAs = false, suggestedName?: string): Promise<boolean> => {
     try {
@@ -307,7 +321,7 @@ export default function App() {
   };
 
   return (
-    <main className="app-shell">
+    <main className="app-shell" data-theme={theme}>
       <RibbonHeader
         documentName={summary.displayName}
         dirty={summary.dirty}
@@ -319,6 +333,7 @@ export default function App() {
         canRedo={summary.canRedo}
         canChangeRows={!summary.filtersActive && summary.sortCount === 0}
         hasView={summary.filtersActive || summary.sortCount > 0}
+        theme={theme}
         onNew={createNew}
         onOpen={openDocument}
         onSave={() => void saveDocument(false)}
@@ -337,6 +352,7 @@ export default function App() {
         onHeaderChange={(enabled) => void setSessionHeader(enabled).then(setSummary).catch((reason) => setError(String(reason)))}
         onToggleExplorer={() => setExplorerOpen((open) => !open)}
         onClearView={() => void changeView(EMPTY_VIEW)}
+        onThemeChange={changeTheme}
         onDelimiterChange={(delimiter) => void applyEdit({ kind: "setDelimiter", delimiter })}
         onDocumentNameCommit={renameDocument}
       />
@@ -361,6 +377,7 @@ export default function App() {
         <div className={`workspace${explorerOpen ? " explorer-open" : ""}`}>
           <CsvGrid
             summary={summary}
+            theme={theme}
             onApplyEdit={applyEdit}
             onSelectionChange={setSelection}
             onError={handleError}

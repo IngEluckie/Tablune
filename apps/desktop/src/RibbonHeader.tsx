@@ -4,6 +4,7 @@ import {
   useRef,
   useState,
 } from "react";
+import type { ThemeMode } from "./theme";
 
 type MenuSection = "file" | "edit" | "data" | "view";
 
@@ -28,6 +29,7 @@ interface RibbonHeaderProps {
   canRedo: boolean;
   canChangeRows: boolean;
   hasView: boolean;
+  theme: ThemeMode;
   onNew: () => void;
   onOpen: () => void;
   onSave: () => void;
@@ -46,6 +48,7 @@ interface RibbonHeaderProps {
   onHeaderChange: (enabled: boolean) => void;
   onToggleExplorer: () => void;
   onClearView: () => void;
+  onThemeChange: (theme: ThemeMode) => void;
   onDelimiterChange: (delimiter: string) => void;
   onDocumentNameCommit: (documentName: string) => Promise<boolean>;
 }
@@ -77,6 +80,7 @@ export default function RibbonHeader({
   canRedo,
   canChangeRows,
   hasView,
+  theme,
   onNew,
   onOpen,
   onSave,
@@ -95,6 +99,7 @@ export default function RibbonHeader({
   onHeaderChange,
   onToggleExplorer,
   onClearView,
+  onThemeChange,
   onDelimiterChange,
   onDocumentNameCommit,
 }: RibbonHeaderProps) {
@@ -327,6 +332,8 @@ export default function RibbonHeader({
             {activeMenu === "view" && (
               <div className="ribbon-group" aria-label="View actions">
                 <label className="ribbon-check"><input type="checkbox" checked={headerEnabled} onChange={(event) => onHeaderChange(event.target.checked)} /> First row is header</label>
+                <span className="ribbon-divider" aria-hidden="true" />
+                <label className="ribbon-check"><input type="checkbox" checked={theme === "dark"} onChange={(event) => onThemeChange(event.target.checked ? "dark" : "light")} /> Dark mode</label>
                 <span className="ribbon-divider" aria-hidden="true" />
                 <button onClick={onFind}>Find</button>
                 <button onClick={onToggleExplorer}>Data Explorer</button>
