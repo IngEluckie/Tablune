@@ -2,7 +2,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { useMemo, useState } from "react";
 import CsvGrid from "./CsvGrid";
 import RibbonHeader from "./RibbonHeader";
-import { readCsvDocument, writeCsvDocument } from "./ipc";
+import { readCsvDocument, renameCsvDocument, writeCsvDocument } from "./ipc";
 import type { CsvPayload } from "./types";
 
 const EMPTY_DOCUMENT: CsvPayload = {
@@ -57,24 +57,57 @@ export default function App() {
     }
   };
 
-  const saveDocument = async (saveAs = false) => {
-    let destination = saveAs ? null : path;
-    if (!destination) {
-      destination = await save({
-        defaultPath: fileName(path),
-        filters: [{ name: "CSV", extensions: ["csv"] }],
-      });
+  const saveDocument = async (saveAs = false, suggestedName?: string): Promise<boolean> => {
+    try {
+      let destination = saveAs ? null : path;
+      if (!destination) {
+        destination = await save({
+          defaultPath: suggestedName ?? fileName(path),
+          filters: [{ name: "CSV", extensions: ["csv"] }],
+        });
+      }
+      if (!destination) return false;
+
+      setBusy(true);
+      setError(null);
+      await writeCsvDocument(destination, document);
+      setPath(destination);
+      setDirty(false);
+      return true;
+    } catch (reason) {
+      setError(String(reason));
+      return false;
+    } finally {
+      setBusy(false);
     }
-    if (!destination) return;
+  };
+
+  const renameDocument = async (nextName: string): Promise<boolean> => {
+    const normalizedName = nextName.trim();
+    if (
+      normalizedName.length === 0
+      || normalizedName === "."
+      || normalizedName === ".."
+      || normalizedName.includes("/")
+      || normalizedName.includes("\\")
+      || normalizedName.includes("\0")
+    ) {
+      setError("Enter a valid file name without folders.");
+      return false;
+    }
+
+    if (!path) return saveDocument(true, normalizedName);
+    if (normalizedName === fileName(path)) return true;
 
     setBusy(true);
     setError(null);
     try {
-      await writeCsvDocument(destination, document);
-      setPath(destination);
-      setDirty(false);
+      const renamedPath = await renameCsvDocument(path, normalizedName);
+      setPath(renamedPath);
+      return true;
     } catch (reason) {
       setError(String(reason));
+      return false;
     } finally {
       setBusy(false);
     }
@@ -109,6 +142,7 @@ export default function App() {
           setDocument((current) => ({ ...current, delimiter }));
           setDirty(true);
         }}
+        onDocumentNameCommit={renameDocument}
       />
 
       <CsvGrid rows={document.rows} onCellChange={updateCell} />

@@ -75,13 +75,33 @@ button { cursor: default; }
   margin-left: 16px;
 }
 .header-document {
+  min-width: 0;
   max-width: min(38vw, 440px);
+  padding: 4px 5px;
   overflow: hidden;
+  border: 1px solid transparent;
+  border-radius: 5px;
   color: rgba(255, 255, 255, 0.92);
+  background: transparent;
   font-size: 13px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.header-document:hover { border-color: rgba(255, 255, 255, 0.22); background: rgba(255, 255, 255, 0.08); }
+.header-document:focus-visible { outline: 2px solid rgba(255, 255, 255, 0.8); outline-offset: 1px; }
+.header-document-editor { display: flex; align-items: center; min-width: 0; }
+.header-document-editor input {
+  width: min(38vw, 300px);
+  height: 28px;
+  padding: 0 7px;
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  border-radius: 5px;
+  outline: none;
+  color: white;
+  background: rgba(2, 18, 79, 0.52);
+  font-size: 13px;
+}
+.header-document-editor input:focus { box-shadow: 0 0 0 2px rgba(121, 223, 165, 0.55); }
 .dirty-dot { margin-right: 6px; color: #8ae3ad; font-size: 9px; }
 .identity-divider { width: 1px; height: 20px; margin: 0 3px; background: rgba(255, 255, 255, 0.28); }
 .compact-brand-mark {

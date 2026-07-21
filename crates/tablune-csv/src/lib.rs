@@ -96,12 +96,17 @@ pub fn write_path(
 
     let mut writer = WriterBuilder::new()
         .has_headers(false)
+        .flexible(true)
         .delimiter(dialect.delimiter)
         .terminator(terminator)
         .from_writer(buffer);
 
     for row in document.rows() {
-        writer.write_record(row)?;
+        if row.is_empty() {
+            writer.write_record([""])?;
+        } else {
+            writer.write_record(row)?;
+        }
     }
 
     writer.flush()?;
@@ -191,7 +196,14 @@ fn replace_file(temporary_path: &Path, destination: &Path) -> Result<(), CsvErro
 
 #[cfg(test)]
 mod tests {
-    use super::{CsvDialect, LineEnding, read_bytes};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use tablune_core::{CellPosition, TableDocument};
+
+    use super::{CsvDialect, LineEnding, read_bytes, read_path, write_path};
 
     #[test]
     fn parses_quoted_delimiters_and_newlines() {
@@ -219,5 +231,29 @@ mod tests {
     fn strips_utf8_bom() {
         let file = read_bytes(b"\xEF\xBB\xBFa,b\n1,2\n").expect("CSV should parse");
         assert_eq!(file.document.rows()[0][0], "a");
+    }
+
+    #[test]
+    fn preserves_blank_rows_before_a_wide_sparse_row() {
+        let mut document = TableDocument::new();
+        document.set_cell(CellPosition { row: 3, column: 4 }, "Fads".into());
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("tablune-sparse-{unique}.csv"));
+
+        write_path(&path, &document, CsvDialect::default())
+            .expect("sparse document should be written");
+        let reopened = read_path(&path).expect("sparse document should reopen");
+
+        assert_eq!(reopened.document.row_count(), 4);
+        assert_eq!(
+            reopened.document.cell(CellPosition { row: 3, column: 4 }),
+            Some("Fads")
+        );
+
+        fs::remove_file(path).expect("temporary CSV should be removed");
     }
 }

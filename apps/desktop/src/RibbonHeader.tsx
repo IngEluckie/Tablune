@@ -28,6 +28,7 @@ interface RibbonHeaderProps {
   onSave: () => void;
   onSaveAs: () => void;
   onDelimiterChange: (delimiter: string) => void;
+  onDocumentNameCommit: (documentName: string) => Promise<boolean>;
 }
 
 function readPinnedPreference(): boolean {
@@ -57,12 +58,17 @@ export default function RibbonHeader({
   onSave,
   onSaveAs,
   onDelimiterChange,
+  onDocumentNameCommit,
 }: RibbonHeaderProps) {
   const [activeMenu, setActiveMenu] = useState<MenuSection>("file");
   const [pointerOpen, setPointerOpen] = useState(false);
   const [focusOpen, setFocusOpen] = useState(false);
   const [pinned, setPinned] = useState(readPinnedPreference);
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState(documentName);
   const closeTimer = useRef<number | null>(null);
+  const nameInput = useRef<HTMLInputElement>(null);
+  const nameCommitInProgress = useRef(false);
 
   const ribbonOpen = pinned || pointerOpen || focusOpen;
 
@@ -102,7 +108,42 @@ export default function RibbonHeader({
     writePinnedPreference(nextPinned);
   };
 
+  const beginNameEdit = () => {
+    if (busy) return;
+    setNameDraft(documentName);
+    setEditingName(true);
+  };
+
+  const cancelNameEdit = () => {
+    nameCommitInProgress.current = false;
+    setNameDraft(documentName);
+    setEditingName(false);
+  };
+
+  const commitNameEdit = async () => {
+    if (busy || nameCommitInProgress.current) return;
+    nameCommitInProgress.current = true;
+    try {
+      const committed = await onDocumentNameCommit(nameDraft);
+      if (committed) {
+        setEditingName(false);
+        return;
+      }
+    } finally {
+      nameCommitInProgress.current = false;
+    }
+    if (nameInput.current) {
+      window.setTimeout(() => nameInput.current?.focus(), 0);
+    }
+  };
+
   useEffect(() => () => cancelScheduledClose(), []);
+  useEffect(() => {
+    if (!editingName) setNameDraft(documentName);
+  }, [documentName, editingName]);
+  useEffect(() => {
+    if (editingName) nameInput.current?.select();
+  }, [editingName]);
 
   return (
     <section
@@ -134,10 +175,40 @@ export default function RibbonHeader({
         </nav>
 
         <div className="header-identity">
-          <span className="header-document" title={documentName}>
-            {dirty && <span className="dirty-dot" aria-label="Unsaved changes">●</span>}
-            {documentName}
-          </span>
+          {editingName ? (
+            <span className="header-document-editor">
+              {dirty && <span className="dirty-dot" aria-label="Unsaved changes">●</span>}
+              <input
+                ref={nameInput}
+                aria-label="Document name"
+                value={nameDraft}
+                disabled={busy}
+                onChange={(event) => setNameDraft(event.target.value)}
+                onBlur={() => {
+                  if (!nameCommitInProgress.current) cancelNameEdit();
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    void commitNameEdit();
+                  } else if (event.key === "Escape") {
+                    event.preventDefault();
+                    cancelNameEdit();
+                  }
+                }}
+              />
+            </span>
+          ) : (
+            <button
+              className="header-document"
+              title={documentName}
+              aria-label={`Rename ${documentName}`}
+              onDoubleClick={beginNameEdit}
+            >
+              {dirty && <span className="dirty-dot" aria-label="Unsaved changes">●</span>}
+              {documentName}
+            </button>
+          )}
           <span className="identity-divider" aria-hidden="true" />
           <span className="compact-brand-mark" aria-hidden="true">T</span>
           <span className="compact-brand-name"><strong>Tablune</strong> Sheets</span>

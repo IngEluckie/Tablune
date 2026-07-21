@@ -8,3 +8,7 @@ export function readCsvDocument(path: string): Promise<CsvPayload> {
 export function writeCsvDocument(path: string, payload: CsvPayload): Promise<void> {
   return invoke<void>("write_csv_document", { path, payload });
 }
+
+export function renameCsvDocument(path: string, newName: string): Promise<string> {
+  return invoke<string>("rename_csv_document", { path, newName });
+}
