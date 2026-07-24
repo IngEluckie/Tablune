@@ -48,6 +48,7 @@ interface RibbonHeaderProps {
   onHeaderChange: (enabled: boolean) => void;
   onToggleExplorer: () => void;
   onClearView: () => void;
+  onPythonMacro: () => void;
   onThemeChange: (theme: ThemeMode) => void;
   onDelimiterChange: (delimiter: string) => void;
   onDocumentNameCommit: (documentName: string) => Promise<boolean>;
@@ -99,6 +100,7 @@ export default function RibbonHeader({
   onHeaderChange,
   onToggleExplorer,
   onClearView,
+  onPythonMacro,
   onThemeChange,
   onDelimiterChange,
   onDocumentNameCommit,
@@ -326,6 +328,8 @@ export default function RibbonHeader({
                 <span className="ribbon-divider" aria-hidden="true" />
                 <button onClick={onToggleExplorer}>Explore</button>
                 <button onClick={onClearView} disabled={!hasView}>Clear View</button>
+                <span className="ribbon-divider" aria-hidden="true" />
+                <button onClick={onPythonMacro} disabled={busy}>Python Macro</button>
               </div>
             )}
 

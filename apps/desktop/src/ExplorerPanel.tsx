@@ -48,7 +48,10 @@ export default function ExplorerPanel({
   useEffect(() => {
     let active = true;
     setLoading(true);
-    Promise.all([getColumnProfile(column), getFacets(column, facetQuery, 0, 100)])
+    Promise.all([
+      getColumnProfile(summary.documentId, column),
+      getFacets(summary.documentId, column, facetQuery, 0, 100),
+    ])
       .then(([nextProfile, nextFacets]) => {
         if (!active) return;
         setProfile(nextProfile);
@@ -58,7 +61,7 @@ export default function ExplorerPanel({
       .catch((reason) => onError(String(reason)))
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [column, facetQuery, onError, summary.revision, summary.viewRevision]);
+  }, [column, facetQuery, onError, summary.documentId, summary.revision, summary.viewRevision]);
 
   const replaceColumnFilter = (filter: FilterSpec | null) => {
     const filters = view.filters.filter((candidate) => candidate.column !== column);
@@ -92,7 +95,7 @@ export default function ExplorerPanel({
   const loadMoreFacets = async () => {
     if (facets.nextOffset === null) return;
     try {
-      const next = await getFacets(column, facetQuery, facets.nextOffset, 100);
+      const next = await getFacets(summary.documentId, column, facetQuery, facets.nextOffset, 100);
       setFacets({
         values: [...facets.values, ...next.values],
         totalDistinct: next.totalDistinct,

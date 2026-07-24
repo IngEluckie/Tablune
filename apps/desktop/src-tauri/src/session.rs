@@ -3,7 +3,10 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
 };
 
 use serde::{Deserialize, Serialize};
@@ -14,10 +17,17 @@ use tauri::{AppHandle, Manager, State};
 
 const HISTORY_ENTRIES: usize = 500;
 const HISTORY_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_HISTORY_BYTES: usize = HISTORY_BYTES;
+static NEXT_SESSION_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn next_session_identity() -> u64 {
+    NEXT_SESSION_IDENTITY.fetch_add(1, AtomicOrdering::Relaxed)
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentSummary {
+    pub document_id: u64,
     pub path: Option<String>,
     pub display_name: String,
     pub delimiter: String,
@@ -38,6 +48,18 @@ pub struct DocumentSummary {
     pub sort_count: usize,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct MacroDocumentSnapshot {
+    pub document_id: u64,
+    pub identity: u64,
+    pub revision: u64,
+    pub rows: Vec<Vec<String>>,
+    pub header_enabled: bool,
+    pub display_name: String,
+    pub delimiter: String,
+    pub line_ending: LineEnding,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GridRow {
@@ -50,6 +72,7 @@ pub struct GridRow {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GridWindow {
+    pub document_id: u64,
     pub revision: u64,
     pub view_revision: u64,
     pub row_start: usize,
@@ -218,6 +241,9 @@ struct FilePreferences {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Preferences {
+    #[serde(default)]
+    python_interpreter: Option<String>,
+    #[serde(default)]
     files: HashMap<String, FilePreferences>,
 }
 
@@ -229,6 +255,26 @@ struct RecoveryPayload {
     dialect: CsvDialect,
     header_enabled: bool,
     column_types: HashMap<usize, ColumnType>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceRecoveryPayload {
+    version: u8,
+    documents: Vec<RecoveryPayload>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum StoredRecoveryPayload {
+    Workspace(WorkspaceRecoveryPayload),
+    Legacy(RecoveryPayload),
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSummary {
+    pub documents: Vec<DocumentSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +306,12 @@ enum InternalOp {
     },
     SetDelimiter(u8),
     ReorderRows(Vec<u64>),
+    ReplaceRows {
+        index: usize,
+        remove_count: usize,
+        rows: Vec<Vec<String>>,
+        ids: Vec<u64>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -285,6 +337,7 @@ pub struct DocumentSession {
     column_types: HashMap<usize, ColumnType>,
     view: ViewState,
     visible_rows: Vec<usize>,
+    identity: u64,
 }
 
 impl Default for DocumentSession {
@@ -306,6 +359,7 @@ impl Default for DocumentSession {
             column_types: HashMap::new(),
             view: ViewState::default(),
             visible_rows: Vec::new(),
+            identity: next_session_identity(),
         };
         session.rebuild_view();
         session
@@ -334,14 +388,16 @@ impl DocumentSession {
             column_types: preferences.column_types,
             view: ViewState::default(),
             visible_rows: Vec::new(),
+            identity: next_session_identity(),
         };
         session.rebuild_view();
         session
     }
 
-    fn summary(&self) -> DocumentSummary {
+    pub(crate) fn summary(&self) -> DocumentSummary {
         let header_names = self.header_names();
         DocumentSummary {
+            document_id: self.identity,
             path: self
                 .path
                 .as_ref()
@@ -508,6 +564,7 @@ impl DocumentSession {
             })
             .collect();
         GridWindow {
+            document_id: self.identity,
             revision: self.revision,
             view_revision: self.view_revision,
             row_start,
@@ -572,7 +629,145 @@ impl DocumentSession {
             }
             InternalOp::SetDelimiter(delimiter) => self.dialect.delimiter = *delimiter,
             InternalOp::ReorderRows(ids) => self.reorder_by_ids(ids)?,
+            InternalOp::ReplaceRows {
+                index,
+                remove_count,
+                rows,
+                ids,
+            } => {
+                let index = (*index).min(self.document.row_count());
+                let end = index
+                    .saturating_add(*remove_count)
+                    .min(self.document.row_count());
+                self.document.delete_rows(index, *remove_count);
+                self.row_ids.drain(index..end);
+                self.document.insert_rows(index, rows.clone());
+                self.row_ids.splice(index..index, ids.clone());
+            }
         }
+        Ok(())
+    }
+
+    pub(crate) fn macro_snapshot(&self) -> MacroDocumentSnapshot {
+        MacroDocumentSnapshot {
+            document_id: self.identity,
+            identity: self.identity,
+            revision: self.revision,
+            rows: self.document.rows().to_vec(),
+            header_enabled: self.header_enabled,
+            display_name: self.summary().display_name,
+            delimiter: char::from(self.dialect.delimiter).to_string(),
+            line_ending: self.dialect.line_ending,
+        }
+    }
+
+    pub(crate) fn matches_macro_revision(&self, identity: u64, revision: u64) -> bool {
+        self.identity == identity && self.revision == revision
+    }
+
+    pub(crate) fn matches_macro_snapshot(
+        &self,
+        identity: u64,
+        revision: u64,
+        header_enabled: bool,
+    ) -> bool {
+        self.matches_macro_revision(identity, revision) && self.header_enabled == header_enabled
+    }
+
+    pub(crate) fn apply_macro_rows(
+        &mut self,
+        rows: Vec<Vec<String>>,
+        expected_identity: u64,
+        expected_revision: u64,
+    ) -> Result<(), String> {
+        if !self.matches_macro_revision(expected_identity, expected_revision) {
+            return Err("the document changed; run the macro preview again".to_string());
+        }
+        let estimated_bytes = estimate_macro_history(self.document.rows(), &rows);
+        if estimated_bytes > MAX_HISTORY_BYTES {
+            return Err("this macro result is too large to keep an undo entry".to_string());
+        }
+        if self.document.rows() == rows {
+            return Ok(());
+        }
+
+        let before_columns = self.document.column_count();
+        let same_shape = self.document.rows().len() == rows.len()
+            && self
+                .document
+                .rows()
+                .iter()
+                .zip(&rows)
+                .all(|(before, after)| before.len() == after.len());
+        if same_shape {
+            let mut before = Vec::new();
+            let mut after = Vec::new();
+            for (row_index, (old_row, new_row)) in
+                self.document.rows().iter().zip(&rows).enumerate()
+            {
+                for (column, (old, new)) in old_row.iter().zip(new_row).enumerate() {
+                    if old != new {
+                        before.push(CellInput {
+                            row: row_index,
+                            column,
+                            value: old.clone(),
+                        });
+                        after.push(CellInput {
+                            row: row_index,
+                            column,
+                            value: new.clone(),
+                        });
+                    }
+                }
+            }
+            self.commit(
+                EditRecord {
+                    forward: InternalOp::SetCells {
+                        cells: after,
+                        restore_shape: None,
+                    },
+                    inverse: InternalOp::SetCells {
+                        cells: before,
+                        restore_shape: None,
+                    },
+                },
+                estimated_bytes,
+            )?;
+        } else {
+            let (start, before_end, after_end) = macro_changed_range(self.document.rows(), &rows);
+            let before_rows = self.document.rows()[start..before_end].to_vec();
+            let before_ids = self.row_ids[start..before_end].to_vec();
+            let after_rows = rows[start..after_end].to_vec();
+            let after_ids = (0..after_rows.len())
+                .map(|_| {
+                    let id = self.next_row_id;
+                    self.next_row_id = self.next_row_id.wrapping_add(1);
+                    id
+                })
+                .collect();
+            self.commit(
+                EditRecord {
+                    forward: InternalOp::ReplaceRows {
+                        index: start,
+                        remove_count: before_rows.len(),
+                        rows: after_rows,
+                        ids: after_ids,
+                    },
+                    inverse: InternalOp::ReplaceRows {
+                        index: start,
+                        remove_count: after_end - start,
+                        rows: before_rows,
+                        ids: before_ids,
+                    },
+                },
+                estimated_bytes,
+            )?;
+        }
+        self.view = ViewState::default();
+        if self.document.column_count() != before_columns {
+            self.column_types.clear();
+        }
+        self.rebuild_view();
         Ok(())
     }
 
@@ -944,102 +1139,382 @@ impl DocumentSession {
     }
 }
 
-pub struct SessionState(pub Mutex<DocumentSession>);
+pub(crate) type DocumentHandle = Arc<Mutex<DocumentSession>>;
 
-impl Default for SessionState {
+pub struct WorkspaceState {
+    documents: Mutex<Vec<DocumentHandle>>,
+}
+
+impl Default for WorkspaceState {
     fn default() -> Self {
-        Self(Mutex::new(DocumentSession::default()))
+        Self {
+            documents: Mutex::new(vec![Arc::new(Mutex::new(DocumentSession::default()))]),
+        }
     }
 }
 
-#[tauri::command]
-pub fn session_summary(state: State<'_, SessionState>) -> Result<DocumentSummary, String> {
-    Ok(lock(&state)?.summary())
+fn lock_workspace(
+    state: &WorkspaceState,
+) -> Result<std::sync::MutexGuard<'_, Vec<DocumentHandle>>, String> {
+    state
+        .documents
+        .lock()
+        .map_err(|_| "document workspace is unavailable".to_string())
+}
+
+pub(crate) fn lock_document(
+    handle: &DocumentHandle,
+) -> Result<std::sync::MutexGuard<'_, DocumentSession>, String> {
+    handle
+        .lock()
+        .map_err(|_| "document session is unavailable".to_string())
+}
+
+pub(crate) fn document_handle(
+    state: &WorkspaceState,
+    document_id: u64,
+) -> Result<DocumentHandle, String> {
+    lock_workspace(state)?
+        .iter()
+        .find(|handle| {
+            lock_document(handle)
+                .map(|session| session.identity == document_id)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .ok_or_else(|| format!("document {document_id} is not open"))
+}
+
+fn workspace_summary_value(state: &WorkspaceState) -> Result<WorkspaceSummary, String> {
+    let handles = lock_workspace(state)?.clone();
+    let documents = handles
+        .iter()
+        .map(|handle| Ok(lock_document(handle)?.summary()))
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(WorkspaceSummary { documents })
+}
+
+fn reorder_documents_internal(
+    state: &WorkspaceState,
+    document_ids: Vec<u64>,
+) -> Result<WorkspaceSummary, String> {
+    let handles = lock_workspace(state)?.clone();
+    if document_ids.len() != handles.len() {
+        return Err("the reordered list must contain every open document exactly once".to_string());
+    }
+
+    let mut handles_by_id = HashMap::with_capacity(handles.len());
+    for handle in &handles {
+        let document_id = lock_document(handle)?.identity;
+        handles_by_id.insert(document_id, handle.clone());
+    }
+
+    let mut seen = HashSet::with_capacity(document_ids.len());
+    let mut reordered = Vec::with_capacity(document_ids.len());
+    for document_id in document_ids {
+        if !seen.insert(document_id) {
+            return Err(format!("document {document_id} appears more than once"));
+        }
+        reordered.push(
+            handles_by_id
+                .get(&document_id)
+                .cloned()
+                .ok_or_else(|| format!("document {document_id} is not open"))?,
+        );
+    }
+
+    let mut current = lock_workspace(state)?;
+    if current.len() != handles.len()
+        || !current
+            .iter()
+            .all(|candidate| handles.iter().any(|handle| Arc::ptr_eq(candidate, handle)))
+    {
+        return Err("the workspace changed while the documents were being reordered".to_string());
+    }
+    *current = reordered;
+    drop(current);
+    workspace_summary_value(state)
+}
+
+fn find_document_by_path(
+    state: &WorkspaceState,
+    path: &Path,
+    except_document_id: Option<u64>,
+) -> Result<Option<DocumentHandle>, String> {
+    let key = canonical_key(path);
+    let handles = lock_workspace(state)?.clone();
+    for handle in handles {
+        let session = lock_document(&handle)?;
+        if Some(session.identity) != except_document_id
+            && session
+                .path
+                .as_deref()
+                .is_some_and(|open| canonical_key(open) == key)
+        {
+            drop(session);
+            return Ok(Some(handle));
+        }
+    }
+    Ok(None)
+}
+
+fn recovery_payload(session: &DocumentSession) -> Option<RecoveryPayload> {
+    (session.current_state != session.saved_state).then(|| RecoveryPayload {
+        rows: session.document.rows().to_vec(),
+        path: session
+            .path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        dialect: session.dialect,
+        header_enabled: session.header_enabled,
+        column_types: session.column_types.clone(),
+    })
+}
+
+fn workspace_recovery_payload(
+    state: &WorkspaceState,
+    excluded_document_id: Option<u64>,
+) -> Result<Option<WorkspaceRecoveryPayload>, String> {
+    let handles = lock_workspace(state)?.clone();
+    let mut documents = Vec::new();
+    for handle in handles {
+        let session = lock_document(&handle)?;
+        if Some(session.identity) != excluded_document_id
+            && let Some(payload) = recovery_payload(&session)
+        {
+            documents.push(payload);
+        }
+    }
+    Ok((!documents.is_empty()).then_some(WorkspaceRecoveryPayload {
+        version: 1,
+        documents,
+    }))
+}
+
+fn session_from_recovery(payload: RecoveryPayload) -> DocumentSession {
+    let row_count = payload.rows.len();
+    let mut session = DocumentSession {
+        document: TableDocument::from_rows(payload.rows),
+        path: payload.path.map(PathBuf::from),
+        dialect: payload.dialect,
+        revision: 1,
+        view_revision: 0,
+        current_state: 1,
+        saved_state: 0,
+        next_state: 2,
+        next_row_id: row_count as u64 + 1,
+        row_ids: (1..=row_count as u64).collect(),
+        history: TransactionHistory::with_limits(HISTORY_ENTRIES, HISTORY_BYTES),
+        header_enabled: payload.header_enabled,
+        header_suggested: false,
+        column_types: payload.column_types,
+        view: ViewState::default(),
+        visible_rows: Vec::new(),
+        identity: next_session_identity(),
+    };
+    session.rebuild_view();
+    session
+}
+
+fn write_workspace_recovery_internal(
+    app: &AppHandle,
+    state: &WorkspaceState,
+    excluded_document_id: Option<u64>,
+) -> Result<(), String> {
+    let path = recovery_path(app)?;
+    let Some(payload) = workspace_recovery_payload(state, excluded_document_id)? else {
+        return remove_if_exists(&path).map_err(|error| error.to_string());
+    };
+    write_json_atomic(&path, &payload)
+}
+
+fn ensure_path_available(
+    state: &WorkspaceState,
+    path: &Path,
+    document_id: u64,
+) -> Result<(), String> {
+    if find_document_by_path(state, path, Some(document_id))?.is_some() {
+        Err("another open document already uses that path".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn close_document_internal(
+    state: &WorkspaceState,
+    document_id: u64,
+    discard_unsaved: bool,
+) -> Result<(), String> {
+    let handle = document_handle(state, document_id)?;
+    if lock_document(&handle)?.summary().dirty && !discard_unsaved {
+        return Err("save or explicitly discard this document before closing it".to_string());
+    }
+    let mut documents = lock_workspace(state)?;
+    let index = documents
+        .iter()
+        .position(|candidate| Arc::ptr_eq(candidate, &handle))
+        .ok_or_else(|| format!("document {document_id} is not open"))?;
+    documents.remove(index);
+    Ok(())
 }
 
 #[tauri::command]
-pub fn session_new(
-    app: AppHandle,
-    state: State<'_, SessionState>,
+pub fn workspace_summary(state: State<'_, WorkspaceState>) -> Result<WorkspaceSummary, String> {
+    workspace_summary_value(&state)
+}
+
+#[tauri::command]
+pub fn workspace_reorder(
+    state: State<'_, WorkspaceState>,
+    document_ids: Vec<u64>,
+) -> Result<WorkspaceSummary, String> {
+    reorder_documents_internal(&state, document_ids)
+}
+
+#[tauri::command]
+pub fn session_summary(
+    state: State<'_, WorkspaceState>,
+    document_id: u64,
 ) -> Result<DocumentSummary, String> {
-    *lock(&state)? = DocumentSession::default();
-    remove_if_exists(&recovery_path(&app)?).map_err(|error| error.to_string())?;
-    Ok(lock(&state)?.summary())
+    Ok(lock_document(&document_handle(&state, document_id)?)?.summary())
+}
+
+#[tauri::command]
+pub fn session_new(state: State<'_, WorkspaceState>) -> Result<DocumentSummary, String> {
+    let handle = Arc::new(Mutex::new(DocumentSession::default()));
+    let summary = lock_document(&handle)?.summary();
+    lock_workspace(&state)?.push(handle);
+    Ok(summary)
 }
 
 #[tauri::command]
 pub fn session_open(
     app: AppHandle,
-    state: State<'_, SessionState>,
+    state: State<'_, WorkspaceState>,
     path: String,
 ) -> Result<DocumentSummary, String> {
     let path_buf = PathBuf::from(&path);
+    if let Some(handle) = find_document_by_path(&state, &path_buf, None)? {
+        return Ok(lock_document(&handle)?.summary());
+    }
     let file = tablune_csv::read_path(&path_buf).map_err(|error| error.to_string())?;
     let preferences = load_preferences(&app)?
         .files
         .get(&canonical_key(&path_buf))
         .cloned()
         .unwrap_or_default();
-    *lock(&state)? = DocumentSession::from_file(path_buf, file, preferences);
-    remove_if_exists(&recovery_path(&app)?).map_err(|error| error.to_string())?;
-    Ok(lock(&state)?.summary())
+    if let Some(handle) = find_document_by_path(&state, &path_buf, None)? {
+        return Ok(lock_document(&handle)?.summary());
+    }
+    let handle = Arc::new(Mutex::new(DocumentSession::from_file(
+        path_buf,
+        file,
+        preferences,
+    )));
+    let summary = lock_document(&handle)?.summary();
+    lock_workspace(&state)?.push(handle);
+    Ok(summary)
+}
+
+#[tauri::command]
+pub fn session_close(
+    app: AppHandle,
+    state: State<'_, WorkspaceState>,
+    document_id: u64,
+    discard_unsaved: bool,
+) -> Result<WorkspaceSummary, String> {
+    let handle = document_handle(&state, document_id)?;
+    if lock_document(&handle)?.summary().dirty && !discard_unsaved {
+        return Err("save or explicitly discard this document before closing it".to_string());
+    }
+    write_workspace_recovery_internal(&app, &state, Some(document_id))?;
+    close_document_internal(&state, document_id, discard_unsaved)?;
+    workspace_summary_value(&state)
 }
 
 #[tauri::command]
 pub fn session_save(
     app: AppHandle,
-    state: State<'_, SessionState>,
+    state: State<'_, WorkspaceState>,
+    document_id: u64,
     path: Option<String>,
 ) -> Result<DocumentSummary, String> {
-    let mut session = lock(&state)?;
-    let destination = path
-        .map(PathBuf::from)
-        .or_else(|| session.path.clone())
-        .ok_or_else(|| "a destination path is required".to_string())?;
-    tablune_csv::write_path(&destination, &session.document, session.dialect)
-        .map_err(|error| error.to_string())?;
-    session.path = Some(destination);
-    session.saved_state = session.current_state;
-    save_file_preferences(&app, &session)?;
-    remove_if_exists(&recovery_path(&app)?).map_err(|error| error.to_string())?;
-    Ok(session.summary())
+    let handle = document_handle(&state, document_id)?;
+    let destination = {
+        let session = lock_document(&handle)?;
+        path.map(PathBuf::from)
+            .or_else(|| session.path.clone())
+            .ok_or_else(|| "a destination path is required".to_string())?
+    };
+    ensure_path_available(&state, &destination, document_id)?;
+    let summary = {
+        let mut session = lock_document(&handle)?;
+        tablune_csv::write_path(&destination, &session.document, session.dialect)
+            .map_err(|error| error.to_string())?;
+        session.path = Some(destination);
+        session.saved_state = session.current_state;
+        save_file_preferences(&app, &session)?;
+        session.summary()
+    };
+    write_workspace_recovery_internal(&app, &state, None)?;
+    Ok(summary)
 }
 
 #[tauri::command]
 pub fn session_rename(
     app: AppHandle,
-    state: State<'_, SessionState>,
+    state: State<'_, WorkspaceState>,
+    document_id: u64,
     new_name: String,
 ) -> Result<DocumentSummary, String> {
-    let mut session = lock(&state)?;
-    let source = session
+    let handle = document_handle(&state, document_id)?;
+    let source = lock_document(&handle)?
         .path
         .clone()
         .ok_or_else(|| "save the document before renaming it".to_string())?;
-    let destination = super::rename_document_path(&source, new_name.trim())?;
-    session.path = Some(destination);
-    save_file_preferences(&app, &session)?;
-    Ok(session.summary())
+    let destination = source
+        .parent()
+        .ok_or_else(|| "the document does not have a parent folder".to_string())?
+        .join(new_name.trim());
+    ensure_path_available(&state, &destination, document_id)?;
+    let summary = {
+        let mut session = lock_document(&handle)?;
+        session.path = Some(super::rename_document_path(&source, new_name.trim())?);
+        save_file_preferences(&app, &session)?;
+        session.summary()
+    };
+    write_workspace_recovery_internal(&app, &state, None)?;
+    Ok(summary)
 }
 
 #[tauri::command]
 pub fn session_grid_window(
-    state: State<'_, SessionState>,
+    state: State<'_, WorkspaceState>,
+    document_id: u64,
     row_start: usize,
     row_count: usize,
     column_start: usize,
     column_count: usize,
 ) -> Result<GridWindow, String> {
-    Ok(lock(&state)?.grid_window(row_start, row_count, column_start, column_count))
+    Ok(
+        lock_document(&document_handle(&state, document_id)?)?.grid_window(
+            row_start,
+            row_count,
+            column_start,
+            column_count,
+        ),
+    )
 }
 
 #[tauri::command]
 pub fn session_apply_edit(
-    state: State<'_, SessionState>,
+    state: State<'_, WorkspaceState>,
+    document_id: u64,
     command: EditCommand,
     expected_revision: u64,
 ) -> Result<DocumentSummary, String> {
-    let mut session = lock(&state)?;
+    let handle = document_handle(&state, document_id)?;
+    let mut session = lock_document(&handle)?;
     session.apply_edit(command, expected_revision)?;
     Ok(session.summary())
 }
@@ -1047,29 +1522,38 @@ pub fn session_apply_edit(
 #[tauri::command]
 pub fn session_undo(
     app: AppHandle,
-    state: State<'_, SessionState>,
+    state: State<'_, WorkspaceState>,
+    document_id: u64,
 ) -> Result<DocumentSummary, String> {
-    let mut session = lock(&state)?;
-    session.undo()?;
-    if session.current_state == session.saved_state {
-        remove_if_exists(&recovery_path(&app)?).map_err(|error| error.to_string())?;
-    }
-    Ok(session.summary())
+    let handle = document_handle(&state, document_id)?;
+    let summary = {
+        let mut session = lock_document(&handle)?;
+        session.undo()?;
+        session.summary()
+    };
+    write_workspace_recovery_internal(&app, &state, None)?;
+    Ok(summary)
 }
 
 #[tauri::command]
-pub fn session_redo(state: State<'_, SessionState>) -> Result<DocumentSummary, String> {
-    let mut session = lock(&state)?;
+pub fn session_redo(
+    state: State<'_, WorkspaceState>,
+    document_id: u64,
+) -> Result<DocumentSummary, String> {
+    let handle = document_handle(&state, document_id)?;
+    let mut session = lock_document(&handle)?;
     session.redo()?;
     Ok(session.summary())
 }
 
 #[tauri::command]
 pub fn session_set_view(
-    state: State<'_, SessionState>,
+    state: State<'_, WorkspaceState>,
+    document_id: u64,
     view: ViewState,
 ) -> Result<DocumentSummary, String> {
-    let mut session = lock(&state)?;
+    let handle = document_handle(&state, document_id)?;
+    let mut session = lock_document(&handle)?;
     session.view = view;
     session.rebuild_view();
     Ok(session.summary())
@@ -1078,10 +1562,12 @@ pub fn session_set_view(
 #[tauri::command]
 pub fn session_set_header(
     app: AppHandle,
-    state: State<'_, SessionState>,
+    state: State<'_, WorkspaceState>,
+    document_id: u64,
     enabled: bool,
 ) -> Result<DocumentSummary, String> {
-    let mut session = lock(&state)?;
+    let handle = document_handle(&state, document_id)?;
+    let mut session = lock_document(&handle)?;
     session.header_enabled = enabled;
     session.header_suggested = false;
     session.view = ViewState::default();
@@ -1093,11 +1579,13 @@ pub fn session_set_header(
 #[tauri::command]
 pub fn session_set_column_type(
     app: AppHandle,
-    state: State<'_, SessionState>,
+    state: State<'_, WorkspaceState>,
+    document_id: u64,
     column: usize,
     column_type: ColumnType,
 ) -> Result<DocumentSummary, String> {
-    let mut session = lock(&state)?;
+    let handle = document_handle(&state, document_id)?;
+    let mut session = lock_document(&handle)?;
     session.column_types.insert(column, column_type);
     session.rebuild_view();
     save_file_preferences(&app, &session)?;
@@ -1106,18 +1594,21 @@ pub fn session_set_column_type(
 
 #[tauri::command]
 pub fn session_search(
-    state: State<'_, SessionState>,
+    state: State<'_, WorkspaceState>,
+    document_id: u64,
     request: SearchRequest,
 ) -> Result<Vec<SearchMatch>, String> {
-    Ok(lock(&state)?.search(&request))
+    Ok(lock_document(&document_handle(&state, document_id)?)?.search(&request))
 }
 
 #[tauri::command]
 pub fn session_replace(
-    state: State<'_, SessionState>,
+    state: State<'_, WorkspaceState>,
+    document_id: u64,
     request: ReplaceRequest,
 ) -> Result<DocumentSummary, String> {
-    let mut session = lock(&state)?;
+    let handle = document_handle(&state, document_id)?;
+    let mut session = lock_document(&handle)?;
     if request.expected_revision != session.revision {
         return Err("the document changed; run the search again".to_string());
     }
@@ -1157,26 +1648,36 @@ pub fn session_replace(
 
 #[tauri::command]
 pub fn session_column_profile(
-    state: State<'_, SessionState>,
+    state: State<'_, WorkspaceState>,
+    document_id: u64,
     column: usize,
 ) -> Result<ColumnProfile, String> {
-    Ok(lock(&state)?.profile(column))
+    Ok(lock_document(&document_handle(&state, document_id)?)?.profile(column))
 }
 
 #[tauri::command]
 pub fn session_facets(
-    state: State<'_, SessionState>,
+    state: State<'_, WorkspaceState>,
+    document_id: u64,
     column: usize,
     query: String,
     offset: usize,
     limit: usize,
 ) -> Result<FacetPage, String> {
-    Ok(lock(&state)?.facets(column, &query, offset, limit))
+    Ok(
+        lock_document(&document_handle(&state, document_id)?)?
+            .facets(column, &query, offset, limit),
+    )
 }
 
 #[tauri::command]
-pub fn session_export_view(state: State<'_, SessionState>, path: String) -> Result<(), String> {
-    let session = lock(&state)?;
+pub fn session_export_view(
+    state: State<'_, WorkspaceState>,
+    document_id: u64,
+    path: String,
+) -> Result<(), String> {
+    let handle = document_handle(&state, document_id)?;
+    let session = lock_document(&handle)?;
     let mut rows =
         Vec::with_capacity(session.visible_rows.len() + usize::from(session.header_enabled));
     if session.header_enabled && session.document.row_count() > 0 {
@@ -1193,78 +1694,100 @@ pub fn session_export_view(state: State<'_, SessionState>, path: String) -> Resu
 }
 
 #[tauri::command]
-pub fn session_write_recovery(
+pub fn workspace_write_recovery(
     app: AppHandle,
-    state: State<'_, SessionState>,
+    state: State<'_, WorkspaceState>,
 ) -> Result<(), String> {
-    let session = lock(&state)?;
-    if session.current_state == session.saved_state {
-        return Ok(());
-    }
-    let payload = RecoveryPayload {
-        rows: session.document.rows().to_vec(),
-        path: session
-            .path
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned()),
-        dialect: session.dialect,
-        header_enabled: session.header_enabled,
-        column_types: session.column_types.clone(),
-    };
-    write_json_atomic(&recovery_path(&app)?, &payload)
+    write_workspace_recovery_internal(&app, &state, None)
 }
 
 #[tauri::command]
-pub fn session_recovery_available(app: AppHandle) -> Result<bool, String> {
+pub fn workspace_recovery_available(app: AppHandle) -> Result<bool, String> {
     Ok(recovery_path(&app)?.exists())
 }
 
 #[tauri::command]
-pub fn session_restore_recovery(
+pub fn workspace_restore_recovery(
     app: AppHandle,
-    state: State<'_, SessionState>,
-) -> Result<DocumentSummary, String> {
-    let payload: RecoveryPayload = read_json(&recovery_path(&app)?)?;
-    let row_count = payload.rows.len();
-    let mut session = DocumentSession {
-        document: TableDocument::from_rows(payload.rows),
-        path: payload.path.map(PathBuf::from),
-        dialect: payload.dialect,
-        revision: 1,
-        view_revision: 0,
-        current_state: 1,
-        saved_state: 0,
-        next_state: 2,
-        next_row_id: row_count as u64 + 1,
-        row_ids: (1..=row_count as u64).collect(),
-        history: TransactionHistory::with_limits(HISTORY_ENTRIES, HISTORY_BYTES),
-        header_enabled: payload.header_enabled,
-        header_suggested: false,
-        column_types: payload.column_types,
-        view: ViewState::default(),
-        visible_rows: Vec::new(),
+    state: State<'_, WorkspaceState>,
+) -> Result<WorkspaceSummary, String> {
+    let stored: StoredRecoveryPayload = read_json(&recovery_path(&app)?)?;
+    let payloads = match stored {
+        StoredRecoveryPayload::Workspace(payload) => {
+            if payload.version != 1 {
+                return Err(format!("unsupported recovery version {}", payload.version));
+            }
+            payload.documents
+        }
+        StoredRecoveryPayload::Legacy(payload) => vec![payload],
     };
-    session.rebuild_view();
-    *lock(&state)? = session;
-    Ok(lock(&state)?.summary())
+    let documents = payloads
+        .into_iter()
+        .map(|payload| Arc::new(Mutex::new(session_from_recovery(payload))))
+        .collect();
+    *lock_workspace(&state)? = documents;
+    workspace_summary_value(&state)
 }
 
 #[tauri::command]
-pub fn session_discard_recovery(app: AppHandle) -> Result<(), String> {
+pub fn workspace_discard_recovery(app: AppHandle) -> Result<(), String> {
     remove_if_exists(&recovery_path(&app)?).map_err(|error| error.to_string())
 }
 
-fn lock<'a>(
-    state: &'a State<'_, SessionState>,
-) -> Result<std::sync::MutexGuard<'a, DocumentSession>, String> {
-    state
-        .0
-        .lock()
-        .map_err(|_| "document session is unavailable".to_string())
+pub(crate) fn estimate_macro_history(before: &[Vec<String>], after: &[Vec<String>]) -> usize {
+    let same_shape = before.len() == after.len()
+        && before
+            .iter()
+            .zip(after)
+            .all(|(old_row, new_row)| old_row.len() == new_row.len());
+    if same_shape {
+        before
+            .iter()
+            .zip(after)
+            .flat_map(|(old_row, new_row)| old_row.iter().zip(new_row))
+            .filter(|(old, new)| old != new)
+            .map(|(old, new)| old.len().saturating_add(new.len()).saturating_add(32))
+            .fold(0usize, usize::saturating_add)
+    } else {
+        let (start, before_end, after_end) = macro_changed_range(before, after);
+        before[start..before_end]
+            .iter()
+            .chain(&after[start..after_end])
+            .flatten()
+            .map(String::len)
+            .fold(0usize, usize::saturating_add)
+            .saturating_add(
+                (before_end - start)
+                    .saturating_add(after_end - start)
+                    .saturating_mul(32),
+            )
+    }
+}
+
+fn macro_changed_range(before: &[Vec<String>], after: &[Vec<String>]) -> (usize, usize, usize) {
+    let mut prefix = 0;
+    while prefix < before.len() && prefix < after.len() && before[prefix] == after[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < before.len().saturating_sub(prefix)
+        && suffix < after.len().saturating_sub(prefix)
+        && before[before.len() - suffix - 1] == after[after.len() - suffix - 1]
+    {
+        suffix += 1;
+    }
+    (prefix, before.len() - suffix, after.len() - suffix)
 }
 
 fn canonical_key(path: &Path) -> String {
     path.canonicalize()
+        .or_else(|_| {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            parent.canonicalize().map(|parent| {
+                path.file_name()
+                    .map_or(parent.clone(), |name| parent.join(name))
+            })
+        })
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .into_owned()
@@ -1293,6 +1816,16 @@ fn load_preferences(app: &AppHandle) -> Result<Preferences, String> {
         return Ok(Preferences::default());
     }
     read_json(&path)
+}
+
+pub(crate) fn load_python_interpreter(app: &AppHandle) -> Result<Option<String>, String> {
+    Ok(load_preferences(app)?.python_interpreter)
+}
+
+pub(crate) fn save_python_interpreter(app: &AppHandle, path: String) -> Result<(), String> {
+    let mut preferences = load_preferences(app)?;
+    preferences.python_interpreter = Some(path);
+    write_json_atomic(&preferences_path(app)?, &preferences)
 }
 
 fn save_file_preferences(app: &AppHandle, session: &DocumentSession) -> Result<(), String> {
@@ -1489,6 +2022,215 @@ fn replace_case_insensitive_once(value: &str, query: &str, replacement: &str) ->
 mod tests {
     use super::*;
 
+    fn add_session(workspace: &WorkspaceState, session: DocumentSession) -> u64 {
+        let document_id = session.identity;
+        lock_workspace(workspace)
+            .unwrap()
+            .push(Arc::new(Mutex::new(session)));
+        document_id
+    }
+
+    #[test]
+    fn workspace_documents_keep_independent_history_and_views() {
+        let workspace = WorkspaceState {
+            documents: Mutex::new(Vec::new()),
+        };
+        let first_id = add_session(&workspace, DocumentSession::default());
+        let second_id = add_session(&workspace, DocumentSession::default());
+
+        let first = document_handle(&workspace, first_id).unwrap();
+        lock_document(&first)
+            .unwrap()
+            .apply_edit(
+                EditCommand::SetCells {
+                    cells: vec![CellInput {
+                        row: 0,
+                        column: 0,
+                        value: "first".into(),
+                    }],
+                },
+                0,
+            )
+            .unwrap();
+        let second = document_handle(&workspace, second_id).unwrap();
+        lock_document(&second)
+            .unwrap()
+            .view
+            .filters
+            .push(FilterSpec {
+                column: 0,
+                operator: "equals".into(),
+                value: "second".into(),
+                second_value: String::new(),
+                values: Vec::new(),
+                column_type: ColumnType::Text,
+                case_sensitive: false,
+            });
+        lock_document(&second).unwrap().rebuild_view();
+
+        let first = lock_document(&first).unwrap();
+        let second = lock_document(&second).unwrap();
+        assert_eq!(first.cell_value(0, 0), "first");
+        assert!(first.history.can_undo());
+        assert!(first.view.filters.is_empty());
+        assert_eq!(second.cell_value(0, 0), "");
+        assert!(!second.history.can_undo());
+        assert_eq!(second.view.filters.len(), 1);
+    }
+
+    #[test]
+    fn workspace_close_requires_explicit_discard_and_rejects_unknown_ids() {
+        let workspace = WorkspaceState::default();
+        let document_id = workspace_summary_value(&workspace).unwrap().documents[0].document_id;
+        let handle = document_handle(&workspace, document_id).unwrap();
+        lock_document(&handle)
+            .unwrap()
+            .apply_edit(
+                EditCommand::SetCells {
+                    cells: vec![CellInput {
+                        row: 0,
+                        column: 0,
+                        value: "dirty".into(),
+                    }],
+                },
+                0,
+            )
+            .unwrap();
+
+        assert!(close_document_internal(&workspace, document_id, false).is_err());
+        close_document_internal(&workspace, document_id, true).unwrap();
+        assert!(
+            workspace_summary_value(&workspace)
+                .unwrap()
+                .documents
+                .is_empty()
+        );
+        assert!(document_handle(&workspace, document_id).is_err());
+    }
+
+    #[test]
+    fn workspace_reorder_requires_the_exact_open_document_set() {
+        let workspace = WorkspaceState {
+            documents: Mutex::new(Vec::new()),
+        };
+        let first_id = add_session(&workspace, DocumentSession::default());
+        let second_id = add_session(&workspace, DocumentSession::default());
+        let third_id = add_session(&workspace, DocumentSession::default());
+
+        let reordered =
+            reorder_documents_internal(&workspace, vec![third_id, first_id, second_id]).unwrap();
+        assert_eq!(
+            reordered
+                .documents
+                .iter()
+                .map(|document| document.document_id)
+                .collect::<Vec<_>>(),
+            vec![third_id, first_id, second_id]
+        );
+
+        assert!(
+            reorder_documents_internal(&workspace, vec![third_id, third_id, first_id]).is_err()
+        );
+        assert!(reorder_documents_internal(&workspace, vec![third_id, first_id]).is_err());
+        assert!(
+            reorder_documents_internal(&workspace, vec![third_id, first_id, u64::MAX]).is_err()
+        );
+
+        assert_eq!(
+            workspace_summary_value(&workspace)
+                .unwrap()
+                .documents
+                .iter()
+                .map(|document| document.document_id)
+                .collect::<Vec<_>>(),
+            vec![third_id, first_id, second_id]
+        );
+    }
+
+    #[test]
+    fn canonical_paths_reuse_the_existing_document() {
+        let unique = next_session_identity();
+        let directory = std::env::temp_dir().join(format!("tablune-workspace-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("data.csv");
+        fs::write(&path, b"value\n").unwrap();
+        let session = DocumentSession {
+            path: Some(path.clone()),
+            ..Default::default()
+        };
+        let document_id = session.identity;
+        let workspace = WorkspaceState {
+            documents: Mutex::new(vec![Arc::new(Mutex::new(session))]),
+        };
+
+        let equivalent = directory.join(".").join("data.csv");
+        let found = find_document_by_path(&workspace, &equivalent, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lock_document(&found).unwrap().identity, document_id);
+        assert!(
+            find_document_by_path(&workspace, &path, Some(document_id))
+                .unwrap()
+                .is_none()
+        );
+        let other_id = add_session(&workspace, DocumentSession::default());
+        assert!(ensure_path_available(&workspace, &path, other_id).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_manifest_contains_only_dirty_documents_and_reads_legacy_payloads() {
+        let clean = DocumentSession::default();
+        assert!(recovery_payload(&clean).is_none());
+        let mut dirty = DocumentSession::default();
+        dirty
+            .apply_edit(
+                EditCommand::SetCells {
+                    cells: vec![CellInput {
+                        row: 0,
+                        column: 0,
+                        value: "recover".into(),
+                    }],
+                },
+                0,
+            )
+            .unwrap();
+        let payload = recovery_payload(&dirty).unwrap();
+        let mut second_dirty = DocumentSession::default();
+        second_dirty
+            .apply_edit(
+                EditCommand::SetCells {
+                    cells: vec![CellInput {
+                        row: 1,
+                        column: 0,
+                        value: "also recover".into(),
+                    }],
+                },
+                0,
+            )
+            .unwrap();
+        let state = WorkspaceState {
+            documents: Mutex::new(vec![
+                Arc::new(Mutex::new(clean)),
+                Arc::new(Mutex::new(dirty)),
+                Arc::new(Mutex::new(second_dirty)),
+            ]),
+        };
+        let workspace = workspace_recovery_payload(&state, None).unwrap().unwrap();
+        assert_eq!(workspace.documents.len(), 2);
+        assert_eq!(workspace.documents[0].rows[0][0], "recover");
+        assert_eq!(workspace.documents[1].rows[1][0], "also recover");
+        let stored: StoredRecoveryPayload =
+            serde_json::from_slice(&serde_json::to_vec(&workspace).unwrap()).unwrap();
+        assert!(matches!(stored, StoredRecoveryPayload::Workspace(_)));
+        let legacy: StoredRecoveryPayload =
+            serde_json::from_slice(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert!(matches!(legacy, StoredRecoveryPayload::Legacy(_)));
+        let restored = session_from_recovery(payload);
+        assert!(restored.summary().dirty);
+        assert_eq!(restored.cell_value(0, 0), "recover");
+    }
+
     #[test]
     fn edits_are_transactional_and_saved_state_is_restored_by_undo() {
         let mut session = DocumentSession::default();
@@ -1513,6 +2255,59 @@ mod tests {
         assert_eq!(session.document.column_count(), 0);
         session.redo().unwrap();
         assert_eq!(session.cell_value(2, 3), "value");
+    }
+
+    #[test]
+    fn macro_changes_are_one_atomic_undo_entry() {
+        let mut session = DocumentSession {
+            document: TableDocument::from_rows(vec![vec!["name".into()], vec!["Ada".into()]]),
+            header_enabled: true,
+            ..Default::default()
+        };
+        session.ensure_row_ids();
+        let identity = session.identity;
+        session
+            .apply_macro_rows(
+                vec![
+                    vec!["person".into(), "active".into()],
+                    vec!["Ada".into(), "yes".into()],
+                    vec!["Linus".into(), "no".into()],
+                ],
+                identity,
+                0,
+            )
+            .unwrap();
+        assert_eq!(session.revision, 1);
+        assert!(session.history.can_undo());
+        assert_eq!(session.document.row_count(), 3);
+        session.undo().unwrap();
+        assert_eq!(session.document.rows(), &[vec!["name"], vec!["Ada"]]);
+        session.redo().unwrap();
+        assert_eq!(session.document.row_count(), 3);
+    }
+
+    #[test]
+    fn same_shape_macro_history_only_counts_changed_cells() {
+        let before = vec![vec!["same".to_string(), "old".to_string()]];
+        let after = vec![vec!["same".to_string(), "new".to_string()]];
+        assert_eq!(estimate_macro_history(&before, &after), 38);
+    }
+
+    #[test]
+    fn structural_macro_history_excludes_unchanged_edges() {
+        let before = vec![
+            vec!["prefix".to_string()],
+            vec!["old".to_string()],
+            vec!["suffix".to_string()],
+        ];
+        let after = vec![
+            vec!["prefix".to_string()],
+            vec!["new".to_string(), "column".to_string()],
+            vec!["added".to_string()],
+            vec!["suffix".to_string()],
+        ];
+        assert_eq!(macro_changed_range(&before, &after), (1, 2, 3));
+        assert_eq!(estimate_macro_history(&before, &after), 113);
     }
 
     #[test]

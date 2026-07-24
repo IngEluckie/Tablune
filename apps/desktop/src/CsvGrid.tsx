@@ -13,6 +13,7 @@ import type {
   CellCoordinate,
   DocumentSummary,
   EditCommand,
+  GridViewportState,
   GridWindow,
   SelectionMode,
   SelectionRange,
@@ -32,6 +33,9 @@ interface CsvGridProps {
   onApplyEdit: (command: EditCommand) => Promise<void>;
   onSelectionChange: (selection: SelectionRange) => void;
   onError: (message: string) => void;
+  initialSelection?: SelectionRange;
+  initialViewport?: GridViewportState;
+  onViewportChange?: (viewport: GridViewportState) => void;
   reveal?: { viewRow: number; column: number; nonce: number } | null;
   onHeaderSort: (column: number) => void;
 }
@@ -124,18 +128,32 @@ async function writeClipboard(text: string): Promise<void> {
   if (!copied) throw new Error("Clipboard access is unavailable.");
 }
 
-export default function CsvGrid({ summary, theme, onApplyEdit, onSelectionChange, onError, reveal, onHeaderSort }: CsvGridProps) {
+const DEFAULT_SELECTION: SelectionRange = {
+  anchor: { row: 0, column: 0 },
+  focus: { row: 0, column: 0 },
+  mode: "cells",
+};
+
+export default function CsvGrid({
+  summary,
+  theme,
+  onApplyEdit,
+  onSelectionChange,
+  onError,
+  initialSelection = DEFAULT_SELECTION,
+  initialViewport = { scrollTop: 0, scrollLeft: 0 },
+  onViewportChange,
+  reveal,
+  onHeaderSort,
+}: CsvGridProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dragAnchor = useRef<GridTarget | null>(null);
   const requestId = useRef(0);
+  const viewportFrame = useRef<number | null>(null);
   const selectAllStage = useRef(0);
   const [windowData, setWindowData] = useState<GridWindow | null>(null);
-  const [selection, setSelection] = useState<SelectionRange>({
-    anchor: { row: 0, column: 0 },
-    focus: { row: 0, column: 0 },
-    mode: "cells",
-  });
+  const [selection, setSelection] = useState<SelectionRange>(initialSelection);
   const [editing, setEditing] = useState<EditingCell | null>(null);
   const [draft, setDraft] = useState("");
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
@@ -159,12 +177,35 @@ export default function CsvGrid({ summary, theme, onApplyEdit, onSelectionChange
     const columnAmount = Math.ceil(viewport.clientWidth / COLUMN_WIDTH) + 5;
     const currentRequest = ++requestId.current;
     try {
-      const data = await getGridWindow(firstRow, rowAmount, firstColumn, columnAmount);
-      if (currentRequest === requestId.current) setWindowData(data);
+      const data = await getGridWindow(summary.documentId, firstRow, rowAmount, firstColumn, columnAmount);
+      if (currentRequest === requestId.current && data.documentId === summary.documentId) setWindowData(data);
     } catch (reason) {
       onError(String(reason));
     }
-  }, [onError]);
+  }, [onError, summary.documentId]);
+
+  useEffect(() => {
+    requestId.current += 1;
+    setWindowData(null);
+    setEditing(null);
+    setContextMenu(null);
+    setSelection(initialSelection);
+  }, [initialSelection, summary.documentId]);
+
+  useLayoutEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    viewport.scrollTop = initialViewport.scrollTop;
+    viewport.scrollLeft = initialViewport.scrollLeft;
+    draw();
+    void loadVisibleWindow();
+  // Initial values belong to the mounted document. Subsequent scroll updates are reported upward.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [summary.documentId]);
+
+  useEffect(() => () => {
+    if (viewportFrame.current !== null) window.cancelAnimationFrame(viewportFrame.current);
+  }, []);
 
   useEffect(() => {
     void loadVisibleWindow();
@@ -338,7 +379,8 @@ export default function CsvGrid({ summary, theme, onApplyEdit, onSelectionChange
   const sourceRowForView = async (viewRow: number): Promise<number | null> => {
     const cached = cachedRow(viewRow);
     if (cached) return cached.sourceRow;
-    const data = await getGridWindow(viewRow, 1, 0, 1);
+    const data = await getGridWindow(summary.documentId, viewRow, 1, 0, 1);
+    if (data.documentId !== summary.documentId) return null;
     if (data.rows[0]) return data.rows[0].sourceRow;
     if (!summary.filtersActive && summary.sortCount === 0) {
       return viewRow + Number(summary.headerEnabled);
@@ -375,7 +417,14 @@ export default function CsvGrid({ summary, theme, onApplyEdit, onSelectionChange
     const matrix: string[][] = [];
     const sourceRows: number[] = [];
     for (let offset = 0; offset < rowAmount; offset += 400) {
-      const data = await getGridWindow(range.startRow + offset, Math.min(400, rowAmount - offset), range.startColumn, columnAmount);
+      const data = await getGridWindow(
+        summary.documentId,
+        range.startRow + offset,
+        Math.min(400, rowAmount - offset),
+        range.startColumn,
+        columnAmount,
+      );
+      if (data.documentId !== summary.documentId) continue;
       for (const row of data.rows) {
         matrix.push(row.cells);
         sourceRows.push(row.sourceRow);
@@ -540,6 +589,13 @@ export default function CsvGrid({ summary, theme, onApplyEdit, onSelectionChange
         draw();
         void loadVisibleWindow();
         setContextMenu(null);
+        if (onViewportChange && viewportFrame.current === null) {
+          viewportFrame.current = window.requestAnimationFrame(() => {
+            viewportFrame.current = null;
+            const viewport = viewportRef.current;
+            if (viewport) onViewportChange({ scrollTop: viewport.scrollTop, scrollLeft: viewport.scrollLeft });
+          });
+        }
       }}
       onKeyDown={handleKeyDown}
       onMouseDown={(event) => {

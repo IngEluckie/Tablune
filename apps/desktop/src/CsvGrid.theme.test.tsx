@@ -1,12 +1,14 @@
 // @vitest-environment jsdom
 
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import CsvGrid from "./CsvGrid";
+import { getGridWindow } from "./ipc";
 import type { DocumentSummary } from "./types";
 
 vi.mock("./ipc", () => ({
   getGridWindow: vi.fn().mockResolvedValue({
+    documentId: 1,
     revision: 0,
     viewRevision: 0,
     rowStart: 0,
@@ -16,6 +18,7 @@ vi.mock("./ipc", () => ({
 }));
 
 const summary: DocumentSummary = {
+  documentId: 1,
   path: null,
   displayName: "Untitled.csv",
   delimiter: ",",
@@ -65,9 +68,18 @@ describe("CsvGrid theming", () => {
   };
 
   beforeEach(() => {
+    vi.mocked(getGridWindow).mockResolvedValue({
+      documentId: 1,
+      revision: 0,
+      viewRevision: 0,
+      rowStart: 0,
+      columnStart: 0,
+      rows: [],
+    });
     fillStyles.length = 0;
     strokeStyles.length = 0;
     clearRect.mockClear();
+    context.fillText.mockClear();
     vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(800);
     vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(600);
     vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation((() => context) as unknown as typeof HTMLCanvasElement.prototype.getContext);
@@ -102,5 +114,49 @@ describe("CsvGrid theming", () => {
     expect(clearRect).toHaveBeenCalled();
     expect(fillStyles).toContain("#171c23");
     expect(strokeStyles).toContain("#45c982");
+  });
+
+  it("ignores a grid response belonging to another document", async () => {
+    vi.mocked(getGridWindow).mockResolvedValue({
+      documentId: 99,
+      revision: 0,
+      viewRevision: 0,
+      rowStart: 0,
+      columnStart: 0,
+      rows: [{ viewIndex: 0, sourceRow: 0, rowId: 1, cells: ["stale value"] }],
+    });
+    render(<CsvGrid
+      summary={summary}
+      theme="light"
+      onApplyEdit={vi.fn().mockResolvedValue(undefined)}
+      onSelectionChange={vi.fn()}
+      onError={vi.fn()}
+      onHeaderSort={vi.fn()}
+    />);
+
+    await waitFor(() => expect(getGridWindow).toHaveBeenCalled());
+    expect(context.fillText).not.toHaveBeenCalledWith("stale value", expect.any(Number), expect.any(Number));
+  });
+
+  it("restores and reports the document viewport", async () => {
+    const onViewportChange = vi.fn();
+    const { container } = render(<CsvGrid
+      summary={summary}
+      theme="light"
+      initialViewport={{ scrollTop: 140, scrollLeft: 75 }}
+      onViewportChange={onViewportChange}
+      onApplyEdit={vi.fn().mockResolvedValue(undefined)}
+      onSelectionChange={vi.fn()}
+      onError={vi.fn()}
+      onHeaderSort={vi.fn()}
+    />);
+    const viewport = container.querySelector(".grid-viewport") as HTMLDivElement;
+    expect(viewport.scrollTop).toBe(140);
+    expect(viewport.scrollLeft).toBe(75);
+
+    viewport.scrollTop = 210;
+    viewport.scrollLeft = 95;
+    fireEvent.scroll(viewport);
+    await waitFor(() => expect(onViewportChange).toHaveBeenCalledWith({ scrollTop: 210, scrollLeft: 95 }));
   });
 });

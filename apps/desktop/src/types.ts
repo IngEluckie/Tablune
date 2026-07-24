@@ -1,4 +1,5 @@
 export type LineEnding = "lf" | "crlf";
+export type DocumentId = number;
 
 export interface CsvPayload {
   rows: string[][];
@@ -12,6 +13,7 @@ export interface Selection {
 }
 
 export interface DocumentSummary {
+  documentId: DocumentId;
   path: string | null;
   displayName: string;
   delimiter: string;
@@ -32,6 +34,10 @@ export interface DocumentSummary {
   sortCount: number;
 }
 
+export interface WorkspaceSummary {
+  documents: DocumentSummary[];
+}
+
 export interface GridRow {
   viewIndex: number;
   sourceRow: number;
@@ -40,6 +46,7 @@ export interface GridRow {
 }
 
 export interface GridWindow {
+  documentId: DocumentId;
   revision: number;
   viewRevision: number;
   rowStart: number;
@@ -58,6 +65,11 @@ export interface SelectionRange {
   anchor: CellCoordinate;
   focus: CellCoordinate;
   mode: SelectionMode;
+}
+
+export interface GridViewportState {
+  scrollTop: number;
+  scrollLeft: number;
 }
 
 export interface CellInput {
@@ -148,4 +160,35 @@ export interface FacetPage {
   values: FacetValue[];
   totalDistinct: number;
   nextOffset: number | null;
+}
+
+export interface PythonStatus {
+  path: string | null;
+  version: string | null;
+  available: boolean;
+  error: string | null;
+}
+
+export interface MacroChangeSample {
+  row: number;
+  column: number;
+  before: string | null;
+  after: string | null;
+}
+
+export interface MacroPreview {
+  id: string;
+  baseRevision: number;
+  rowsBefore: number;
+  rowsAfter: number;
+  columnsBefore: number;
+  columnsAfter: number;
+  changedCells: number;
+  headerChanged: boolean;
+  estimatedUndoBytes: number;
+  canApply: boolean;
+  blockedReason: string | null;
+  stdout: string;
+  stderr: string;
+  samples: MacroChangeSample[];
 }

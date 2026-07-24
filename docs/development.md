@@ -10,6 +10,16 @@ pnpm install
 pnpm dev
 ```
 
+Python macro development and integration tests require Python 3.10 or later. The application detects Homebrew and `PATH` installations, and users can select another interpreter from the macro dialog. Tablune does not require or install third-party Python packages.
+
+Macro files define this standard-library contract:
+
+```python
+def transform(rows, context):
+    # rows is list[list[str]]; return rows or {"rows": rows, "headers": [...]}.
+    return rows
+```
+
 The first supported development target is Apple Silicon macOS. Intel macOS compatibility should be kept where dependencies permit it.
 
 ## Windows 11

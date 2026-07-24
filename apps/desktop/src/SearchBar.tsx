@@ -52,7 +52,7 @@ export default function SearchBar({ summary, selection, onSummary, onNavigate, o
     }
     setSearching(true);
     try {
-      const found = await searchSession(request);
+      const found = await searchSession(summary.documentId, request);
       setMatches(found);
       if (!found.length) {
         setActive(-1);
@@ -80,7 +80,7 @@ export default function SearchBar({ summary, selection, onSummary, onNavigate, o
   const replace = async (replaceAll: boolean) => {
     if (!query) return;
     try {
-      const next = await replaceSession({ search: request, replacement, replaceAll, expectedRevision: summary.revision });
+      const next = await replaceSession(summary.documentId, { search: request, replacement, replaceAll, expectedRevision: summary.revision });
       onSummary(next);
       setMatches([]);
       setActive(-1);

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tablune_core::TableDocument;
 use tablune_csv::{CsvDialect, LineEnding};
 
+mod python_macros;
 mod session;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,15 +90,19 @@ fn exit_application(app: tauri::AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(session::SessionState::default())
+        .manage(session::WorkspaceState::default())
+        .manage(python_macros::PythonRuntimeState::default())
         .invoke_handler(tauri::generate_handler![
             read_csv_document,
             write_csv_document,
             rename_csv_document,
             exit_application,
+            session::workspace_summary,
+            session::workspace_reorder,
             session::session_summary,
             session::session_new,
             session::session_open,
+            session::session_close,
             session::session_save,
             session::session_rename,
             session::session_grid_window,
@@ -112,10 +117,17 @@ pub fn run() {
             session::session_column_profile,
             session::session_facets,
             session::session_export_view,
-            session::session_write_recovery,
-            session::session_recovery_available,
-            session::session_restore_recovery,
-            session::session_discard_recovery
+            session::workspace_write_recovery,
+            session::workspace_recovery_available,
+            session::workspace_restore_recovery,
+            session::workspace_discard_recovery,
+            python_macros::python_status,
+            python_macros::python_set_interpreter,
+            python_macros::macro_read_script,
+            python_macros::macro_write_script,
+            python_macros::python_preview_macro,
+            python_macros::python_cancel_macro,
+            python_macros::python_apply_preview
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tablune Sheets");

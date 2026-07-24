@@ -25,6 +25,8 @@ Tablune Sheets 0.3 is a desktop editor and non-destructive explorer for delimite
 - Stable multi-column sorting and typed filters
 - Facets, inferred types, and column profiles
 - Export current view and apply sort explicitly
+- Full-document Python macros using a user-managed Python environment
+- Macro editor, script open/save, mandatory preview, cancellation, and atomic undo
 
 ## Excluded
 
@@ -32,10 +34,11 @@ Tablune Sheets 0.3 is a desktop editor and non-destructive explorer for delimite
 - Styling and number formats
 - Multiple worksheets
 - XLSX import or export
-- Charts, pivot tables, and macros
+- Charts and pivot tables
+- Sandboxed macros, package installation, and managed Python environments
 - Collaboration and cloud storage
 - Automatic type conversion
 
 ## Acceptance criterion
 
-On macOS, a user can safely edit and recover a CSV, inspect up to 100,000 rows through a windowed canvas, create non-destructive views, and export results without losing or coercing textual cell values.
+On macOS, a user can safely edit and recover a CSV, inspect up to 100,000 rows through a windowed canvas, create non-destructive views, preview and undo Python transformations, and export results without losing or coercing textual cell values.

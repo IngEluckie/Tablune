@@ -34,6 +34,7 @@ const defaultProps = {
   onHeaderChange: vi.fn(),
   onToggleExplorer: vi.fn(),
   onClearView: vi.fn(),
+  onPythonMacro: vi.fn(),
   onThemeChange: vi.fn(),
   onDelimiterChange: vi.fn(),
   onDocumentNameCommit: vi.fn().mockResolvedValue(true),
@@ -110,6 +111,8 @@ describe("RibbonHeader", () => {
 
     fireEvent.mouseEnter(screen.getByRole("button", { name: "Data" }));
     expect((screen.getByRole("button", { name: "Insert Row" }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Python Macro" }));
+    expect(defaultProps.onPythonMacro).toHaveBeenCalledOnce();
     fireEvent.change(screen.getByRole("combobox", { name: "Delimiter" }), {
       target: { value: ";" },
     });
