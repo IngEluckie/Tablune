@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CsvGrid, { normalizeSelection } from "./CsvGrid";
 import DocumentTabs from "./DocumentTabs";
 import ExplorerPanel from "./ExplorerPanel";
-import PythonMacroDialog from "./PythonMacroDialog";
+import PythonMacroPanel from "./PythonMacroDialog";
 import SearchBar from "./SearchBar";
 import RibbonHeader from "./RibbonHeader";
 import UnsavedChangesDialog from "./UnsavedChangesDialog";
@@ -126,6 +126,7 @@ export default function App() {
   const activeDocumentIdRef = useRef<DocumentId>(0);
   const closingInProgress = useRef(false);
   const lastRecovery = useRef(0);
+  const restoreExplorerAfterMacro = useRef(false);
 
   const summary = documents.find((document) => document.documentId === activeDocumentId) ?? EMPTY_SUMMARY;
   const tabUi = tabUiStates[activeDocumentId] ?? emptyTabUiState();
@@ -521,6 +522,7 @@ export default function App() {
   }, [activateDocument, busy, createNew, macroOpen, requestCloseDocument, runHistoryCommand, unsavedRequest]);
 
   const renameDocument = async (nextName: string): Promise<boolean> => {
+    if (macroOpen) return false;
     const normalizedName = nextName.trim();
     if (!normalizedName || normalizedName === "." || normalizedName === ".." || /[\\/\0]/.test(normalizedName)) {
       setError("Enter a valid file name without folders.");
@@ -557,6 +559,7 @@ export default function App() {
   };
 
   const applyEdit = useCallback(async (command: EditCommand) => {
+    if (macroOpen) return;
     const documentId = activeDocumentIdRef.current;
     const document = documentsRef.current.find((candidate) => candidate.documentId === documentId);
     if (!document) return;
@@ -576,9 +579,10 @@ export default function App() {
       updateDocument(current);
       throw reason;
     }
-  }, [clearSizing, updateDocument]);
+  }, [clearSizing, macroOpen, updateDocument]);
 
   const changeView = async (nextView: ViewState) => {
+    if (macroOpen) return;
     const documentId = summary.documentId;
     if (!documentId) return;
     setBusy(true);
@@ -598,10 +602,12 @@ export default function App() {
   };
 
   const runGridCommand = (command: "copy" | "cut" | "paste") => {
+    if (macroOpen && command !== "copy") return;
     document.dispatchEvent(new CustomEvent("tablune-grid-command", { detail: command }));
   };
 
   const runDimensionOperation = (kind: "insertRows" | "deleteRows" | "insertColumns" | "deleteColumns") => {
+    if (macroOpen) return;
     const range = normalizeSelection(tabUi.selection);
     const rows = kind.endsWith("Rows");
     if (rows && (summary.filtersActive || summary.sortCount > 0)) {
@@ -614,6 +620,7 @@ export default function App() {
   };
 
   const exportView = async () => {
+    if (macroOpen) return;
     const documentId = summary.documentId;
     const destination = await save({
       defaultPath: `filtered-${summary.displayName}`,
@@ -635,12 +642,26 @@ export default function App() {
     ? documents.filter((document) => document.documentId === unsavedRequest.documentId)
     : documents.filter((document) => document.dirty);
 
+  const openPythonMacro = () => {
+    if (busy || macroOpen || unsavedRequest || summary.documentId === 0) return;
+    restoreExplorerAfterMacro.current = explorerOpen;
+    setExplorerOpen(false);
+    setMacroOpen(true);
+  };
+
+  const closePythonMacro = () => {
+    setMacroOpen(false);
+    if (restoreExplorerAfterMacro.current) setExplorerOpen(true);
+    restoreExplorerAfterMacro.current = false;
+  };
+
   return (
     <main className="app-shell" data-theme={theme}>
       <RibbonHeader
         documentName={summary.displayName}
         dirty={summary.dirty}
         busy={busy}
+        mutationsLocked={macroOpen}
         error={error}
         delimiter={summary.delimiter}
         headerEnabled={summary.headerEnabled}
@@ -667,14 +688,17 @@ export default function App() {
         onInsertColumn={() => runDimensionOperation("insertColumns")}
         onDeleteColumn={() => runDimensionOperation("deleteColumns")}
         onFind={() => setSearchOpen(true)}
-        onHeaderChange={(enabled) => void setSessionHeader(summary.documentId, enabled).then((next) => {
-          updateDocument(next);
-          clearSizing(next.documentId, "both");
-        }).catch((reason) => setError(String(reason)))}
-        onToggleExplorer={() => setExplorerOpen((open) => !open)}
+        onHeaderChange={(enabled) => {
+          if (macroOpen) return;
+          void setSessionHeader(summary.documentId, enabled).then((next) => {
+            updateDocument(next);
+            clearSizing(next.documentId, "both");
+          }).catch((reason) => setError(String(reason)));
+        }}
+        onToggleExplorer={() => { if (!macroOpen) setExplorerOpen((open) => !open); }}
         onClearView={() => void changeView(EMPTY_VIEW)}
         onResetCellSizing={() => clearSizing(summary.documentId, "both")}
-        onPythonMacro={() => setMacroOpen(true)}
+        onPythonMacro={openPythonMacro}
         onThemeChange={changeTheme}
         onDelimiterChange={(delimiter) => void applyEdit({ kind: "setDelimiter", delimiter })}
         onDocumentNameCommit={renameDocument}
@@ -686,6 +710,7 @@ export default function App() {
             key={summary.documentId}
             summary={summary}
             selection={tabUi.selection}
+            readOnly={macroOpen}
             onSummary={updateDocument}
             onNavigate={(match: SearchMatch) => {
               if (activeDocumentIdRef.current !== summary.documentId) return;
@@ -699,12 +724,13 @@ export default function App() {
             onError={(message) => handleActiveDocumentError(summary.documentId, message)}
           />
         )}
-        <div className={`workspace${explorerOpen ? " explorer-open" : ""}`}>
+        <div className={`workspace${explorerOpen && !macroOpen ? " explorer-open" : ""}${macroOpen ? " macro-open" : ""}`}>
           {summary.documentId !== 0 && (
             <CsvGrid
-              key={summary.documentId}
+              key={`grid-${summary.documentId}`}
               summary={summary}
               theme={theme}
+              readOnly={macroOpen}
               initialSelection={tabUi.selection}
               initialViewport={tabUi.viewport}
               initialSizing={tabUi.sizing}
@@ -723,9 +749,9 @@ export default function App() {
               }}
             />
           )}
-          {explorerOpen && summary.documentId !== 0 && (
+          {explorerOpen && !macroOpen && summary.documentId !== 0 && (
             <ExplorerPanel
-              key={summary.documentId}
+              key={`explorer-${summary.documentId}`}
               summary={summary}
               column={tabUi.selection.focus.column}
               view={tabUi.view}
@@ -740,6 +766,23 @@ export default function App() {
               onExport={exportView}
               onClose={() => setExplorerOpen(false)}
               onError={(message) => handleActiveDocumentError(summary.documentId, message)}
+            />
+          )}
+          {macroOpen && summary.documentId !== 0 && (
+            <PythonMacroPanel
+              key={`macro-${summary.documentId}`}
+              summary={summary}
+              trustAcknowledged={macroTrustAcknowledged}
+              onTrustAcknowledged={() => setMacroTrustAcknowledged(true)}
+              onApplied={(nextSummary) => {
+                updateDocument(nextSummary);
+                updateTabUi(nextSummary.documentId, (current) => ({
+                  ...current,
+                  view: EMPTY_VIEW,
+                  sizing: { columnWidths: {}, rowHeights: {} },
+                }));
+              }}
+              onClose={closePythonMacro}
             />
           )}
         </div>
@@ -764,24 +807,6 @@ export default function App() {
         <span>{summary.lineEnding === "crlf" ? "CRLF" : "LF"}</span>
         <span>UTF-8</span>
       </footer>
-
-      {macroOpen && (
-        <PythonMacroDialog
-          key={summary.documentId}
-          summary={summary}
-          trustAcknowledged={macroTrustAcknowledged}
-          onTrustAcknowledged={() => setMacroTrustAcknowledged(true)}
-          onApplied={(nextSummary) => {
-            updateDocument(nextSummary);
-            updateTabUi(nextSummary.documentId, (current) => ({
-              ...current,
-              view: EMPTY_VIEW,
-              sizing: { columnWidths: {}, rowHeights: {} },
-            }));
-          }}
-          onClose={() => setMacroOpen(false)}
-        />
-      )}
 
       {unsavedRequest && dialogDocuments.length > 0 && (
         <UnsavedChangesDialog

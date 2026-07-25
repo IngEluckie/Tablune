@@ -254,4 +254,58 @@ describe("CsvGrid theming", () => {
     fireEvent.doubleClick(viewport, { clientX: 10, clientY: 92, button: 0 });
     expect(onSizingChange).toHaveBeenLastCalledWith({ columnWidths: {}, rowHeights: {} });
   });
+
+  it("keeps navigation, sizing and copy available in read-only mode while blocking mutations", async () => {
+    vi.mocked(getGridWindow).mockResolvedValue({
+      documentId: 1,
+      revision: 0,
+      viewRevision: 0,
+      rowStart: 0,
+      columnStart: 0,
+      rows: [{ viewIndex: 0, sourceRow: 0, rowId: 1, cells: ["copy me"] }],
+    });
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    const onApplyEdit = vi.fn().mockResolvedValue(undefined);
+    const onSelectionChange = vi.fn();
+    const onSizingChange = vi.fn();
+    const onHeaderSort = vi.fn();
+    const { container, queryByRole } = render(<CsvGrid
+      summary={{ ...summary, rowCount: 1, columnCount: 1, visibleRowCount: 1 }}
+      theme="light"
+      readOnly
+      onSizingChange={onSizingChange}
+      onApplyEdit={onApplyEdit}
+      onSelectionChange={onSelectionChange}
+      onError={vi.fn()}
+      onHeaderSort={onHeaderSort}
+    />);
+    await waitFor(() => expect(getGridWindow).toHaveBeenCalled());
+    const viewport = container.querySelector(".grid-viewport") as HTMLDivElement;
+
+    fireEvent.pointerDown(viewport, { clientX: 80, clientY: 50, button: 0, pointerId: 1 });
+    fireEvent.keyDown(viewport, { key: "ArrowRight" });
+    expect(onSelectionChange).toHaveBeenCalled();
+
+    fireEvent.keyDown(viewport, { key: "x", metaKey: true });
+    fireEvent.keyDown(viewport, { key: "v", metaKey: true });
+    fireEvent.keyDown(viewport, { key: "Delete" });
+    fireEvent.keyDown(viewport, { key: "z" });
+    fireEvent.doubleClick(viewport, { clientX: 80, clientY: 50, button: 0 });
+    fireEvent.pointerDown(viewport, { clientX: 200, clientY: 10, button: 0, pointerId: 2 });
+    fireEvent.contextMenu(viewport, { clientX: 80, clientY: 50 });
+
+    expect(onApplyEdit).not.toHaveBeenCalled();
+    expect(onHeaderSort).not.toHaveBeenCalled();
+    expect(queryByRole("menu")).toBeNull();
+    expect(container.querySelector(".cell-editor")).toBeNull();
+
+    fireEvent.keyDown(viewport, { key: "c", metaKey: true });
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("copy me"));
+
+    fireEvent.pointerDown(viewport, { clientX: 212, clientY: 10, button: 0, pointerId: 3 });
+    fireEvent.pointerMove(viewport, { clientX: 232, clientY: 10, buttons: 1, pointerId: 3 });
+    fireEvent.pointerUp(viewport, { clientX: 232, clientY: 10, button: 0, pointerId: 3 });
+    expect(onSizingChange).toHaveBeenCalled();
+  });
 });

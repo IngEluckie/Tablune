@@ -71,10 +71,13 @@ vi.mock("./RibbonHeader", () => ({
     onNew: () => void;
     onOpen: () => void;
     onUndo: () => void;
+    mutationsLocked?: boolean;
     canDuplicate: boolean;
     onDuplicate: () => void;
     hasCustomSizing: boolean;
     onResetCellSizing: () => void;
+    onToggleExplorer: () => void;
+    onPythonMacro: () => void;
   }) => (
     <header>
       <span data-testid="active-name">{props.documentName}</span>
@@ -84,6 +87,8 @@ vi.mock("./RibbonHeader", () => ({
       <button onClick={props.onUndo}>Undo</button>
       <button onClick={props.onDuplicate} disabled={!props.canDuplicate}>Duplicar</button>
       <button onClick={props.onResetCellSizing} disabled={!props.hasCustomSizing}>Reset Cell Size</button>
+      <button onClick={props.onToggleExplorer} disabled={props.mutationsLocked}>Explore Panel</button>
+      <button onClick={props.onPythonMacro} disabled={props.mutationsLocked}>Python Macro</button>
     </header>
   ),
 }));
@@ -94,6 +99,7 @@ vi.mock("./CsvGrid", () => ({
     initialSelection: SelectionRange;
     initialViewport: GridViewportState;
     initialSizing: GridSizingState;
+    readOnly?: boolean;
     onSelectionChange: (selection: SelectionRange) => void;
     onViewportChange: (viewport: GridViewportState) => void;
     onSizingChange: (sizing: GridSizingState) => void;
@@ -106,6 +112,7 @@ vi.mock("./CsvGrid", () => ({
       data-scroll-top={props.initialViewport.scrollTop}
       data-column-width={props.initialSizing.columnWidths[2] ?? ""}
       data-row-height={props.initialSizing.rowHeights[7] ?? ""}
+      data-read-only={String(Boolean(props.readOnly))}
     >
       <button onClick={() => {
         props.onSelectionChange({ anchor: { row: 7, column: 2 }, focus: { row: 7, column: 2 }, mode: "cells" });
@@ -119,8 +126,14 @@ vi.mock("./CsvGrid", () => ({
   normalizeSelection: () => ({ startRow: 0, endRow: 0, startColumn: 0, endColumn: 0 }),
 }));
 vi.mock("./SearchBar", () => ({ default: () => null }));
-vi.mock("./ExplorerPanel", () => ({ default: () => null }));
-vi.mock("./PythonMacroDialog", () => ({ default: () => null }));
+vi.mock("./ExplorerPanel", () => ({ default: () => <aside aria-label="Data explorer">Explorer</aside> }));
+vi.mock("./PythonMacroDialog", () => ({
+  default: (props: { onClose: () => void }) => (
+    <aside aria-label="Python Macro">
+      <button onClick={props.onClose}>Close Python Macro</button>
+    </aside>
+  ),
+}));
 
 const summary = (
   documentId: number,
@@ -352,6 +365,33 @@ describe("App multidocument tabs", () => {
     fireEvent.keyDown(window, { key: "t", metaKey: true });
     await waitFor(() => expect(newSession).toHaveBeenCalledOnce());
     expect(screen.getByTestId("grid").getAttribute("data-document-id")).toBe("3");
+  });
+
+  it("docks Python Macro, locks the document, and restores Explorer on close", async () => {
+    vi.mocked(getWorkspaceSummary).mockResolvedValue({
+      documents: [summary(1, "first.csv"), summary(2, "second.csv")],
+    });
+    render(<App />);
+    await screen.findByRole("tab", { name: "first.csv" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Explore Panel" }));
+    expect(screen.getByRole("complementary", { name: "Data explorer" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Python Macro" }));
+    expect(screen.queryByRole("complementary", { name: "Data explorer" })).toBeNull();
+    expect(screen.getByRole("complementary", { name: "Python Macro" })).toBeTruthy();
+    expect(screen.getByTestId("grid").getAttribute("data-read-only")).toBe("true");
+    expect((screen.getByRole("tab", { name: "second.csv" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Explore Panel" }) as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Insert rows from grid" }));
+    expect(applySessionEdit).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Python Macro" }));
+    expect(screen.queryByRole("complementary", { name: "Python Macro" })).toBeNull();
+    expect(screen.getByRole("complementary", { name: "Data explorer" })).toBeTruthy();
+    expect(screen.getByTestId("grid").getAttribute("data-read-only")).toBe("false");
+    expect((screen.getByRole("tab", { name: "second.csv" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it("uses the custom dirty dialog and selects the right-hand neighbor after discard", async () => {

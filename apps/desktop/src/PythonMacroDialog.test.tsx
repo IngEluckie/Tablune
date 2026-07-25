@@ -77,6 +77,7 @@ const props = {
 
 describe("PythonMacroDialog", () => {
   beforeEach(() => {
+    window.localStorage.clear();
     vi.clearAllMocks();
     vi.mocked(getPythonStatus).mockResolvedValue({
       path: "/usr/local/bin/python3",
@@ -94,6 +95,8 @@ describe("PythonMacroDialog", () => {
   it("warns once, previews changes, and applies by preview id", async () => {
     render(<PythonMacroDialog {...props} />);
     await screen.findByText(/Python 3\.12\.1/);
+    expect(screen.getByRole("complementary", { name: "Python Macro" })).toBeTruthy();
+    expect(screen.queryByRole("dialog")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Run Preview" }));
     await waitFor(() => expect(previewPythonMacro).toHaveBeenCalledWith(
@@ -104,12 +107,12 @@ describe("PythonMacroDialog", () => {
     ));
     expect(ask).toHaveBeenCalledWith(expect.stringContaining("normal user permissions"), expect.anything());
     expect(props.onTrustAcknowledged).toHaveBeenCalledOnce();
-    await waitFor(() => {
-      expect(screen.getByText((_, element) => (
-        element?.tagName === "PRE" && element.textContent?.includes("macro output") === true
-      ))).toBeTruthy();
-    });
+    expect((screen.getByRole("tab", { name: "Preview" }) as HTMLElement).getAttribute("aria-selected")).toBe("true");
     expect(screen.getByText("R2 C1")).toBeTruthy();
+    fireEvent.click(screen.getByRole("tab", { name: "Console" }));
+    expect(screen.getByText((_, element) => (
+      element?.tagName === "PRE" && element.textContent?.includes("macro output") === true
+    ))).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Apply" }));
     await waitFor(() => expect(applyPythonPreview).toHaveBeenCalledWith(7, "preview-1", 2));
@@ -136,5 +139,35 @@ describe("PythonMacroDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "Run Preview" }));
     fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
     await waitFor(() => expect(cancelPythonMacro).toHaveBeenCalledOnce());
+  });
+
+  it("switches to Console when execution fails", async () => {
+    vi.mocked(previewPythonMacro).mockRejectedValue(new Error("macro exploded"));
+    render(<PythonMacroDialog {...props} trustAcknowledged />);
+    await screen.findByText(/Python 3\.12\.1/);
+
+    fireEvent.click(screen.getByRole("button", { name: "Run Preview" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("tab", { name: "Console" }).getAttribute("aria-selected")).toBe("true");
+    });
+    expect(screen.getByText((_, element) => (
+      element?.tagName === "PRE" && element.textContent?.includes("macro exploded") === true
+    ))).toBeTruthy();
+  });
+
+  it("resizes with the keyboard and persists the width", async () => {
+    render(<PythonMacroDialog {...props} />);
+    await screen.findByText(/Python 3\.12\.1/);
+    const separator = screen.getByRole("separator", { name: "Resize Python Macro panel" });
+
+    fireEvent.keyDown(separator, { key: "ArrowLeft" });
+
+    expect(separator.getAttribute("aria-valuenow")).toBe("496");
+    expect(window.localStorage.getItem("tablune.pythonMacroPanelWidth")).toBe("496");
+
+    const previewTab = screen.getByRole("tab", { name: "Preview" });
+    fireEvent.keyDown(previewTab, { key: "ArrowRight" });
+    await waitFor(() => expect(screen.getByRole("tab", { name: "Console" }).getAttribute("aria-selected")).toBe("true"));
   });
 });

@@ -42,6 +42,7 @@ const RESIZE_HIT_RADIUS = 5;
 interface CsvGridProps {
   summary: DocumentSummary;
   theme: ThemeMode;
+  readOnly?: boolean;
   onApplyEdit: (command: EditCommand) => Promise<void>;
   onSelectionChange: (selection: SelectionRange) => void;
   onError: (message: string) => void;
@@ -165,6 +166,7 @@ const DEFAULT_SELECTION: SelectionRange = {
 export default function CsvGrid({
   summary,
   theme,
+  readOnly = false,
   onApplyEdit,
   onSelectionChange,
   onError,
@@ -258,6 +260,13 @@ export default function CsvGrid({
     setContextMenu(null);
     setSelection(initialSelection);
   }, [initialSelection, summary.documentId]);
+
+  useEffect(() => {
+    if (readOnly) {
+      setEditing(null);
+      setContextMenu(null);
+    }
+  }, [readOnly]);
 
   useLayoutEffect(() => {
     const viewport = viewportRef.current;
@@ -522,6 +531,7 @@ export default function CsvGrid({
   };
 
   const beginEditing = async (target: GridTarget) => {
+    if (readOnly) return;
     if (target.mode === "columns" && summary.headerEnabled) {
       setDraft(summary.headerValues[target.column] ?? "");
       setEditing({ viewRow: -1, sourceRow: 0, column: target.column, header: true });
@@ -539,6 +549,7 @@ export default function CsvGrid({
     const target = editing;
     if (!target) return;
     setEditing(null);
+    if (readOnly) return;
     await onApplyEdit({ kind: "setCells", cells: [{ row: target.sourceRow, column: target.column, value: draft }] });
     viewportRef.current?.focus();
   };
@@ -616,6 +627,7 @@ export default function CsvGrid({
   useEffect(() => {
     const handleCommand = (event: Event) => {
       const command = (event as CustomEvent<string>).detail;
+      if (readOnly && command !== "copy") return;
       const operation = command === "copy" ? copySelection : command === "cut" ? cutSelection : pasteSelection;
       void operation().catch((reason) => onError(String(reason)));
     };
@@ -644,6 +656,14 @@ export default function CsvGrid({
     if (modifier && event.key.toLowerCase() === "c") {
       event.preventDefault();
       void copySelection().catch((reason) => onError(String(reason)));
+      return;
+    }
+    if (readOnly && (
+      (modifier && ["x", "v"].includes(event.key.toLowerCase()))
+      || ["Enter", "F2", "Delete", "Backspace"].includes(event.key)
+      || (event.key.length === 1 && !modifier && !event.altKey)
+    )) {
+      event.preventDefault();
       return;
     }
     if (modifier && event.key.toLowerCase() === "x") {
@@ -700,6 +720,7 @@ export default function CsvGrid({
   };
 
   const runContextOperation = async (operation: "insertRow" | "deleteRow" | "insertColumn" | "deleteColumn") => {
+    if (readOnly) return;
     const range = normalizeSelection(selection);
     setContextMenu(null);
     if ((summary.filtersActive || summary.sortCount > 0) && operation.includes("Row")) {
@@ -717,6 +738,7 @@ export default function CsvGrid({
     <div
       ref={viewportRef}
       className="grid-viewport"
+      aria-readonly={readOnly}
       tabIndex={0}
       onScroll={() => {
         draw();
@@ -762,7 +784,7 @@ export default function CsvGrid({
           if (absoluteY < COLUMN_HEADER_HEIGHT
             && absoluteX >= ROW_HEADER_WIDTH
             && withinColumn >= columnMetrics.sizeAt(column) - 24) {
-            onHeaderSort(column);
+            if (!readOnly) onHeaderSort(column);
             return;
           }
         }
@@ -839,12 +861,16 @@ export default function CsvGrid({
           return;
         }
         const target = targetFromPointer(event);
-        if (target) void beginEditing(target);
+        if (target && !readOnly) void beginEditing(target);
       }}
       onContextMenu={(event) => {
         event.preventDefault();
         const target = targetFromPointer(event);
         if (target) publishSelection(rangeForTarget(target, false));
+        if (readOnly) {
+          setContextMenu(null);
+          return;
+        }
         const rect = event.currentTarget.getBoundingClientRect();
         setContextMenu({ x: event.clientX - rect.left + event.currentTarget.scrollLeft, y: event.clientY - rect.top + event.currentTarget.scrollTop });
       }}

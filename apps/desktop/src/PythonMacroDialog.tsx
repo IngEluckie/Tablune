@@ -1,5 +1,5 @@
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   applyPythonPreview,
   cancelPythonMacro,
@@ -10,13 +10,20 @@ import {
   writeMacroScript,
 } from "./ipc";
 import type { DocumentSummary, MacroPreview, PythonStatus } from "./types";
+import {
+  MIN_MACRO_PANEL_WIDTH,
+  clampMacroPanelWidth,
+  macroPanelMaximum,
+  readMacroPanelWidth,
+  writeMacroPanelWidth,
+} from "./macroPanelSizing";
 
 const STARTER_MACRO = `def transform(rows, context):
     """Transform the document and return rows containing strings."""
     return rows
 `;
 
-interface PythonMacroDialogProps {
+interface PythonMacroPanelProps {
   summary: DocumentSummary;
   trustAcknowledged: boolean;
   onTrustAcknowledged: () => void;
@@ -35,13 +42,13 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
-export default function PythonMacroDialog({
+export default function PythonMacroPanel({
   summary,
   trustAcknowledged,
   onTrustAcknowledged,
   onApplied,
   onClose,
-}: PythonMacroDialogProps) {
+}: PythonMacroPanelProps) {
   const [python, setPython] = useState<PythonStatus | null>(null);
   const [sourcePath, setSourcePath] = useState<string | null>(null);
   const [code, setCode] = useState(STARTER_MACRO);
@@ -50,6 +57,16 @@ export default function PythonMacroDialog({
   const [running, setRunning] = useState(false);
   const [working, setWorking] = useState(false);
   const [consoleError, setConsoleError] = useState("");
+  const [resultTab, setResultTab] = useState<"preview" | "console">("preview");
+  const [panelWidth, setPanelWidth] = useState(readMacroPanelWidth);
+  const panelRef = useRef<HTMLElement>(null);
+  const previewTabRef = useRef<HTMLButtonElement>(null);
+  const consoleTabRef = useRef<HTMLButtonElement>(null);
+  const resizeRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startWidth: number;
+  } | null>(null);
   const dirty = code !== savedCode;
   const previewStale = preview !== null && preview.baseRevision !== summary.revision;
   const canApply = preview !== null && preview.canApply && !previewStale && !running && !working;
@@ -75,6 +92,23 @@ export default function PythonMacroDialog({
 
   useEffect(() => {
     void refreshPython();
+  }, []);
+
+  useEffect(() => {
+    if (consoleError) setResultTab("console");
+  }, [consoleError]);
+
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    const workspace = panel?.parentElement;
+    if (!workspace || typeof ResizeObserver === "undefined") return;
+    const clampToWorkspace = () => {
+      setPanelWidth((current) => clampMacroPanelWidth(current, workspace.clientWidth));
+    };
+    clampToWorkspace();
+    const observer = new ResizeObserver(clampToWorkspace);
+    observer.observe(workspace);
+    return () => observer.disconnect();
   }, []);
 
   const saveCurrent = async (saveAs = false): Promise<boolean> => {
@@ -174,6 +208,7 @@ export default function PythonMacroDialog({
     setRunning(true);
     try {
       setPreview(await previewPythonMacro(summary.documentId, code, sourcePath, summary.revision));
+      setResultTab("preview");
     } catch (reason) {
       setConsoleError(String(reason));
     } finally {
@@ -209,105 +244,202 @@ export default function PythonMacroDialog({
     onClose();
   };
 
+  const workspaceWidth = () => panelRef.current?.parentElement?.clientWidth;
+
+  const resizeTo = (width: number) => {
+    setPanelWidth(clampMacroPanelWidth(width, workspaceWidth()));
+  };
+
+  const finishResize = () => {
+    resizeRef.current = null;
+    setPanelWidth((current) => {
+      const next = clampMacroPanelWidth(current, workspaceWidth());
+      writeMacroPanelWidth(next);
+      return next;
+    });
+  };
+
+  const selectResultTab = (tab: "preview" | "console", focus = false) => {
+    setResultTab(tab);
+    if (focus) {
+      window.setTimeout(() => {
+        (tab === "preview" ? previewTabRef : consoleTabRef).current?.focus();
+      }, 0);
+    }
+  };
+
   return (
-    <div className="macro-backdrop">
-      <section className="macro-dialog" role="dialog" aria-modal="true" aria-labelledby="macro-title">
-        <header className="macro-dialog-header">
-          <div>
-            <h1 id="macro-title">Python Macro</h1>
-            <span>{dirty ? "● " : ""}{fileName(sourcePath)}</span>
-          </div>
-          <button onClick={() => void closeDialog()} disabled={running}>Close</button>
-        </header>
+    <aside
+      ref={panelRef}
+      className="macro-panel"
+      aria-label="Python Macro"
+      style={{ width: panelWidth }}
+    >
+      <div
+        className="macro-panel-resizer"
+        role="separator"
+        aria-label="Resize Python Macro panel"
+        aria-orientation="vertical"
+        aria-valuemin={MIN_MACRO_PANEL_WIDTH}
+        aria-valuemax={macroPanelMaximum(workspaceWidth())}
+        aria-valuenow={panelWidth}
+        tabIndex={0}
+        onPointerDown={(event) => {
+          if (event.button !== 0) return;
+          event.currentTarget.setPointerCapture?.(event.pointerId);
+          resizeRef.current = { pointerId: event.pointerId, startX: event.clientX, startWidth: panelWidth };
+        }}
+        onPointerMove={(event) => {
+          const resize = resizeRef.current;
+          if (!resize || resize.pointerId !== event.pointerId) return;
+          resizeTo(resize.startWidth + resize.startX - event.clientX);
+        }}
+        onPointerUp={(event) => {
+          const resize = resizeRef.current;
+          if (!resize || resize.pointerId !== event.pointerId) return;
+          if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          }
+          finishResize();
+        }}
+        onPointerCancel={finishResize}
+        onKeyDown={(event) => {
+          if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+          event.preventDefault();
+          const step = event.shiftKey ? 48 : 16;
+          const next = panelWidth + (event.key === "ArrowLeft" ? step : -step);
+          const clamped = clampMacroPanelWidth(next, workspaceWidth());
+          setPanelWidth(clamped);
+          writeMacroPanelWidth(clamped);
+        }}
+      />
 
-        <section className="macro-python-status" aria-label="Python interpreter">
-          <span className={python?.available ? "available" : "unavailable"}>
-            {python?.available
-              ? `Python ${python.version} — ${python.path}`
-              : python?.error ?? "Detecting Python…"}
-          </span>
-          <button onClick={() => void refreshPython()} disabled={working || running}>Test</button>
-          <button onClick={() => void chooseInterpreter()} disabled={working || running}>Choose…</button>
-        </section>
-
-        <div className="macro-toolbar">
-          <button onClick={() => void newMacro()} disabled={working || running}>New</button>
-          <button onClick={() => void openMacro()} disabled={working || running}>Open</button>
-          <button onClick={() => void saveCurrent(false)} disabled={working || running || !dirty}>Save</button>
-          <button onClick={() => void saveCurrent(true)} disabled={working || running}>Save As</button>
-          <span className="macro-toolbar-spacer" />
-          {running ? (
-            <button className="danger" onClick={() => void cancelRun()}>Cancel</button>
-          ) : (
-            <button
-              className="primary"
-              onClick={() => void runPreview()}
-              disabled={working || !python?.available || code.trim().length === 0}
-            >
-              Run Preview
-            </button>
-          )}
-          <button className="primary" onClick={() => void applyPreview()} disabled={!canApply}>Apply</button>
+      <header className="macro-panel-header">
+        <div>
+          <h1>Python Macro</h1>
+          <span>{dirty ? "● " : ""}{fileName(sourcePath)}</span>
         </div>
+        <button onClick={() => void closeDialog()} disabled={running} aria-label="Close Python Macro">×</button>
+      </header>
 
-        <div className="macro-workspace">
-          <label className="macro-editor-panel">
-            <span>Macro code</span>
-            <textarea
-              aria-label="Macro code"
-              value={code}
-              spellCheck={false}
-              disabled={running || working}
-              onChange={(event) => {
-                setCode(event.target.value);
-                setPreview(null);
-              }}
-            />
-          </label>
-
-          <section className="macro-results" aria-label="Macro results">
-            <div className="macro-preview-panel">
-              <h2>Preview</h2>
-              {running && <p>Running Python macro…</p>}
-              {!running && !preview && <p>Run the macro to preview changes. The document will not be modified.</p>}
-              {preview && (
-                <>
-                  <div className="macro-metrics">
-                    <span>Rows <strong>{preview.rowsBefore.toLocaleString()} → {preview.rowsAfter.toLocaleString()}</strong></span>
-                    <span>Columns <strong>{preview.columnsBefore} → {preview.columnsAfter}</strong></span>
-                    <span>Changed cells <strong>{preview.changedCells.toLocaleString()}</strong></span>
-                    <span>Undo <strong>{formatBytes(preview.estimatedUndoBytes)}</strong></span>
-                    {preview.headerChanged && <span>Header changed</span>}
-                  </div>
-                  {(preview.blockedReason || previewStale) && (
-                    <p className="macro-warning">{previewStale ? "The document changed; run Preview again." : preview.blockedReason}</p>
-                  )}
-                  {preview.samples.length > 0 && (
-                    <div className="macro-samples-scroll">
-                      <table className="macro-samples">
-                        <thead><tr><th>Cell</th><th>Before</th><th>After</th></tr></thead>
-                        <tbody>
-                          {preview.samples.map((sample) => (
-                            <tr key={`${sample.row}:${sample.column}`}>
-                              <th>R{sample.row + 1} C{sample.column + 1}</th>
-                              <td>{sample.before ?? "∅"}</td>
-                              <td>{sample.after ?? "∅"}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-            <div className="macro-console-panel">
-              <h2>Console</h2>
-              <pre>{consoleText}</pre>
-            </div>
-          </section>
-        </div>
+      <section className="macro-python-status" aria-label="Python interpreter">
+        <span className={python?.available ? "available" : "unavailable"}>
+          {python?.available
+            ? `Python ${python.version} — ${python.path}`
+            : python?.error ?? "Detecting Python…"}
+        </span>
+        <button onClick={() => void refreshPython()} disabled={working || running}>Test</button>
+        <button onClick={() => void chooseInterpreter()} disabled={working || running}>Choose…</button>
       </section>
-    </div>
+
+      <div className="macro-toolbar">
+        <button onClick={() => void newMacro()} disabled={working || running}>New</button>
+        <button onClick={() => void openMacro()} disabled={working || running}>Open</button>
+        <button onClick={() => void saveCurrent(false)} disabled={working || running || !dirty}>Save</button>
+        <button onClick={() => void saveCurrent(true)} disabled={working || running}>Save As</button>
+      </div>
+
+      <label className="macro-editor-panel">
+        <span>Macro code</span>
+        <textarea
+          aria-label="Macro code"
+          value={code}
+          spellCheck={false}
+          disabled={running || working}
+          onChange={(event) => {
+            setCode(event.target.value);
+            setPreview(null);
+          }}
+        />
+      </label>
+
+      <section className="macro-results" aria-label="Macro results">
+        <div className="macro-result-tabs" role="tablist" aria-label="Macro output">
+          <button
+            ref={previewTabRef}
+            id="macro-preview-tab"
+            role="tab"
+            aria-selected={resultTab === "preview"}
+            aria-controls="macro-preview-panel"
+            tabIndex={resultTab === "preview" ? 0 : -1}
+            onClick={() => selectResultTab("preview")}
+            onKeyDown={(event) => {
+              if (event.key !== "ArrowRight" && event.key !== "End") return;
+              event.preventDefault();
+              selectResultTab("console", true);
+            }}
+          >Preview</button>
+          <button
+            ref={consoleTabRef}
+            id="macro-console-tab"
+            role="tab"
+            aria-selected={resultTab === "console"}
+            aria-controls="macro-console-panel"
+            tabIndex={resultTab === "console" ? 0 : -1}
+            onClick={() => selectResultTab("console")}
+            onKeyDown={(event) => {
+              if (event.key !== "ArrowLeft" && event.key !== "Home") return;
+              event.preventDefault();
+              selectResultTab("preview", true);
+            }}
+          >Console</button>
+        </div>
+        {resultTab === "preview" ? (
+          <div id="macro-preview-panel" className="macro-preview-panel" role="tabpanel" aria-labelledby="macro-preview-tab">
+            {running && <p>Running Python macro…</p>}
+            {!running && !preview && <p>Run the macro to preview changes. The document will not be modified.</p>}
+            {preview && (
+              <>
+                <div className="macro-metrics">
+                  <span>Rows <strong>{preview.rowsBefore.toLocaleString()} → {preview.rowsAfter.toLocaleString()}</strong></span>
+                  <span>Columns <strong>{preview.columnsBefore} → {preview.columnsAfter}</strong></span>
+                  <span>Changed cells <strong>{preview.changedCells.toLocaleString()}</strong></span>
+                  <span>Undo <strong>{formatBytes(preview.estimatedUndoBytes)}</strong></span>
+                  {preview.headerChanged && <span>Header changed</span>}
+                </div>
+                {(preview.blockedReason || previewStale) && (
+                  <p className="macro-warning">{previewStale ? "The document changed; run Preview again." : preview.blockedReason}</p>
+                )}
+                {preview.samples.length > 0 && (
+                  <div className="macro-samples-scroll">
+                    <table className="macro-samples">
+                      <thead><tr><th>Cell</th><th>Before</th><th>After</th></tr></thead>
+                      <tbody>
+                        {preview.samples.map((sample) => (
+                          <tr key={`${sample.row}:${sample.column}`}>
+                            <th>R{sample.row + 1} C{sample.column + 1}</th>
+                            <td>{sample.before ?? "∅"}</td>
+                            <td>{sample.after ?? "∅"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        ) : (
+          <div id="macro-console-panel" className="macro-console-panel" role="tabpanel" aria-labelledby="macro-console-tab">
+            <pre>{consoleText}</pre>
+          </div>
+        )}
+      </section>
+
+      <footer className="macro-actions">
+        {running ? (
+          <button className="danger" onClick={() => void cancelRun()}>Cancel</button>
+        ) : (
+          <button
+            className="primary"
+            onClick={() => void runPreview()}
+            disabled={working || !python?.available || code.trim().length === 0}
+          >
+            Run Preview
+          </button>
+        )}
+        <button className="primary" onClick={() => void applyPreview()} disabled={!canApply}>Apply</button>
+      </footer>
+    </aside>
   );
 }

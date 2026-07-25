@@ -22,6 +22,7 @@ interface RibbonHeaderProps {
   documentName: string;
   dirty: boolean;
   busy: boolean;
+  mutationsLocked?: boolean;
   error: string | null;
   delimiter: string;
   headerEnabled: boolean;
@@ -78,6 +79,7 @@ export default function RibbonHeader({
   documentName,
   dirty,
   busy,
+  mutationsLocked = false,
   error,
   delimiter,
   headerEnabled,
@@ -162,7 +164,7 @@ export default function RibbonHeader({
   };
 
   const beginNameEdit = () => {
-    if (busy) return;
+    if (busy || mutationsLocked) return;
     setNameDraft(documentName);
     setEditingName(true);
   };
@@ -197,6 +199,9 @@ export default function RibbonHeader({
   useEffect(() => {
     if (editingName) nameInput.current?.select();
   }, [editingName]);
+  useEffect(() => {
+    if (mutationsLocked && editingName) cancelNameEdit();
+  }, [editingName, mutationsLocked]);
 
   return (
     <section
@@ -256,6 +261,7 @@ export default function RibbonHeader({
               className="header-document"
               title={documentName}
               aria-label={`Rename ${documentName}`}
+              disabled={busy || mutationsLocked}
               onDoubleClick={beginNameEdit}
             >
               {dirty && <span className="dirty-dot" aria-label="Unsaved changes">●</span>}
@@ -293,23 +299,23 @@ export default function RibbonHeader({
           <div className="ribbon-content">
             {activeMenu === "file" && (
               <div className="ribbon-group" aria-label="File actions">
-                <button onClick={onNew} disabled={busy}>New</button>
-                <button onClick={onOpen} disabled={busy}>Open</button>
-                <button onClick={onSave} disabled={busy}>Save</button>
-                <button onClick={onSaveAs} disabled={busy}>Save As</button>
-                <button onClick={onDuplicate} disabled={busy || !canDuplicate}>Duplicar</button>
-                <button onClick={onExportView} disabled={busy}>Export View</button>
+                <button onClick={onNew} disabled={busy || mutationsLocked}>New</button>
+                <button onClick={onOpen} disabled={busy || mutationsLocked}>Open</button>
+                <button onClick={onSave} disabled={busy || mutationsLocked}>Save</button>
+                <button onClick={onSaveAs} disabled={busy || mutationsLocked}>Save As</button>
+                <button onClick={onDuplicate} disabled={busy || mutationsLocked || !canDuplicate}>Duplicar</button>
+                <button onClick={onExportView} disabled={busy || mutationsLocked}>Export View</button>
               </div>
             )}
 
             {activeMenu === "edit" && (
               <div className="ribbon-group" aria-label="Edit actions">
-                <button onClick={onUndo} disabled={busy || !canUndo}>Undo</button>
-                <button onClick={onRedo} disabled={busy || !canRedo}>Redo</button>
+                <button onClick={onUndo} disabled={busy || mutationsLocked || !canUndo}>Undo</button>
+                <button onClick={onRedo} disabled={busy || mutationsLocked || !canRedo}>Redo</button>
                 <span className="ribbon-divider" aria-hidden="true" />
-                <button onClick={onCut} disabled={busy}>Cut</button>
+                <button onClick={onCut} disabled={busy || mutationsLocked}>Cut</button>
                 <button onClick={onCopy} disabled={busy}>Copy</button>
-                <button onClick={onPaste} disabled={busy}>Paste</button>
+                <button onClick={onPaste} disabled={busy || mutationsLocked}>Paste</button>
                 <span className="ribbon-divider" aria-hidden="true" />
                 <button onClick={onFind}>Find</button>
               </div>
@@ -321,6 +327,7 @@ export default function RibbonHeader({
                   Delimiter
                   <select
                     value={delimiter}
+                    disabled={busy || mutationsLocked}
                     onChange={(event) => onDelimiterChange(event.target.value)}
                   >
                     <option value=",">Comma</option>
@@ -330,26 +337,26 @@ export default function RibbonHeader({
                   </select>
                 </label>
                 <span className="ribbon-divider" aria-hidden="true" />
-                <button onClick={onInsertRow} disabled={busy || !canChangeRows}>Insert Row</button>
-                <button onClick={onDeleteRow} disabled={busy || !canChangeRows}>Delete Row</button>
-                <button onClick={onInsertColumn} disabled={busy}>Insert Column</button>
-                <button onClick={onDeleteColumn} disabled={busy}>Delete Column</button>
+                <button onClick={onInsertRow} disabled={busy || mutationsLocked || !canChangeRows}>Insert Row</button>
+                <button onClick={onDeleteRow} disabled={busy || mutationsLocked || !canChangeRows}>Delete Row</button>
+                <button onClick={onInsertColumn} disabled={busy || mutationsLocked}>Insert Column</button>
+                <button onClick={onDeleteColumn} disabled={busy || mutationsLocked}>Delete Column</button>
                 <span className="ribbon-divider" aria-hidden="true" />
-                <button onClick={onToggleExplorer}>Explore</button>
-                <button onClick={onClearView} disabled={!hasView}>Clear View</button>
+                <button onClick={onToggleExplorer} disabled={mutationsLocked}>Explore</button>
+                <button onClick={onClearView} disabled={mutationsLocked || !hasView}>Clear View</button>
                 <span className="ribbon-divider" aria-hidden="true" />
-                <button onClick={onPythonMacro} disabled={busy}>Python Macro</button>
+                <button onClick={onPythonMacro} disabled={busy || mutationsLocked}>Python Macro</button>
               </div>
             )}
 
             {activeMenu === "view" && (
               <div className="ribbon-group" aria-label="View actions">
-                <label className="ribbon-check"><input type="checkbox" checked={headerEnabled} onChange={(event) => onHeaderChange(event.target.checked)} /> First row is header</label>
+                <label className="ribbon-check"><input type="checkbox" checked={headerEnabled} disabled={busy || mutationsLocked} onChange={(event) => onHeaderChange(event.target.checked)} /> First row is header</label>
                 <span className="ribbon-divider" aria-hidden="true" />
                 <label className="ribbon-check"><input type="checkbox" checked={theme === "dark"} onChange={(event) => onThemeChange(event.target.checked ? "dark" : "light")} /> Dark mode</label>
                 <span className="ribbon-divider" aria-hidden="true" />
                 <button onClick={onFind}>Find</button>
-                <button onClick={onToggleExplorer}>Data Explorer</button>
+                <button onClick={onToggleExplorer} disabled={mutationsLocked}>Data Explorer</button>
                 <button onClick={onResetCellSizing} disabled={busy || !hasCustomSizing}>Reset Cell Size</button>
               </div>
             )}

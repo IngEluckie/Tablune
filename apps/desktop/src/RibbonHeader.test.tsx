@@ -177,6 +177,30 @@ describe("RibbonHeader", () => {
     expect(defaultProps.onDuplicate).toHaveBeenCalledOnce();
   });
 
+  it("locks document mutations while keeping navigation tools available", () => {
+    render(<RibbonHeader {...defaultProps} mutationsLocked canUndo canRedo hasView hasCustomSizing />);
+
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "File" }));
+    expect((screen.getByRole("button", { name: "New" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "Edit" }));
+    expect((screen.getByRole("button", { name: "Cut" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Paste" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Copy" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole("button", { name: "Find" }) as HTMLButtonElement).disabled).toBe(false);
+
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "Data" }));
+    expect((screen.getByRole("combobox", { name: "Delimiter" }) as HTMLSelectElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Insert Row" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Explore" }) as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "View" }));
+    expect((screen.getByRole("checkbox", { name: "First row is header" }) as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getByRole("checkbox", { name: "Dark mode" }) as HTMLInputElement).disabled).toBe(false);
+    expect((screen.getByRole("button", { name: "Reset Cell Size" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it("edits the document name on double click and commits it with Enter", async () => {
     render(<RibbonHeader {...defaultProps} />);
 

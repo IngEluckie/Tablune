@@ -6,13 +6,14 @@ import type { DocumentSummary, SearchMatch, SearchRequest, SelectionRange } from
 interface SearchBarProps {
   summary: DocumentSummary;
   selection: SelectionRange;
+  readOnly?: boolean;
   onSummary: (summary: DocumentSummary) => void;
   onNavigate: (match: SearchMatch) => void;
   onClose: () => void;
   onError: (message: string) => void;
 }
 
-export default function SearchBar({ summary, selection, onSummary, onNavigate, onClose, onError }: SearchBarProps) {
+export default function SearchBar({ summary, selection, readOnly = false, onSummary, onNavigate, onClose, onError }: SearchBarProps) {
   const [query, setQuery] = useState("");
   const [replacement, setReplacement] = useState("");
   const [caseSensitive, setCaseSensitive] = useState(false);
@@ -78,7 +79,7 @@ export default function SearchBar({ summary, selection, onSummary, onNavigate, o
   }, [request]);
 
   const replace = async (replaceAll: boolean) => {
-    if (!query) return;
+    if (!query || readOnly) return;
     try {
       const next = await replaceSession(summary.documentId, { search: request, replacement, replaceAll, expectedRevision: summary.revision });
       onSummary(next);
@@ -99,9 +100,9 @@ export default function SearchBar({ summary, selection, onSummary, onNavigate, o
       <button onClick={() => void runSearch(-1)} aria-label="Previous match">↑</button>
       <button onClick={() => void runSearch(1)} aria-label="Next match">↓</button>
       <span className="search-count">{searching ? "…" : matches.length ? `${Math.max(1, active + 1)} / ${matches.length}` : "No matches"}</span>
-      <input aria-label="Replace with" placeholder="Replace with" value={replacement} onChange={(event) => setReplacement(event.target.value)} />
-      <button onClick={() => void replace(false)} disabled={active < 0}>Replace</button>
-      <button onClick={() => void replace(true)} disabled={!matches.length}>Replace All</button>
+      <input aria-label="Replace with" placeholder="Replace with" value={replacement} disabled={readOnly} onChange={(event) => setReplacement(event.target.value)} />
+      <button onClick={() => void replace(false)} disabled={readOnly || active < 0}>Replace</button>
+      <button onClick={() => void replace(true)} disabled={readOnly || !matches.length}>Replace All</button>
       <label><input type="checkbox" checked={caseSensitive} onChange={(event) => setCaseSensitive(event.target.checked)} /> Aa</label>
       <label><input type="checkbox" checked={wholeCell} onChange={(event) => setWholeCell(event.target.checked)} /> Whole cell</label>
       <select aria-label="Search scope" value={scope} onChange={(event) => setScope(event.target.value as typeof scope)} disabled={(summary.filtersActive || summary.sortCount > 0) && scope !== "document"}>
