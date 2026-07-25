@@ -33,6 +33,12 @@ button { cursor: default; }
   --focus: #1e4dff;
   --focus-soft: rgba(30, 77, 255, 0.22);
   --error: #b42318;
+  --code-keyword: #7c3aed;
+  --code-string: #087f5b;
+  --code-comment: #737b84;
+  --code-number: #075db8;
+  --code-name: #252a30;
+  --code-definition: #9a3412;
   --menu-shadow: rgba(18, 26, 37, 0.18);
   --header-gradient: linear-gradient(120deg, #071d76 0%, #123eb7 55%, #07318e 100%);
   color-scheme: light;
@@ -67,6 +73,12 @@ button { cursor: default; }
   --focus: #3f6cff;
   --focus-soft: rgba(83, 121, 255, 0.32);
   --error: #ff8a80;
+  --code-keyword: #c4a7ff;
+  --code-string: #75d5a4;
+  --code-comment: #8994a1;
+  --code-number: #7dc4ff;
+  --code-name: #e7ebf0;
+  --code-definition: #ffad7a;
   --menu-shadow: rgba(0, 0, 0, 0.42);
   --header-gradient: linear-gradient(120deg, #051554 0%, #0d2d8f 55%, #07236a 100%);
   color-scheme: dark;
@@ -169,21 +181,46 @@ button { cursor: default; }
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
-.macro-editor-panel textarea {
+.python-macro-editor {
   width: 100%;
   height: 100%;
   min-height: 0;
-  resize: none;
-  padding: 13px;
   border: 0;
   border-top: 1px solid var(--border-subtle);
-  outline: none;
   color: var(--text-strong);
   background: var(--surface-subtle);
-  font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  tab-size: 4;
+  overflow: hidden;
 }
-.macro-editor-panel textarea:focus { box-shadow: inset 0 0 0 2px var(--focus); }
+.python-macro-editor-loading {
+  min-height: 0;
+  padding: 13px;
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  background: var(--surface-subtle);
+  font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.python-macro-editor .cm-editor {
+  width: 100%;
+  height: 100%;
+  outline: none;
+  background: transparent;
+}
+.python-macro-editor .cm-scroller {
+  overflow: auto;
+  font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.python-macro-editor .cm-content { min-height: 100%; padding: 13px; caret-color: var(--text-strong); }
+.python-macro-editor .cm-line { padding: 0; }
+.python-macro-editor .cm-selectionBackground,
+.python-macro-editor .cm-content ::selection { background: var(--focus-soft) !important; }
+.python-macro-editor .cm-editor.cm-focused { box-shadow: inset 0 0 0 2px var(--focus); }
+.python-macro-editor .cm-content[aria-disabled="true"] { opacity: 0.68; }
+.python-macro-editor .cm-py-keyword { color: var(--code-keyword); font-weight: 650; }
+.python-macro-editor .cm-py-string { color: var(--code-string); }
+.python-macro-editor .cm-py-comment { color: var(--code-comment); font-style: italic; }
+.python-macro-editor .cm-py-number { color: var(--code-number); }
+.python-macro-editor .cm-py-name { color: var(--code-name); }
+.python-macro-editor .cm-py-definition { color: var(--code-definition); }
 
 .macro-results {
   display: grid;

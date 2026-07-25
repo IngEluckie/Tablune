@@ -19,7 +19,7 @@ def fail(message: str) -> "None":
 
 def validate_rows(value: Any) -> list[list[str]]:
     if not isinstance(value, list):
-        fail("transform() must return rows as a list")
+        fail("the macro must produce rows as a list")
     for row_index, row in enumerate(value):
         if not isinstance(row, list):
             fail(f"row {row_index} is not a list")
@@ -48,10 +48,13 @@ def load_macro(path: Path):
         fail("the macro module could not be loaded")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    run = getattr(module, "run", None)
+    if callable(run):
+        return run, True
     transform = getattr(module, "transform", None)
-    if not callable(transform):
-        fail("the macro must define transform(rows, context)")
-    return transform
+    if callable(transform):
+        return transform, False
+    fail("the macro must define run(rows, context) or transform(rows, context)")
 
 
 def main() -> None:
@@ -69,12 +72,15 @@ def main() -> None:
     header_enabled = context.get("header_enabled") is True
     original_headers = validate_headers(context.get("headers"), header_enabled)
 
-    transform = load_macro(macro_path)
-    result = transform(rows, context)
+    entrypoint, allows_empty_result = load_macro(macro_path)
+    result = entrypoint(rows, context)
     headers = original_headers
-    if isinstance(result, dict):
+    if result is None and allows_empty_result:
+        rows = validate_rows(rows)
+        headers = validate_headers(context.get("headers"), header_enabled)
+    elif isinstance(result, dict):
         if "rows" not in result:
-            fail("transform() result is missing rows")
+            fail("the macro result is missing rows")
         rows = validate_rows(result["rows"])
         headers = validate_headers(result.get("headers"), header_enabled)
     else:

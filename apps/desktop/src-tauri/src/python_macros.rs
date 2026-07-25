@@ -705,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn runner_preserves_strings_and_supports_headers_and_ragged_rows() {
+    fn runner_prefers_run_and_supports_mutation_without_a_return_value() {
         let Ok(interpreter) = inspect_interpreter("python3") else {
             return;
         };
@@ -732,7 +732,7 @@ mod tests {
             interpreter,
             runner,
             snapshot,
-            "def transform(rows, context):\n    rows.append(['雪'])\n    return {'rows': rows, 'headers': ['person', 'note']}\n".into(),
+            "def transform(rows, context):\n    return [['wrong']]\n\ndef run(rows, context):\n    rows.append(['雪'])\n    context['headers'][:] = ['person', 'note']\n".into(),
             None,
         )
         .unwrap();
@@ -740,6 +740,67 @@ mod tests {
         assert_eq!(result.rows[1][1], "línea\n,dos");
         assert_eq!(result.rows[2], vec![""]);
         assert_eq!(result.rows[3], vec!["雪"]);
+    }
+
+    #[test]
+    fn runner_allows_calculation_only_run() {
+        let Ok(interpreter) = inspect_interpreter("python3") else {
+            return;
+        };
+        let runner = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("python")
+            .join("tablune_runner.py");
+        let snapshot = MacroDocumentSnapshot {
+            document_id: 1,
+            identity: 1,
+            revision: 0,
+            rows: vec![vec!["4".into()], vec!["5".into()]],
+            header_enabled: false,
+            display_name: "test.csv".into(),
+            delimiter: ",".into(),
+            line_ending: tablune_csv::LineEnding::Lf,
+        };
+        let result = run_macro(
+            PythonRuntimeState::default().inner,
+            interpreter,
+            runner,
+            snapshot,
+            "def run(rows, context):\n    print(sum(int(row[0]) for row in rows))\n".into(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.rows, vec![vec!["4"], vec!["5"]]);
+        assert_eq!(result.stdout.trim(), "9");
+    }
+
+    #[test]
+    fn runner_keeps_transform_as_a_legacy_entrypoint() {
+        let Ok(interpreter) = inspect_interpreter("python3") else {
+            return;
+        };
+        let runner = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("python")
+            .join("tablune_runner.py");
+        let snapshot = MacroDocumentSnapshot {
+            document_id: 1,
+            identity: 1,
+            revision: 0,
+            rows: vec![vec!["before".into()]],
+            header_enabled: false,
+            display_name: "test.csv".into(),
+            delimiter: ",".into(),
+            line_ending: tablune_csv::LineEnding::Lf,
+        };
+        let result = run_macro(
+            PythonRuntimeState::default().inner,
+            interpreter,
+            runner,
+            snapshot,
+            "def transform(rows, context):\n    return [['after']]\n".into(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.rows, vec![vec!["after"]]);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   applyPythonPreview,
   cancelPythonMacro,
@@ -19,9 +19,19 @@ import {
 } from "./macroPanelSizing";
 
 const STARTER_MACRO = `def transform(rows, context):
-    """Transform the document and return rows containing strings."""
+    """Optionally transform the complete document."""
     return rows
+
+
+def run(rows, context):
+    """Run calculations or update individual cells in place."""
+    print(f"Rows: {len(rows)}")
+
+    # Uncomment to apply the full transform above:
+    # rows[:] = transform(rows, context)
 `;
+
+const PythonMacroEditor = lazy(() => import("./PythonMacroEditor"));
 
 interface PythonMacroPanelProps {
   summary: DocumentSummary;
@@ -339,19 +349,19 @@ export default function PythonMacroPanel({
         <button onClick={() => void saveCurrent(true)} disabled={working || running}>Save As</button>
       </div>
 
-      <label className="macro-editor-panel">
+      <div className="macro-editor-panel">
         <span>Macro code</span>
-        <textarea
-          aria-label="Macro code"
-          value={code}
-          spellCheck={false}
-          disabled={running || working}
-          onChange={(event) => {
-            setCode(event.target.value);
-            setPreview(null);
-          }}
-        />
-      </label>
+        <Suspense fallback={<div className="python-macro-editor-loading">Loading editor…</div>}>
+          <PythonMacroEditor
+            value={code}
+            disabled={running || working}
+            onChange={(nextCode) => {
+              setCode(nextCode);
+              setPreview(null);
+            }}
+          />
+        </Suspense>
+      </div>
 
       <section className="macro-results" aria-label="Macro results">
         <div className="macro-result-tabs" role="tablist" aria-label="Macro output">

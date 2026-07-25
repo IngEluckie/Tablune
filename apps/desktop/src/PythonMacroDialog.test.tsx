@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 
 import { ask } from "@tauri-apps/plugin-dialog";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { EditorView } from "@codemirror/view";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyPythonPreview,
@@ -101,10 +102,16 @@ describe("PythonMacroDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "Run Preview" }));
     await waitFor(() => expect(previewPythonMacro).toHaveBeenCalledWith(
       7,
-      expect.stringContaining("def transform"),
+      expect.stringContaining("def run"),
       null,
       2,
     ));
+    expect(previewPythonMacro).toHaveBeenCalledWith(
+      7,
+      expect.stringContaining("def transform"),
+      null,
+      2,
+    );
     expect(ask).toHaveBeenCalledWith(expect.stringContaining("normal user permissions"), expect.anything());
     expect(props.onTrustAcknowledged).toHaveBeenCalledOnce();
     expect((screen.getByRole("tab", { name: "Preview" }) as HTMLElement).getAttribute("aria-selected")).toBe("true");
@@ -137,8 +144,30 @@ describe("PythonMacroDialog", () => {
     render(<PythonMacroDialog {...props} trustAcknowledged />);
     await screen.findByText(/Python 3\.12\.1/);
     fireEvent.click(screen.getByRole("button", { name: "Run Preview" }));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Macro code" }).getAttribute("contenteditable")).toBe("false"));
     fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
     await waitFor(() => expect(cancelPythonMacro).toHaveBeenCalledOnce());
+  });
+
+  it("invalidates the preview after an editor change and runs the updated code", async () => {
+    render(<PythonMacroDialog {...props} trustAcknowledged />);
+    await screen.findByText(/Python 3\.12\.1/);
+    fireEvent.click(screen.getByRole("button", { name: "Run Preview" }));
+    await screen.findByText("R2 C1");
+
+    const textbox = screen.getByRole("textbox", { name: "Macro code" });
+    const view = EditorView.findFromDOM(textbox);
+    if (!view) throw new Error("CodeMirror view was not found");
+    act(() => view.dispatch({ changes: { from: view.state.doc.length, insert: "\nprint('updated')" } }));
+
+    await waitFor(() => expect((screen.getByRole("button", { name: "Apply" }) as HTMLButtonElement).disabled).toBe(true));
+    fireEvent.click(screen.getByRole("button", { name: "Run Preview" }));
+    await waitFor(() => expect(previewPythonMacro).toHaveBeenLastCalledWith(
+      7,
+      expect.stringContaining("print('updated')"),
+      null,
+      2,
+    ));
   });
 
   it("switches to Console when execution fails", async () => {
