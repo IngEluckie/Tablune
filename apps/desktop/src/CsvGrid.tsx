@@ -1,31 +1,43 @@
 import {
   type KeyboardEvent,
-  type MouseEvent,
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
+import {
+  createAxisMetrics,
+  DEFAULT_COLUMN_WIDTH,
+  DEFAULT_ROW_HEIGHT,
+  MAX_COLUMN_WIDTH,
+  MAX_ROW_HEIGHT,
+  MIN_COLUMN_WIDTH,
+  MIN_ROW_HEIGHT,
+  clampGridSize,
+  withSizeOverride,
+  type AxisMetrics,
+} from "./gridSizing";
 import { getGridWindow } from "./ipc";
 import { GRID_PALETTES, type ThemeMode } from "./theme";
 import type {
   CellCoordinate,
   DocumentSummary,
   EditCommand,
+  GridSizingState,
   GridViewportState,
   GridWindow,
   SelectionMode,
   SelectionRange,
 } from "./types";
 
-const ROW_HEIGHT = 28;
-const COLUMN_WIDTH = 160;
 const ROW_HEADER_WIDTH = 52;
 const COLUMN_HEADER_HEIGHT = 32;
 const MIN_ROWS = 100;
 const MIN_COLUMNS = 26;
 const WINDOW_OVERSCAN = 12;
+const RESIZE_HIT_RADIUS = 5;
 
 interface CsvGridProps {
   summary: DocumentSummary;
@@ -36,6 +48,8 @@ interface CsvGridProps {
   initialSelection?: SelectionRange;
   initialViewport?: GridViewportState;
   onViewportChange?: (viewport: GridViewportState) => void;
+  initialSizing?: GridSizingState;
+  onSizingChange?: (sizing: GridSizingState) => void;
   reveal?: { viewRow: number; column: number; nonce: number } | null;
   onHeaderSort: (column: number) => void;
 }
@@ -50,6 +64,20 @@ interface EditingCell {
 interface GridTarget extends CellCoordinate {
   mode: SelectionMode;
 }
+
+interface ResizeTarget {
+  axis: "column" | "row";
+  index: number;
+}
+
+interface ResizeState extends ResizeTarget {
+  pointerId: number;
+  startClientPosition: number;
+  startSize: number;
+  currentSize: number;
+}
+
+const EMPTY_SIZING: GridSizingState = { columnWidths: {}, rowHeights: {} };
 
 export function columnName(index: number): string {
   let value = index + 1;
@@ -143,6 +171,8 @@ export default function CsvGrid({
   initialSelection = DEFAULT_SELECTION,
   initialViewport = { scrollTop: 0, scrollLeft: 0 },
   onViewportChange,
+  initialSizing = EMPTY_SIZING,
+  onSizingChange,
   reveal,
   onHeaderSort,
 }: CsvGridProps) {
@@ -157,11 +187,44 @@ export default function CsvGrid({
   const [editing, setEditing] = useState<EditingCell | null>(null);
   const [draft, setDraft] = useState("");
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [resizeState, setResizeState] = useState<ResizeState | null>(null);
+  const [resizeHover, setResizeHover] = useState<ResizeTarget["axis"] | null>(null);
 
   const columnCount = Math.max(MIN_COLUMNS, summary.columnCount);
   const rowCount = Math.max(MIN_ROWS, summary.visibleRowCount || 1);
-  const totalWidth = ROW_HEADER_WIDTH + columnCount * COLUMN_WIDTH;
-  const totalHeight = COLUMN_HEADER_HEIGHT + rowCount * ROW_HEIGHT;
+  const activeSizing = useMemo<GridSizingState>(() => {
+    if (!resizeState) return initialSizing;
+    if (resizeState.axis === "column") {
+      return {
+        ...initialSizing,
+        columnWidths: withSizeOverride(
+          initialSizing.columnWidths,
+          resizeState.index,
+          resizeState.currentSize,
+          DEFAULT_COLUMN_WIDTH,
+        ),
+      };
+    }
+    return {
+      ...initialSizing,
+      rowHeights: withSizeOverride(
+        initialSizing.rowHeights,
+        resizeState.index,
+        resizeState.currentSize,
+        DEFAULT_ROW_HEIGHT,
+      ),
+    };
+  }, [initialSizing, resizeState]);
+  const columnMetrics = useMemo(
+    () => createAxisMetrics(columnCount, DEFAULT_COLUMN_WIDTH, activeSizing.columnWidths),
+    [activeSizing.columnWidths, columnCount],
+  );
+  const rowMetrics = useMemo(
+    () => createAxisMetrics(rowCount, DEFAULT_ROW_HEIGHT, activeSizing.rowHeights),
+    [activeSizing.rowHeights, rowCount],
+  );
+  const totalWidth = ROW_HEADER_WIDTH + columnMetrics.totalSize;
+  const totalHeight = COLUMN_HEADER_HEIGHT + rowMetrics.totalSize;
 
   const publishSelection = useCallback((next: SelectionRange) => {
     setSelection(next);
@@ -170,11 +233,15 @@ export default function CsvGrid({
 
   const loadVisibleWindow = useCallback(async () => {
     const viewport = viewportRef.current;
-    if (!viewport) return;
-    const firstRow = Math.max(0, Math.floor((viewport.scrollTop - COLUMN_HEADER_HEIGHT) / ROW_HEIGHT) - WINDOW_OVERSCAN);
-    const rowAmount = Math.ceil(viewport.clientHeight / ROW_HEIGHT) + WINDOW_OVERSCAN * 2;
-    const firstColumn = Math.max(0, Math.floor((viewport.scrollLeft - ROW_HEADER_WIDTH) / COLUMN_WIDTH) - 2);
-    const columnAmount = Math.ceil(viewport.clientWidth / COLUMN_WIDTH) + 5;
+    if (!viewport || resizeState) return;
+    const visibleFirstRow = rowMetrics.indexAt(viewport.scrollTop - COLUMN_HEADER_HEIGHT);
+    const visibleLastRow = rowMetrics.indexAt(viewport.scrollTop + viewport.clientHeight - COLUMN_HEADER_HEIGHT);
+    const firstRow = Math.max(0, visibleFirstRow - WINDOW_OVERSCAN);
+    const rowAmount = Math.min(rowCount - firstRow, visibleLastRow - firstRow + 1 + WINDOW_OVERSCAN);
+    const visibleFirstColumn = columnMetrics.indexAt(viewport.scrollLeft - ROW_HEADER_WIDTH);
+    const visibleLastColumn = columnMetrics.indexAt(viewport.scrollLeft + viewport.clientWidth - ROW_HEADER_WIDTH);
+    const firstColumn = Math.max(0, visibleFirstColumn - 2);
+    const columnAmount = Math.min(columnCount - firstColumn, visibleLastColumn - firstColumn + 4);
     const currentRequest = ++requestId.current;
     try {
       const data = await getGridWindow(summary.documentId, firstRow, rowAmount, firstColumn, columnAmount);
@@ -182,7 +249,7 @@ export default function CsvGrid({
     } catch (reason) {
       onError(String(reason));
     }
-  }, [onError, summary.documentId]);
+  }, [columnCount, columnMetrics, onError, resizeState, rowCount, rowMetrics, summary.documentId]);
 
   useEffect(() => {
     requestId.current += 1;
@@ -239,55 +306,63 @@ export default function CsvGrid({
     context.clearRect(0, 0, width, height);
     context.font = "13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
     context.textBaseline = "middle";
-    const firstColumn = Math.max(0, Math.floor((viewport.scrollLeft - ROW_HEADER_WIDTH) / COLUMN_WIDTH));
-    const lastColumn = Math.min(columnCount - 1, Math.ceil((viewport.scrollLeft + width - ROW_HEADER_WIDTH) / COLUMN_WIDTH));
-    const firstRow = Math.max(0, Math.floor((viewport.scrollTop - COLUMN_HEADER_HEIGHT) / ROW_HEIGHT));
-    const lastRow = Math.min(rowCount - 1, Math.ceil((viewport.scrollTop + height - COLUMN_HEADER_HEIGHT) / ROW_HEIGHT));
+    const firstColumn = columnMetrics.indexAt(viewport.scrollLeft - ROW_HEADER_WIDTH);
+    const lastColumn = columnMetrics.indexAt(viewport.scrollLeft + width - ROW_HEADER_WIDTH);
+    const firstRow = rowMetrics.indexAt(viewport.scrollTop - COLUMN_HEADER_HEIGHT);
+    const lastRow = rowMetrics.indexAt(viewport.scrollTop + height - COLUMN_HEADER_HEIGHT);
     const range = normalizeSelection(selection);
     const palette = GRID_PALETTES[theme];
     context.fillStyle = palette.background;
     context.fillRect(0, 0, width, height);
 
     for (let column = firstColumn; column <= lastColumn; column += 1) {
-      const x = ROW_HEADER_WIDTH + column * COLUMN_WIDTH - viewport.scrollLeft;
+      const columnWidth = columnMetrics.sizeAt(column);
+      const x = ROW_HEADER_WIDTH + columnMetrics.offsetAt(column) - viewport.scrollLeft;
       const selected = selection.mode === "columns" && column >= range.startColumn && column <= range.endColumn;
       context.fillStyle = selected || column === selection.focus.column ? palette.activeHeader : palette.header;
-      context.fillRect(x, 0, COLUMN_WIDTH, COLUMN_HEADER_HEIGHT);
+      context.fillRect(x, 0, columnWidth, COLUMN_HEADER_HEIGHT);
       context.fillStyle = palette.headerText;
       context.textAlign = "center";
       const label = summary.headerEnabled ? summary.headerNames[column] ?? columnName(column) : columnName(column);
-      context.fillText(label, x + COLUMN_WIDTH / 2, COLUMN_HEADER_HEIGHT / 2);
+      context.save();
+      context.beginPath();
+      context.rect(x + 4, 0, Math.max(0, columnWidth - 8), COLUMN_HEADER_HEIGHT);
+      context.clip();
+      context.fillText(label, x + columnWidth / 2, COLUMN_HEADER_HEIGHT / 2);
       if (column < summary.headerNames.length) {
         context.fillStyle = palette.headerIcon;
         context.textAlign = "right";
-        context.fillText("↕", x + COLUMN_WIDTH - 9, COLUMN_HEADER_HEIGHT / 2);
+        context.fillText("↕", x + columnWidth - 9, COLUMN_HEADER_HEIGHT / 2);
       }
+      context.restore();
     }
 
     for (let row = firstRow; row <= lastRow; row += 1) {
-      const y = COLUMN_HEADER_HEIGHT + row * ROW_HEIGHT - viewport.scrollTop;
+      const rowHeight = rowMetrics.sizeAt(row);
+      const y = COLUMN_HEADER_HEIGHT + rowMetrics.offsetAt(row) - viewport.scrollTop;
       const rowSelected = selection.mode === "rows" && row >= range.startRow && row <= range.endRow;
       context.fillStyle = rowSelected || row === selection.focus.row ? palette.activeHeader : palette.header;
-      context.fillRect(0, y, ROW_HEADER_WIDTH, ROW_HEIGHT);
+      context.fillRect(0, y, ROW_HEADER_WIDTH, rowHeight);
       context.fillStyle = palette.rowHeaderText;
       context.textAlign = "center";
       const sourceRow = cachedRow(row)?.sourceRow;
-      context.fillText(String((sourceRow ?? row) + 1), ROW_HEADER_WIDTH / 2, y + ROW_HEIGHT / 2);
+      context.fillText(String((sourceRow ?? row) + 1), ROW_HEADER_WIDTH / 2, y + rowHeight / 2);
       for (let column = firstColumn; column <= lastColumn; column += 1) {
-        const x = ROW_HEADER_WIDTH + column * COLUMN_WIDTH - viewport.scrollLeft;
+        const columnWidth = columnMetrics.sizeAt(column);
+        const x = ROW_HEADER_WIDTH + columnMetrics.offsetAt(column) - viewport.scrollLeft;
         const selected = row >= range.startRow && row <= range.endRow
           && column >= range.startColumn && column <= range.endColumn;
         if (selected) {
           context.fillStyle = palette.selectionFill;
-          context.fillRect(x, y, COLUMN_WIDTH, ROW_HEIGHT);
+          context.fillRect(x, y, columnWidth, rowHeight);
         }
         context.fillStyle = palette.cellText;
         context.textAlign = "left";
         context.save();
         context.beginPath();
-        context.rect(x + 6, y, COLUMN_WIDTH - 12, ROW_HEIGHT);
+        context.rect(x + 6, y, Math.max(0, columnWidth - 12), rowHeight);
         context.clip();
-        context.fillText(getCell(row, column), x + 8, y + ROW_HEIGHT / 2);
+        context.fillText(getCell(row, column), x + 8, y + rowHeight / 2);
         context.restore();
       }
     }
@@ -296,12 +371,12 @@ export default function CsvGrid({
     context.lineWidth = 1;
     context.beginPath();
     for (let column = firstColumn; column <= lastColumn + 1; column += 1) {
-      const x = ROW_HEADER_WIDTH + column * COLUMN_WIDTH - viewport.scrollLeft + 0.5;
+      const x = ROW_HEADER_WIDTH + columnMetrics.offsetAt(column) - viewport.scrollLeft + 0.5;
       context.moveTo(x, 0);
       context.lineTo(x, height);
     }
     for (let row = firstRow; row <= lastRow + 1; row += 1) {
-      const y = COLUMN_HEADER_HEIGHT + row * ROW_HEIGHT - viewport.scrollTop + 0.5;
+      const y = COLUMN_HEADER_HEIGHT + rowMetrics.offsetAt(row) - viewport.scrollTop + 0.5;
       context.moveTo(0, y);
       context.lineTo(width, y);
     }
@@ -311,17 +386,17 @@ export default function CsvGrid({
     context.lineTo(width, COLUMN_HEADER_HEIGHT + 0.5);
     context.stroke();
 
-    const selectedX = ROW_HEADER_WIDTH + range.startColumn * COLUMN_WIDTH - viewport.scrollLeft;
-    const selectedY = COLUMN_HEADER_HEIGHT + range.startRow * ROW_HEIGHT - viewport.scrollTop;
+    const selectedX = ROW_HEADER_WIDTH + columnMetrics.offsetAt(range.startColumn) - viewport.scrollLeft;
+    const selectedY = COLUMN_HEADER_HEIGHT + rowMetrics.offsetAt(range.startRow) - viewport.scrollTop;
     context.strokeStyle = palette.selectionStroke;
     context.lineWidth = 2;
     context.strokeRect(
       selectedX + 1,
       selectedY + 1,
-      (range.endColumn - range.startColumn + 1) * COLUMN_WIDTH - 2,
-      (range.endRow - range.startRow + 1) * ROW_HEIGHT - 2,
+      columnMetrics.rangeSize(range.startColumn, range.endColumn + 1) - 2,
+      rowMetrics.rangeSize(range.startRow, range.endRow + 1) - 2,
     );
-  }, [cachedRow, columnCount, getCell, rowCount, selection, summary.headerEnabled, summary.headerNames, theme]);
+  }, [cachedRow, columnMetrics, getCell, rowMetrics, selection, summary.headerEnabled, summary.headerNames, theme]);
 
   useLayoutEffect(() => {
     draw();
@@ -335,7 +410,32 @@ export default function CsvGrid({
     return () => observer.disconnect();
   }, [draw, loadVisibleWindow]);
 
-  const targetFromPointer = (event: MouseEvent<HTMLDivElement>): GridTarget | null => {
+  const boundaryAt = (metrics: AxisMetrics, offset: number): number | null => {
+    if (offset < 0 || offset > metrics.totalSize) return null;
+    const index = metrics.indexAt(offset);
+    if (index > 0 && Math.abs(offset - metrics.offsetAt(index)) <= RESIZE_HIT_RADIUS) return index - 1;
+    if (Math.abs(offset - metrics.offsetAt(index + 1)) <= RESIZE_HIT_RADIUS) return index;
+    return null;
+  };
+
+  const resizeTargetFromPointer = (event: { clientX: number; clientY: number }): ResizeTarget | null => {
+    const viewport = viewportRef.current;
+    if (!viewport) return null;
+    const rect = viewport.getBoundingClientRect();
+    const absoluteX = event.clientX - rect.left + viewport.scrollLeft;
+    const absoluteY = event.clientY - rect.top + viewport.scrollTop;
+    if (absoluteY < COLUMN_HEADER_HEIGHT && absoluteX >= ROW_HEADER_WIDTH) {
+      const index = boundaryAt(columnMetrics, absoluteX - ROW_HEADER_WIDTH);
+      if (index !== null) return { axis: "column", index };
+    }
+    if (absoluteX < ROW_HEADER_WIDTH && absoluteY >= COLUMN_HEADER_HEIGHT) {
+      const index = boundaryAt(rowMetrics, absoluteY - COLUMN_HEADER_HEIGHT);
+      if (index !== null) return { axis: "row", index };
+    }
+    return null;
+  };
+
+  const targetFromPointer = (event: { clientX: number; clientY: number }): GridTarget | null => {
     const viewport = viewportRef.current;
     if (!viewport) return null;
     const rect = viewport.getBoundingClientRect();
@@ -347,22 +447,55 @@ export default function CsvGrid({
     if (absoluteY < COLUMN_HEADER_HEIGHT) {
       return {
         row: 0,
-        column: Math.min(columnCount - 1, Math.max(0, Math.floor((absoluteX - ROW_HEADER_WIDTH) / COLUMN_WIDTH))),
+        column: columnMetrics.indexAt(absoluteX - ROW_HEADER_WIDTH),
         mode: "columns",
       };
     }
     if (absoluteX < ROW_HEADER_WIDTH) {
       return {
-        row: Math.min(rowCount - 1, Math.max(0, Math.floor((absoluteY - COLUMN_HEADER_HEIGHT) / ROW_HEIGHT))),
+        row: rowMetrics.indexAt(absoluteY - COLUMN_HEADER_HEIGHT),
         column: 0,
         mode: "rows",
       };
     }
     return {
-      row: Math.min(rowCount - 1, Math.floor((absoluteY - COLUMN_HEADER_HEIGHT) / ROW_HEIGHT)),
-      column: Math.min(columnCount - 1, Math.floor((absoluteX - ROW_HEADER_WIDTH) / COLUMN_WIDTH)),
+      row: rowMetrics.indexAt(absoluteY - COLUMN_HEADER_HEIGHT),
+      column: columnMetrics.indexAt(absoluteX - ROW_HEADER_WIDTH),
       mode: "cells",
     };
+  };
+
+  const publishSizing = (next: GridSizingState) => {
+    onSizingChange?.(next);
+  };
+
+  const autoFit = (target: ResizeTarget) => {
+    if (target.axis === "row") {
+      publishSizing({
+        ...initialSizing,
+        rowHeights: withSizeOverride(initialSizing.rowHeights, target.index, DEFAULT_ROW_HEIGHT, DEFAULT_ROW_HEIGHT),
+      });
+      return;
+    }
+    const canvas = canvasRef.current;
+    const context = canvas?.getContext("2d");
+    if (context) context.font = "13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+    const label = summary.headerEnabled
+      ? summary.headerNames[target.index] ?? columnName(target.index)
+      : columnName(target.index);
+    const values = [label];
+    if (windowData
+      && target.index >= windowData.columnStart
+      && windowData.rows.some((row) => target.index - windowData.columnStart < row.cells.length)) {
+      for (const row of windowData.rows) values.push(row.cells[target.index - windowData.columnStart] ?? "");
+    }
+    const measured = Math.max(...values.map((value) => context?.measureText?.(value).width ?? value.length * 7));
+    const iconAllowance = target.index < summary.headerNames.length ? 28 : 0;
+    const width = clampGridSize(measured + 16 + iconAllowance, MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH);
+    publishSizing({
+      ...initialSizing,
+      columnWidths: withSizeOverride(initialSizing.columnWidths, target.index, width, DEFAULT_COLUMN_WIDTH),
+    });
   };
 
   const rangeForTarget = (target: GridTarget, extend: boolean): SelectionRange => {
@@ -497,13 +630,13 @@ export default function CsvGrid({
     const viewport = viewportRef.current;
     if (viewport) {
       viewport.scrollTo({
-        top: Math.max(0, COLUMN_HEADER_HEIGHT + next.row * ROW_HEIGHT - viewport.clientHeight / 2),
-        left: Math.max(0, ROW_HEADER_WIDTH + next.column * COLUMN_WIDTH - viewport.clientWidth / 2),
+        top: Math.max(0, COLUMN_HEADER_HEIGHT + rowMetrics.offsetAt(next.row) - viewport.clientHeight / 2),
+        left: Math.max(0, ROW_HEADER_WIDTH + columnMetrics.offsetAt(next.column) - viewport.clientWidth / 2),
         behavior: "smooth",
       });
       window.setTimeout(() => void loadVisibleWindow(), 180);
     }
-  }, [loadVisibleWindow, publishSelection, reveal]);
+  }, [columnMetrics, loadVisibleWindow, publishSelection, reveal, rowMetrics]);
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (editing) return;
@@ -598,16 +731,38 @@ export default function CsvGrid({
         }
       }}
       onKeyDown={handleKeyDown}
-      onMouseDown={(event) => {
+      style={{ cursor: resizeState?.axis === "column" || resizeHover === "column" ? "col-resize" : resizeState?.axis === "row" || resizeHover === "row" ? "row-resize" : undefined }}
+      onPointerDown={(event) => {
+        if (event.button !== 0) return;
         setContextMenu(null);
+        const resizeTarget = resizeTargetFromPointer(event);
+        if (resizeTarget) {
+          event.preventDefault();
+          event.currentTarget.setPointerCapture?.(event.pointerId);
+          const metrics = resizeTarget.axis === "column" ? columnMetrics : rowMetrics;
+          const startClientPosition = resizeTarget.axis === "column" ? event.clientX : event.clientY;
+          setResizeState({
+            ...resizeTarget,
+            pointerId: event.pointerId,
+            startClientPosition,
+            startSize: metrics.sizeAt(resizeTarget.index),
+            currentSize: metrics.sizeAt(resizeTarget.index),
+          });
+          setResizeHover(resizeTarget.axis);
+          return;
+        }
         const viewport = viewportRef.current;
         if (viewport) {
           const rect = viewport.getBoundingClientRect();
           const absoluteX = event.clientX - rect.left + viewport.scrollLeft;
           const absoluteY = event.clientY - rect.top + viewport.scrollTop;
-          const withinColumn = (absoluteX - ROW_HEADER_WIDTH) % COLUMN_WIDTH;
-          if (absoluteY < COLUMN_HEADER_HEIGHT && absoluteX >= ROW_HEADER_WIDTH && withinColumn >= COLUMN_WIDTH - 24) {
-            onHeaderSort(Math.floor((absoluteX - ROW_HEADER_WIDTH) / COLUMN_WIDTH));
+          const columnOffset = absoluteX - ROW_HEADER_WIDTH;
+          const column = columnMetrics.indexAt(columnOffset);
+          const withinColumn = columnOffset - columnMetrics.offsetAt(column);
+          if (absoluteY < COLUMN_HEADER_HEIGHT
+            && absoluteX >= ROW_HEADER_WIDTH
+            && withinColumn >= columnMetrics.sizeAt(column) - 24) {
+            onHeaderSort(column);
             return;
           }
         }
@@ -616,15 +771,73 @@ export default function CsvGrid({
         dragAnchor.current = target;
         publishSelection(rangeForTarget(target, event.shiftKey));
       }}
-      onMouseMove={(event) => {
+      onPointerMove={(event) => {
+        if (resizeState) {
+          const clientPosition = resizeState.axis === "column" ? event.clientX : event.clientY;
+          const minimum = resizeState.axis === "column" ? MIN_COLUMN_WIDTH : MIN_ROW_HEIGHT;
+          const maximum = resizeState.axis === "column" ? MAX_COLUMN_WIDTH : MAX_ROW_HEIGHT;
+          setResizeState({
+            ...resizeState,
+            currentSize: clampGridSize(
+              resizeState.startSize + clientPosition - resizeState.startClientPosition,
+              minimum,
+              maximum,
+            ),
+          });
+          return;
+        }
+        if (event.buttons !== 1) {
+          setResizeHover(resizeTargetFromPointer(event)?.axis ?? null);
+          return;
+        }
         if (!dragAnchor.current || event.buttons !== 1) return;
         const target = targetFromPointer(event);
         if (!target) return;
         const anchor = dragAnchor.current;
         publishSelection(rangeForTarget({ ...target, mode: anchor.mode }, true));
       }}
-      onMouseUp={() => { dragAnchor.current = null; }}
+      onPointerUp={(event) => {
+        dragAnchor.current = null;
+        if (!resizeState) return;
+        if (event.currentTarget.hasPointerCapture?.(resizeState.pointerId)) {
+          event.currentTarget.releasePointerCapture(resizeState.pointerId);
+        }
+        const next = resizeState.axis === "column"
+          ? {
+            ...initialSizing,
+            columnWidths: withSizeOverride(
+              initialSizing.columnWidths,
+              resizeState.index,
+              resizeState.currentSize,
+              DEFAULT_COLUMN_WIDTH,
+            ),
+          }
+          : {
+            ...initialSizing,
+            rowHeights: withSizeOverride(
+              initialSizing.rowHeights,
+              resizeState.index,
+              resizeState.currentSize,
+              DEFAULT_ROW_HEIGHT,
+            ),
+          };
+        publishSizing(next);
+        setResizeState(null);
+        setResizeHover(resizeTargetFromPointer(event)?.axis ?? null);
+      }}
+      onPointerCancel={() => {
+        dragAnchor.current = null;
+        setResizeState(null);
+        setResizeHover(null);
+      }}
+      onPointerLeave={() => { if (!resizeState) setResizeHover(null); }}
       onDoubleClick={(event) => {
+        const resizeTarget = resizeTargetFromPointer(event);
+        if (resizeTarget) {
+          event.preventDefault();
+          autoFit(resizeTarget);
+          return;
+        }
         const target = targetFromPointer(event);
         if (target) void beginEditing(target);
       }}
@@ -636,7 +849,7 @@ export default function CsvGrid({
         setContextMenu({ x: event.clientX - rect.left + event.currentTarget.scrollLeft, y: event.clientY - rect.top + event.currentTarget.scrollTop });
       }}
     >
-      <div style={{ width: totalWidth, height: totalHeight }} />
+      <div data-testid="grid-spacer" style={{ width: totalWidth, height: totalHeight }} />
       <canvas ref={canvasRef} className="grid-canvas" aria-hidden="true" />
       {editing && (
         <input
@@ -645,10 +858,10 @@ export default function CsvGrid({
           value={draft}
           aria-label={editing.header ? "Edit column header" : "Edit cell"}
           style={{
-            left: ROW_HEADER_WIDTH + editing.column * COLUMN_WIDTH + 1,
-            top: editing.header ? 1 : COLUMN_HEADER_HEIGHT + editing.viewRow * ROW_HEIGHT + 1,
-            width: COLUMN_WIDTH - 2,
-            height: (editing.header ? COLUMN_HEADER_HEIGHT : ROW_HEIGHT) - 2,
+            left: ROW_HEADER_WIDTH + columnMetrics.offsetAt(editing.column) + 1,
+            top: editing.header ? 1 : COLUMN_HEADER_HEIGHT + rowMetrics.offsetAt(editing.viewRow) + 1,
+            width: columnMetrics.sizeAt(editing.column) - 2,
+            height: (editing.header ? COLUMN_HEADER_HEIGHT : rowMetrics.sizeAt(editing.viewRow)) - 2,
           }}
           onChange={(event) => setDraft(event.target.value)}
           onBlur={() => void commitEdit()}

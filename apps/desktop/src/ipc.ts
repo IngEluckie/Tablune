@@ -38,6 +38,8 @@ export const closeSession = (documentId: DocumentId, discardUnsaved: boolean) =>
   invoke<WorkspaceSummary>("session_close", { documentId, discardUnsaved });
 export const saveSession = (documentId: DocumentId, path?: string | null) =>
   invoke<DocumentSummary>("session_save", { documentId, path: path ?? null });
+export const duplicateSession = (documentId: DocumentId) =>
+  invoke<WorkspaceSummary>("session_duplicate", { documentId });
 export const renameSession = (documentId: DocumentId, newName: string) =>
   invoke<DocumentSummary>("session_rename", { documentId, newName });
 export const getGridWindow = (documentId: DocumentId, rowStart: number, rowCount: number, columnStart: number, columnCount: number) =>

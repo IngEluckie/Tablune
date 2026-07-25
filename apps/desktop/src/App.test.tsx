@@ -5,8 +5,10 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import {
+  applySessionEdit,
   closeSession,
   discardRecovery,
+  duplicateSession,
   exitApplication,
   getWorkspaceSummary,
   newSession,
@@ -14,8 +16,9 @@ import {
   recoveryAvailable,
   reorderWorkspace,
   saveSession,
+  undoSession,
 } from "./ipc";
-import type { DocumentSummary, GridViewportState, SelectionRange } from "./types";
+import type { DocumentSummary, GridSizingState, GridViewportState, SelectionRange } from "./types";
 
 const nativeWindow = vi.hoisted(() => ({
   closeHandler: null as null | ((event: { preventDefault: () => void }) => Promise<void>),
@@ -41,6 +44,7 @@ vi.mock("./ipc", () => ({
   applySessionEdit: vi.fn(),
   closeSession: vi.fn(),
   discardRecovery: vi.fn().mockResolvedValue(undefined),
+  duplicateSession: vi.fn(),
   exitApplication: vi.fn().mockResolvedValue(undefined),
   exportSessionView: vi.fn(),
   getSessionSummary: vi.fn(),
@@ -61,12 +65,25 @@ vi.mock("./ipc", () => ({
 }));
 
 vi.mock("./RibbonHeader", () => ({
-  default: (props: { documentName: string; error: string | null; onNew: () => void; onOpen: () => void }) => (
+  default: (props: {
+    documentName: string;
+    error: string | null;
+    onNew: () => void;
+    onOpen: () => void;
+    onUndo: () => void;
+    canDuplicate: boolean;
+    onDuplicate: () => void;
+    hasCustomSizing: boolean;
+    onResetCellSizing: () => void;
+  }) => (
     <header>
       <span data-testid="active-name">{props.documentName}</span>
       {props.error && <span role="alert">{props.error}</span>}
       <button onClick={props.onNew}>New CSV</button>
       <button onClick={props.onOpen}>Open CSV</button>
+      <button onClick={props.onUndo}>Undo</button>
+      <button onClick={props.onDuplicate} disabled={!props.canDuplicate}>Duplicar</button>
+      <button onClick={props.onResetCellSizing} disabled={!props.hasCustomSizing}>Reset Cell Size</button>
     </header>
   ),
 }));
@@ -76,19 +93,27 @@ vi.mock("./CsvGrid", () => ({
     summary: DocumentSummary;
     initialSelection: SelectionRange;
     initialViewport: GridViewportState;
+    initialSizing: GridSizingState;
     onSelectionChange: (selection: SelectionRange) => void;
     onViewportChange: (viewport: GridViewportState) => void;
+    onSizingChange: (sizing: GridSizingState) => void;
+    onApplyEdit: (command: { kind: "insertRows" | "insertColumns"; index: number; count: number }) => Promise<void>;
   }) => (
     <div
       data-testid="grid"
       data-document-id={props.summary.documentId}
       data-selection-row={props.initialSelection.focus.row}
       data-scroll-top={props.initialViewport.scrollTop}
+      data-column-width={props.initialSizing.columnWidths[2] ?? ""}
+      data-row-height={props.initialSizing.rowHeights[7] ?? ""}
     >
       <button onClick={() => {
         props.onSelectionChange({ anchor: { row: 7, column: 2 }, focus: { row: 7, column: 2 }, mode: "cells" });
         props.onViewportChange({ scrollTop: 180, scrollLeft: 90 });
+        props.onSizingChange({ columnWidths: { 2: 240 }, rowHeights: { 7: 60 } });
       }}>Set grid state</button>
+      <button onClick={() => void props.onApplyEdit({ kind: "insertRows", index: 0, count: 1 })}>Insert rows from grid</button>
+      <button onClick={() => void props.onApplyEdit({ kind: "insertColumns", index: 0, count: 1 })}>Insert columns from grid</button>
     </div>
   ),
   normalizeSelection: () => ({ startRow: 0, endRow: 0, startColumn: 0, endColumn: 0 }),
@@ -149,6 +174,49 @@ describe("App multidocument tabs", () => {
     expect(closeSession).not.toHaveBeenCalled();
   });
 
+  it("duplicates beside the source without activating the new tab", async () => {
+    const first = summary(1, "report.csv", true);
+    const second = summary(2, "other.csv");
+    const duplicate = summary(3, "report(1).csv", false, "/tmp/report(1).csv");
+    vi.mocked(getWorkspaceSummary).mockResolvedValue({ documents: [first, second] });
+    vi.mocked(duplicateSession).mockResolvedValue({ documents: [first, duplicate, second] });
+    render(<App />);
+    await screen.findByRole("tab", { name: /report.csv/ });
+
+    fireEvent.click(screen.getByRole("button", { name: "Duplicar" }));
+
+    await screen.findByRole("tab", { name: "report(1).csv" });
+    expect(duplicateSession).toHaveBeenCalledWith(1);
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
+      "report.csv●",
+      "report(1).csv",
+      "other.csv",
+    ]);
+    expect(screen.getByTestId("grid").getAttribute("data-document-id")).toBe("1");
+    expect(saveSession).not.toHaveBeenCalled();
+    expect(applySessionEdit).not.toHaveBeenCalled();
+  });
+
+  it("disables duplicate for an unsaved document and preserves tabs on failure", async () => {
+    const untitled = summary(1, "Untitled.csv", false, null);
+    vi.mocked(getWorkspaceSummary).mockResolvedValue({ documents: [untitled] });
+    render(<App />);
+    await screen.findByRole("tab", { name: "Untitled.csv" });
+    expect((screen.getByRole("button", { name: "Duplicar" }) as HTMLButtonElement).disabled).toBe(true);
+
+    cleanup();
+    const saved = summary(2, "saved.csv");
+    vi.mocked(getWorkspaceSummary).mockResolvedValue({ documents: [saved] });
+    vi.mocked(duplicateSession).mockRejectedValue(new Error("permission denied"));
+    render(<App />);
+    await screen.findByRole("tab", { name: "saved.csv" });
+    fireEvent.click(screen.getByRole("button", { name: "Duplicar" }));
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("permission denied"));
+    expect(screen.getAllByRole("tab")).toHaveLength(1);
+    expect(screen.getByTestId("grid").getAttribute("data-document-id")).toBe("2");
+  });
+
   it("keeps partial multi-open successes and activates the first one", async () => {
     vi.mocked(open).mockResolvedValue(["/tmp/second.csv", "/tmp/bad.csv", "/tmp/third.csv"]);
     vi.mocked(openSession).mockImplementation(async (path) => {
@@ -195,6 +263,60 @@ describe("App multidocument tabs", () => {
 
     await waitFor(() => expect(screen.getByTestId("grid").getAttribute("data-selection-row")).toBe("7"));
     expect(screen.getByTestId("grid").getAttribute("data-scroll-top")).toBe("180");
+    expect(screen.getByTestId("grid").getAttribute("data-column-width")).toBe("240");
+  });
+
+  it("resets sizing only for the active tab without editing CSV data", async () => {
+    vi.mocked(getWorkspaceSummary).mockResolvedValue({
+      documents: [summary(1, "first.csv"), summary(2, "second.csv")],
+    });
+    render(<App />);
+    await screen.findByRole("tab", { name: "first.csv" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Set grid state" }));
+    expect((screen.getByRole("button", { name: "Reset Cell Size" }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole("tab", { name: "second.csv" }));
+    fireEvent.click(screen.getByRole("button", { name: "Set grid state" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reset Cell Size" }));
+
+    expect(screen.getByTestId("grid").getAttribute("data-column-width")).toBe("");
+    expect(screen.getByTestId("grid").getAttribute("data-row-height")).toBe("");
+    expect((screen.getByRole("button", { name: "Reset Cell Size" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(applySessionEdit).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("tab", { name: "first.csv" }));
+    expect(screen.getByTestId("grid").getAttribute("data-column-width")).toBe("240");
+    expect(screen.getByTestId("grid").getAttribute("data-row-height")).toBe("60");
+  });
+
+  it("invalidates only the affected sizing axis after structural edits", async () => {
+    const first = summary(1, "first.csv");
+    vi.mocked(applySessionEdit).mockResolvedValue({ ...first, revision: 1, dirty: true });
+    render(<App />);
+    await screen.findByRole("tab", { name: "first.csv" });
+    fireEvent.click(screen.getByRole("button", { name: "Set grid state" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Insert rows from grid" }));
+    await waitFor(() => expect(applySessionEdit).toHaveBeenCalledWith(1, { kind: "insertRows", index: 0, count: 1 }, 0));
+    expect(screen.getByTestId("grid").getAttribute("data-row-height")).toBe("");
+    expect(screen.getByTestId("grid").getAttribute("data-column-width")).toBe("240");
+
+    fireEvent.click(screen.getByRole("button", { name: "Insert columns from grid" }));
+    await waitFor(() => expect(screen.getByTestId("grid").getAttribute("data-column-width")).toBe(""));
+  });
+
+  it("clears both sizing axes after undo", async () => {
+    const first = summary(1, "first.csv");
+    vi.mocked(undoSession).mockResolvedValue(first);
+    render(<App />);
+    await screen.findByRole("tab", { name: "first.csv" });
+    fireEvent.click(screen.getByRole("button", { name: "Set grid state" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+
+    await waitFor(() => expect(undoSession).toHaveBeenCalledWith(1));
+    expect(screen.getByTestId("grid").getAttribute("data-row-height")).toBe("");
+    expect(screen.getByTestId("grid").getAttribute("data-column-width")).toBe("");
   });
 
   it("propagates the complete tab order to the workspace", async () => {

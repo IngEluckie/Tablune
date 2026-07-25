@@ -104,6 +104,7 @@ pub fn run() {
             session::session_open,
             session::session_close,
             session::session_save,
+            session::session_duplicate,
             session::session_rename,
             session::session_grid_window,
             session::session_apply_edit,

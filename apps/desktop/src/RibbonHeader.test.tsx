@@ -14,12 +14,15 @@ const defaultProps = {
   canUndo: false,
   canRedo: false,
   canChangeRows: true,
+  canDuplicate: false,
   hasView: false,
+  hasCustomSizing: false,
   theme: "light" as const,
   onNew: vi.fn(),
   onOpen: vi.fn(),
   onSave: vi.fn(),
   onSaveAs: vi.fn(),
+  onDuplicate: vi.fn(),
   onExportView: vi.fn(),
   onUndo: vi.fn(),
   onRedo: vi.fn(),
@@ -34,6 +37,7 @@ const defaultProps = {
   onHeaderChange: vi.fn(),
   onToggleExplorer: vi.fn(),
   onClearView: vi.fn(),
+  onResetCellSizing: vi.fn(),
   onPythonMacro: vi.fn(),
   onThemeChange: vi.fn(),
   onDelimiterChange: vi.fn(),
@@ -119,7 +123,18 @@ describe("RibbonHeader", () => {
     expect(defaultProps.onDelimiterChange).toHaveBeenCalledWith(";");
 
     fireEvent.mouseEnter(screen.getByRole("button", { name: "View" }));
-    expect((screen.getByRole("button", { name: "Fit Columns" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Reset Cell Size" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("enables and runs the cell-size reset when custom sizing exists", () => {
+    render(<RibbonHeader {...defaultProps} hasCustomSizing />);
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "View" }));
+
+    const reset = screen.getByRole("button", { name: "Reset Cell Size" }) as HTMLButtonElement;
+    expect(reset.disabled).toBe(false);
+    fireEvent.click(reset);
+
+    expect(defaultProps.onResetCellSizing).toHaveBeenCalledOnce();
   });
 
   it("reflects and changes the dark mode preference", () => {
@@ -148,6 +163,18 @@ describe("RibbonHeader", () => {
     expect(defaultProps.onOpen).toHaveBeenCalledOnce();
     expect(defaultProps.onSave).toHaveBeenCalledOnce();
     expect(defaultProps.onSaveAs).toHaveBeenCalledOnce();
+  });
+
+  it("enables duplicate only for a saved document", () => {
+    const { rerender } = render(<RibbonHeader {...defaultProps} />);
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "File" }));
+    expect((screen.getByRole("button", { name: "Duplicar" }) as HTMLButtonElement).disabled).toBe(true);
+
+    rerender(<RibbonHeader {...defaultProps} canDuplicate />);
+    const duplicate = screen.getByRole("button", { name: "Duplicar" }) as HTMLButtonElement;
+    expect(duplicate.disabled).toBe(false);
+    fireEvent.click(duplicate);
+    expect(defaultProps.onDuplicate).toHaveBeenCalledOnce();
   });
 
   it("edits the document name on double click and commits it with Enter", async () => {

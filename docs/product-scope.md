@@ -7,8 +7,10 @@ Tablune Sheets 0.3 is a desktop editor and non-destructive explorer for delimite
 ## Included
 
 - New document
+- Duplicate the current document beside its source without changing the active tab
 - Open CSV, TSV, and semicolon-delimited text
 - Canvas-rendered grid
+- Visual row-height and column-width resizing with visible-content auto-fit
 - Cell selection and editing
 - Keyboard navigation
 - Insert and delete rows and columns

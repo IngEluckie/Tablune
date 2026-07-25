@@ -72,6 +72,11 @@ export interface GridViewportState {
   scrollLeft: number;
 }
 
+export interface GridSizingState {
+  columnWidths: Record<number, number>;
+  rowHeights: Record<number, number>;
+}
+
 export interface CellInput {
   row: number;
   column: number;

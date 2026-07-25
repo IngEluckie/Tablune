@@ -28,12 +28,15 @@ interface RibbonHeaderProps {
   canUndo: boolean;
   canRedo: boolean;
   canChangeRows: boolean;
+  canDuplicate: boolean;
   hasView: boolean;
+  hasCustomSizing: boolean;
   theme: ThemeMode;
   onNew: () => void;
   onOpen: () => void;
   onSave: () => void;
   onSaveAs: () => void;
+  onDuplicate: () => void;
   onExportView: () => void;
   onUndo: () => void;
   onRedo: () => void;
@@ -48,6 +51,7 @@ interface RibbonHeaderProps {
   onHeaderChange: (enabled: boolean) => void;
   onToggleExplorer: () => void;
   onClearView: () => void;
+  onResetCellSizing: () => void;
   onPythonMacro: () => void;
   onThemeChange: (theme: ThemeMode) => void;
   onDelimiterChange: (delimiter: string) => void;
@@ -80,12 +84,15 @@ export default function RibbonHeader({
   canUndo,
   canRedo,
   canChangeRows,
+  canDuplicate,
   hasView,
+  hasCustomSizing,
   theme,
   onNew,
   onOpen,
   onSave,
   onSaveAs,
+  onDuplicate,
   onExportView,
   onUndo,
   onRedo,
@@ -100,6 +107,7 @@ export default function RibbonHeader({
   onHeaderChange,
   onToggleExplorer,
   onClearView,
+  onResetCellSizing,
   onPythonMacro,
   onThemeChange,
   onDelimiterChange,
@@ -289,6 +297,7 @@ export default function RibbonHeader({
                 <button onClick={onOpen} disabled={busy}>Open</button>
                 <button onClick={onSave} disabled={busy}>Save</button>
                 <button onClick={onSaveAs} disabled={busy}>Save As</button>
+                <button onClick={onDuplicate} disabled={busy || !canDuplicate}>Duplicar</button>
                 <button onClick={onExportView} disabled={busy}>Export View</button>
               </div>
             )}
@@ -341,7 +350,7 @@ export default function RibbonHeader({
                 <span className="ribbon-divider" aria-hidden="true" />
                 <button onClick={onFind}>Find</button>
                 <button onClick={onToggleExplorer}>Data Explorer</button>
-                <button disabled>Fit Columns</button>
+                <button onClick={onResetCellSizing} disabled={busy || !hasCustomSizing}>Reset Cell Size</button>
               </div>
             )}
 

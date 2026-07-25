@@ -394,6 +394,31 @@ impl DocumentSession {
         session
     }
 
+    fn duplicate_to(&self, path: PathBuf) -> Self {
+        let row_count = self.document.row_count();
+        let mut session = Self {
+            document: self.document.clone(),
+            path: Some(path),
+            dialect: self.dialect,
+            revision: 0,
+            view_revision: 0,
+            current_state: 0,
+            saved_state: 0,
+            next_state: 1,
+            next_row_id: row_count as u64 + 1,
+            row_ids: (1..=row_count as u64).collect(),
+            history: TransactionHistory::with_limits(HISTORY_ENTRIES, HISTORY_BYTES),
+            header_enabled: self.header_enabled,
+            header_suggested: false,
+            column_types: self.column_types.clone(),
+            view: ViewState::default(),
+            visible_rows: Vec::new(),
+            identity: next_session_identity(),
+        };
+        session.rebuild_view();
+        session
+    }
+
     pub(crate) fn summary(&self) -> DocumentSummary {
         let header_names = self.header_names();
         DocumentSummary {
@@ -1340,6 +1365,48 @@ fn ensure_path_available(
     }
 }
 
+fn duplicate_name_parts(path: &Path) -> Result<(String, u64, Option<String>), String> {
+    let stem = path
+        .file_stem()
+        .ok_or_else(|| "the document does not have a valid file name".to_string())?
+        .to_string_lossy()
+        .into_owned();
+    let extension = path
+        .extension()
+        .map(|value| value.to_string_lossy().into_owned());
+    if let Some(open) = stem.rfind('(')
+        && stem.ends_with(')')
+        && open > 0
+        && let Ok(number) = stem[open + 1..stem.len() - 1].parse::<u64>()
+    {
+        let next = number
+            .checked_add(1)
+            .ok_or_else(|| "could not generate another duplicate file name".to_string())?;
+        return Ok((stem[..open].to_string(), next, extension));
+    }
+    Ok((stem, 1, extension))
+}
+
+fn next_duplicate_path(path: &Path) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the document does not have a parent folder".to_string())?;
+    let (base, mut number, extension) = duplicate_name_parts(path)?;
+    loop {
+        let name = match &extension {
+            Some(extension) => format!("{base}({number}).{extension}"),
+            None => format!("{base}({number})"),
+        };
+        let candidate = parent.join(name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+        number = number
+            .checked_add(1)
+            .ok_or_else(|| "could not generate another duplicate file name".to_string())?;
+    }
+}
+
 fn close_document_internal(
     state: &WorkspaceState,
     document_id: u64,
@@ -1458,6 +1525,51 @@ pub fn session_save(
     };
     write_workspace_recovery_internal(&app, &state, None)?;
     Ok(summary)
+}
+
+#[tauri::command]
+pub fn session_duplicate(
+    app: AppHandle,
+    state: State<'_, WorkspaceState>,
+    document_id: u64,
+) -> Result<WorkspaceSummary, String> {
+    let source_handle = document_handle(&state, document_id)?;
+    let source_path = lock_document(&source_handle)?
+        .path
+        .clone()
+        .ok_or_else(|| "save the document before duplicating it".to_string())?;
+    let mut destination = next_duplicate_path(&source_path)?;
+    while find_document_by_path(&state, &destination, None)?.is_some() {
+        destination = next_duplicate_path(&destination)?;
+    }
+
+    let duplicate = lock_document(&source_handle)?.duplicate_to(destination.clone());
+    tablune_csv::write_path(&destination, &duplicate.document, duplicate.dialect)
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = save_file_preferences(&app, &duplicate) {
+        let _ = fs::remove_file(&destination);
+        return Err(error);
+    }
+
+    let duplicate_handle = Arc::new(Mutex::new(duplicate));
+    let mut workspace = match lock_workspace(&state) {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            let _ = fs::remove_file(&destination);
+            return Err(error);
+        }
+    };
+    let Some(source_index) = workspace
+        .iter()
+        .position(|candidate| Arc::ptr_eq(candidate, &source_handle))
+    else {
+        drop(workspace);
+        let _ = fs::remove_file(&destination);
+        return Err("the source document is no longer open".to_string());
+    };
+    workspace.insert(source_index + 1, duplicate_handle);
+    drop(workspace);
+    workspace_summary_value(&state)
 }
 
 #[tauri::command]
@@ -2028,6 +2140,75 @@ mod tests {
             .unwrap()
             .push(Arc::new(Mutex::new(session)));
         document_id
+    }
+
+    #[test]
+    fn duplicate_names_increment_suffixes_and_preserve_extensions() {
+        let unique = next_session_identity();
+        let directory = std::env::temp_dir().join(format!("tablune-duplicate-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+
+        let source = directory.join("report.csv");
+        fs::write(&source, b"value\n").unwrap();
+        assert_eq!(
+            next_duplicate_path(&source).unwrap(),
+            directory.join("report(1).csv")
+        );
+        fs::write(directory.join("report(1).csv"), b"").unwrap();
+        fs::write(directory.join("report(2).csv"), b"").unwrap();
+        assert_eq!(
+            next_duplicate_path(&source).unwrap(),
+            directory.join("report(3).csv")
+        );
+
+        let numbered = directory.join("data(4).TSV");
+        fs::write(&numbered, b"").unwrap();
+        fs::write(directory.join("data(5).TSV"), b"").unwrap();
+        assert_eq!(
+            next_duplicate_path(&numbered).unwrap(),
+            directory.join("data(6).TSV")
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn duplicated_session_uses_current_data_and_starts_clean() {
+        let mut source = DocumentSession {
+            path: Some(PathBuf::from("/tmp/source.csv")),
+            dialect: CsvDialect {
+                delimiter: b';',
+                line_ending: LineEnding::CrLf,
+            },
+            header_enabled: true,
+            ..Default::default()
+        };
+        source.column_types.insert(0, ColumnType::Number);
+        source
+            .apply_edit(
+                EditCommand::SetCells {
+                    cells: vec![CellInput {
+                        row: 0,
+                        column: 0,
+                        value: "42".into(),
+                    }],
+                },
+                0,
+            )
+            .unwrap();
+
+        let duplicate = source.duplicate_to(PathBuf::from("/tmp/source(1).csv"));
+
+        assert!(source.summary().dirty);
+        assert_eq!(source.cell_value(0, 0), "42");
+        assert_eq!(duplicate.cell_value(0, 0), "42");
+        assert!(!duplicate.summary().dirty);
+        assert!(!duplicate.history.can_undo());
+        assert_eq!(duplicate.dialect, source.dialect);
+        assert!(duplicate.header_enabled);
+        assert_eq!(duplicate.column_types.get(&0), Some(&ColumnType::Number));
+        assert!(duplicate.view.sorts.is_empty());
+        assert!(duplicate.view.filters.is_empty());
     }
 
     #[test]
