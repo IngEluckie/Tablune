@@ -14,11 +14,19 @@ import {
 } from "./ipc";
 import type { DocumentSummary, MacroPreview, PythonStatus } from "./types";
 import {
+  MACRO_RESULTS_RESIZER_SIZE,
+  MIN_MACRO_EDITOR_HEIGHT,
   MIN_MACRO_PANEL_WIDTH,
+  MIN_MACRO_RESULTS_HEIGHT,
   clampMacroPanelWidth,
+  clampMacroResultsHeight,
+  defaultMacroResultsHeight,
   macroPanelMaximum,
+  macroResultsMaximum,
   readMacroPanelWidth,
+  readMacroResultsHeight,
   writeMacroPanelWidth,
+  writeMacroResultsHeight,
 } from "./macroPanelSizing";
 
 const STARTER_MACRO = `def transform(rows, context):
@@ -73,7 +81,11 @@ export default function PythonMacroPanel({
   const [consoleError, setConsoleError] = useState("");
   const [resultTab, setResultTab] = useState<"preview" | "console">("preview");
   const [panelWidth, setPanelWidth] = useState(readMacroPanelWidth);
+  const [preferredResultsHeight, setPreferredResultsHeight] = useState(readMacroResultsHeight);
+  const [workAreaHeight, setWorkAreaHeight] = useState(0);
+  const [resultsResizing, setResultsResizing] = useState(false);
   const panelRef = useRef<HTMLElement>(null);
+  const workAreaRef = useRef<HTMLDivElement>(null);
   const previewTabRef = useRef<HTMLButtonElement>(null);
   const consoleTabRef = useRef<HTMLButtonElement>(null);
   const resizeRef = useRef<{
@@ -81,9 +93,21 @@ export default function PythonMacroPanel({
     startX: number;
     startWidth: number;
   } | null>(null);
+  const resultsResizeRef = useRef<{
+    pointerId: number;
+    startY: number;
+    startHeight: number;
+  } | null>(null);
   const dirty = code !== savedCode;
   const previewStale = preview !== null && preview.baseRevision !== summary.revision;
   const canApply = preview !== null && preview.canApply && !previewStale && !running && !working;
+  const resultsMaximum = macroResultsMaximum(workAreaHeight);
+  const resultsHeight = clampMacroResultsHeight(
+    preferredResultsHeight ?? defaultMacroResultsHeight(workAreaHeight),
+    workAreaHeight,
+  );
+  const resultsHeightRef = useRef(resultsHeight);
+  resultsHeightRef.current = resultsHeight;
   const consoleText = useMemo(() => {
     const parts = [];
     if (preview?.stdout) parts.push(`stdout\n${preview.stdout}`);
@@ -134,6 +158,17 @@ export default function PythonMacroPanel({
     clampToWorkspace();
     const observer = new ResizeObserver(clampToWorkspace);
     observer.observe(workspace);
+    return () => observer.disconnect();
+  }, []);
+
+  useLayoutEffect(() => {
+    const workArea = workAreaRef.current;
+    if (!workArea) return;
+    const measure = () => setWorkAreaHeight(workArea.clientHeight);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(workArea);
     return () => observer.disconnect();
   }, []);
 
@@ -315,6 +350,25 @@ export default function PythonMacroPanel({
     });
   };
 
+  const resizeResultsTo = (height: number) => {
+    const next = clampMacroResultsHeight(height, workAreaRef.current?.clientHeight);
+    resultsHeightRef.current = next;
+    setPreferredResultsHeight(next);
+  };
+
+  const finishResultsResize = () => {
+    resultsResizeRef.current = null;
+    setResultsResizing(false);
+    writeMacroResultsHeight(resultsHeightRef.current);
+  };
+
+  const resizeResultsFromKeyboard = (height: number) => {
+    const next = clampMacroResultsHeight(height, workAreaRef.current?.clientHeight);
+    resultsHeightRef.current = next;
+    setPreferredResultsHeight(next);
+    writeMacroResultsHeight(next);
+  };
+
   const selectResultTab = (tab: "preview" | "console", focus = false) => {
     setResultTab(tab);
     if (focus) {
@@ -407,21 +461,76 @@ export default function PythonMacroPanel({
         </button>
       </div>
 
-      <div className="macro-editor-panel">
-        <span>Macro code</span>
-        <Suspense fallback={<div className="python-macro-editor-loading">Loading editor…</div>}>
-          <PythonMacroEditor
-            value={code}
-            disabled={running || working}
-            onChange={(nextCode) => {
-              setCode(nextCode);
-              setPreview(null);
-            }}
-          />
-        </Suspense>
-      </div>
+      <div
+        ref={workAreaRef}
+        className="macro-work-area"
+        style={{
+          gridTemplateRows: `minmax(${MIN_MACRO_EDITOR_HEIGHT}px, 1fr) ${MACRO_RESULTS_RESIZER_SIZE}px ${resultsHeight}px`,
+        }}
+      >
+        <div className="macro-editor-panel">
+          <span>Macro code</span>
+          <Suspense fallback={<div className="python-macro-editor-loading">Loading editor…</div>}>
+            <PythonMacroEditor
+              value={code}
+              disabled={running || working}
+              onChange={(nextCode) => {
+                setCode(nextCode);
+                setPreview(null);
+              }}
+            />
+          </Suspense>
+        </div>
 
-      <section className="macro-results" aria-label="Macro results">
+        <div
+          className={`macro-output-resizer${resultsResizing ? " resizing" : ""}`}
+          role="separator"
+          aria-label="Resize Preview and Console area"
+          aria-orientation="horizontal"
+          aria-valuemin={MIN_MACRO_RESULTS_HEIGHT}
+          aria-valuemax={resultsMaximum}
+          aria-valuenow={resultsHeight}
+          tabIndex={0}
+          onPointerDown={(event) => {
+            if (event.button !== 0) return;
+            event.currentTarget.setPointerCapture?.(event.pointerId);
+            resultsResizeRef.current = {
+              pointerId: event.pointerId,
+              startY: event.clientY,
+              startHeight: resultsHeight,
+            };
+            setResultsResizing(true);
+          }}
+          onPointerMove={(event) => {
+            const resize = resultsResizeRef.current;
+            if (!resize || resize.pointerId !== event.pointerId) return;
+            resizeResultsTo(resize.startHeight + resize.startY - event.clientY);
+          }}
+          onPointerUp={(event) => {
+            const resize = resultsResizeRef.current;
+            if (!resize || resize.pointerId !== event.pointerId) return;
+            if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+              event.currentTarget.releasePointerCapture(event.pointerId);
+            }
+            finishResultsResize();
+          }}
+          onPointerCancel={(event) => {
+            if (resultsResizeRef.current?.pointerId === event.pointerId) finishResultsResize();
+          }}
+          onKeyDown={(event) => {
+            const step = event.shiftKey ? 48 : 16;
+            let next: number;
+            if (event.key === "ArrowUp") next = resultsHeight + step;
+            else if (event.key === "ArrowDown") next = resultsHeight - step;
+            else if (event.key === "Home") next = MIN_MACRO_RESULTS_HEIGHT;
+            else if (event.key === "End") next = resultsMaximum;
+            else return;
+            event.preventDefault();
+            resizeResultsFromKeyboard(next);
+          }}
+        />
+
+        <section className="macro-results" aria-label="Macro results">
         <div className="macro-result-tabs" role="tablist" aria-label="Macro output">
           <button
             ref={previewTabRef}
@@ -492,7 +601,8 @@ export default function PythonMacroPanel({
             <pre>{consoleText}</pre>
           </div>
         )}
-      </section>
+        </section>
+      </div>
 
       <footer className="macro-actions">
         {running ? (

@@ -93,13 +93,20 @@ button { cursor: default; }
   container: macro-panel / inline-size;
   position: relative;
   display: grid;
-  grid-template-rows: auto auto auto minmax(90px, 1fr) clamp(120px, 30%, 240px) auto;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
   min-width: 360px;
   min-height: 0;
   overflow: hidden;
   border-left: 1px solid var(--border);
   color: var(--text);
   background: var(--panel-background);
+}
+
+.macro-work-area {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .macro-panel button {
@@ -240,12 +247,36 @@ button { cursor: default; }
 .python-macro-editor .cm-py-name { color: var(--code-name); }
 .python-macro-editor .cm-py-definition { color: var(--code-definition); }
 
+.macro-output-resizer {
+  position: relative;
+  z-index: 2;
+  min-height: 8px;
+  cursor: row-resize;
+  touch-action: none;
+  background: var(--surface);
+}
+.macro-output-resizer::after {
+  position: absolute;
+  top: 3px;
+  right: 0;
+  left: 0;
+  height: 1px;
+  background: var(--border);
+  content: "";
+}
+.macro-output-resizer:hover::after,
+.macro-output-resizer:focus-visible::after,
+.macro-output-resizer.resizing::after {
+  height: 2px;
+  background: var(--focus);
+}
+.macro-output-resizer:focus-visible { outline: none; }
+
 .macro-results {
   display: grid;
   grid-template-rows: 34px minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
-  border-top: 1px solid var(--border);
   background: var(--surface);
 }
 .macro-result-tabs { display: flex; align-items: stretch; gap: 4px; padding: 3px 8px 0; border-bottom: 1px solid var(--border-subtle); }

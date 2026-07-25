@@ -87,6 +87,37 @@ const props = {
   onClose: vi.fn(),
 };
 
+function mockWorkAreaResize(initialHeight: number) {
+  let height = initialHeight;
+  let notifyWorkArea = () => {};
+
+  vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+    return this.classList.contains("macro-work-area") ? height : 0;
+  });
+
+  class MockResizeObserver {
+    constructor(private readonly callback: ResizeObserverCallback) {}
+
+    observe(target: Element) {
+      if (target.classList.contains("macro-work-area")) {
+        notifyWorkArea = () => this.callback([], this as unknown as ResizeObserver);
+      }
+      this.callback([], this as unknown as ResizeObserver);
+    }
+
+    unobserve() {}
+    disconnect() {}
+  }
+
+  vi.stubGlobal("ResizeObserver", MockResizeObserver);
+  return {
+    setHeight(nextHeight: number) {
+      height = nextHeight;
+      act(() => notifyWorkArea());
+    },
+  };
+}
+
 describe("PythonMacroDialog", () => {
   beforeEach(() => {
     window.localStorage.clear();
@@ -106,7 +137,11 @@ describe("PythonMacroDialog", () => {
     vi.mocked(applyPythonPreview).mockResolvedValue({ ...summary, revision: 3, dirty: true, canUndo: true });
   });
 
-  afterEach(cleanup);
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
 
   it("warns once, previews changes, and applies by preview id", async () => {
     render(<PythonMacroDialog {...props} />);
@@ -265,5 +300,91 @@ describe("PythonMacroDialog", () => {
     const previewTab = screen.getByRole("tab", { name: "Preview" });
     fireEvent.keyDown(previewTab, { key: "ArrowRight" });
     await waitFor(() => expect(screen.getByRole("tab", { name: "Console" }).getAttribute("aria-selected")).toBe("true"));
+  });
+
+  it("resizes Preview and Console by pointer, captures it, and persists on completion", async () => {
+    class MockPointerEvent extends MouseEvent {
+      readonly pointerId: number;
+
+      constructor(type: string, init: PointerEventInit = {}) {
+        super(type, init);
+        this.pointerId = init.pointerId ?? 0;
+      }
+    }
+    vi.stubGlobal("PointerEvent", MockPointerEvent);
+    render(<PythonMacroDialog {...props} />);
+    await screen.findByText(/Python 3\.12\.1/);
+    const separator = screen.getByRole("separator", { name: "Resize Preview and Console area" });
+    const setPointerCapture = vi.fn();
+    const releasePointerCapture = vi.fn();
+    Object.defineProperties(separator, {
+      setPointerCapture: { value: setPointerCapture },
+      hasPointerCapture: { value: () => true },
+      releasePointerCapture: { value: releasePointerCapture },
+    });
+
+    fireEvent.pointerDown(separator, { button: 0, pointerId: 7, clientY: 300 });
+    expect(setPointerCapture).toHaveBeenCalledWith(7);
+    expect(separator.classList.contains("resizing")).toBe(true);
+    fireEvent.pointerMove(separator, { pointerId: 7, clientY: 260 });
+    expect(separator.getAttribute("aria-valuenow")).toBe("220");
+    fireEvent.pointerMove(separator, { pointerId: 7, clientY: 600 });
+    expect(separator.getAttribute("aria-valuenow")).toBe("120");
+    fireEvent.pointerMove(separator, { pointerId: 7, clientY: 0 });
+    expect(separator.getAttribute("aria-valuenow")).toBe("240");
+    fireEvent.pointerCancel(separator, { pointerId: 7 });
+    expect(separator.classList.contains("resizing")).toBe(false);
+    expect(window.localStorage.getItem("tablune.pythonMacroResultsHeight")).toBe("240");
+
+    fireEvent.pointerDown(separator, { button: 0, pointerId: 8, clientY: 300 });
+    fireEvent.pointerMove(separator, { pointerId: 8, clientY: 350 });
+    fireEvent.pointerUp(separator, { pointerId: 8, clientY: 350 });
+    expect(releasePointerCapture).toHaveBeenCalledWith(8);
+    expect(separator.getAttribute("aria-valuenow")).toBe("190");
+    expect(window.localStorage.getItem("tablune.pythonMacroResultsHeight")).toBe("190");
+
+    fireEvent.click(screen.getByRole("tab", { name: "Console" }));
+    expect(separator.getAttribute("aria-valuenow")).toBe("190");
+  });
+
+  it("supports accessible keyboard resizing and reports current limits", async () => {
+    mockWorkAreaResize(500);
+    render(<PythonMacroDialog {...props} />);
+    await screen.findByText(/Python 3\.12\.1/);
+    const separator = screen.getByRole("separator", { name: "Resize Preview and Console area" });
+
+    expect(separator.getAttribute("aria-orientation")).toBe("horizontal");
+    expect(separator.getAttribute("aria-valuemin")).toBe("120");
+    expect(separator.getAttribute("aria-valuemax")).toBe("402");
+    expect(separator.getAttribute("aria-valuenow")).toBe("150");
+
+    fireEvent.keyDown(separator, { key: "ArrowUp" });
+    expect(separator.getAttribute("aria-valuenow")).toBe("166");
+    fireEvent.keyDown(separator, { key: "ArrowUp", shiftKey: true });
+    expect(separator.getAttribute("aria-valuenow")).toBe("214");
+    fireEvent.keyDown(separator, { key: "ArrowDown" });
+    expect(separator.getAttribute("aria-valuenow")).toBe("198");
+    fireEvent.keyDown(separator, { key: "Home" });
+    expect(separator.getAttribute("aria-valuenow")).toBe("120");
+    fireEvent.keyDown(separator, { key: "End" });
+    expect(separator.getAttribute("aria-valuenow")).toBe("402");
+    expect(window.localStorage.getItem("tablune.pythonMacroResultsHeight")).toBe("402");
+  });
+
+  it("temporarily clamps a saved height and restores it when space returns", async () => {
+    window.localStorage.setItem("tablune.pythonMacroResultsHeight", "300");
+    const workArea = mockWorkAreaResize(400);
+    render(<PythonMacroDialog {...props} />);
+    await screen.findByText(/Python 3\.12\.1/);
+    const separator = screen.getByRole("separator", { name: "Resize Preview and Console area" });
+
+    expect(separator.getAttribute("aria-valuenow")).toBe("300");
+    workArea.setHeight(260);
+    expect(separator.getAttribute("aria-valuemax")).toBe("162");
+    expect(separator.getAttribute("aria-valuenow")).toBe("162");
+    expect(window.localStorage.getItem("tablune.pythonMacroResultsHeight")).toBe("300");
+
+    workArea.setHeight(400);
+    expect(separator.getAttribute("aria-valuenow")).toBe("300");
   });
 });
