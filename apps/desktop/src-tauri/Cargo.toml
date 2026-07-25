@@ -24,3 +24,6 @@ tauri-plugin-dialog = "2"
 tablune-core = { path = "../../../crates/tablune-core" }
 tablune-csv = { path = "../../../crates/tablune-csv" }
 tablune-history = { path = "../../../crates/tablune-history" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

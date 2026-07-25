@@ -115,7 +115,7 @@ pub fn write_path(
     buffer.get_ref().sync_all()?;
     drop(buffer);
 
-    replace_file(&temporary_path, path)
+    replace_file_atomic(&temporary_path, path)
 }
 
 fn detect_dialect(bytes: &[u8]) -> CsvDialect {
@@ -127,9 +127,17 @@ fn detect_dialect(bytes: &[u8]) -> CsvDialect {
 
     let delimiter = DELIMITER_CANDIDATES
         .into_iter()
-        .max_by_key(|candidate| delimiter_score(bytes, *candidate))
-        .filter(|candidate| delimiter_score(bytes, *candidate) > 0)
-        .unwrap_or(b',');
+        .enumerate()
+        .map(|(preference, candidate)| {
+            (
+                delimiter_score(bytes, candidate),
+                usize::MAX - preference,
+                candidate,
+            )
+        })
+        .max()
+        .filter(|(score, _, _)| score.1 > 0)
+        .map_or(b',', |(_, _, candidate)| candidate);
 
     CsvDialect {
         delimiter,
@@ -137,30 +145,49 @@ fn detect_dialect(bytes: &[u8]) -> CsvDialect {
     }
 }
 
-fn delimiter_score(bytes: &[u8], delimiter: u8) -> usize {
-    bytes
-        .split(|byte| *byte == b'\n')
-        .take(32)
-        .map(|line| count_unquoted(line, delimiter))
-        .sum()
+fn delimiter_score(bytes: &[u8], delimiter: u8) -> (usize, usize, usize, usize) {
+    let counts = logical_record_delimiter_counts(bytes, delimiter);
+    let mut frequencies = std::collections::HashMap::<usize, usize>::new();
+    let mut positive_rows = 0;
+    let mut total = 0;
+    for count in counts {
+        if count > 0 {
+            positive_rows += 1;
+            total += count;
+            *frequencies.entry(count).or_default() += 1;
+        }
+    }
+    let (modal_rows, modal_count) = frequencies
+        .into_iter()
+        .map(|(count, frequency)| (frequency, count))
+        .max()
+        .unwrap_or_default();
+    (modal_rows, positive_rows, modal_count, total)
 }
 
-fn count_unquoted(line: &[u8], delimiter: u8) -> usize {
+fn logical_record_delimiter_counts(bytes: &[u8], delimiter: u8) -> Vec<usize> {
     let mut quoted = false;
     let mut count = 0;
+    let mut counts = Vec::new();
     let mut index = 0;
 
-    while index < line.len() {
-        match line[index] {
-            b'"' if quoted && line.get(index + 1) == Some(&b'"') => index += 1,
+    while index < bytes.len() && counts.len() < 32 {
+        match bytes[index] {
+            b'"' if quoted && bytes.get(index + 1) == Some(&b'"') => index += 1,
             b'"' => quoted = !quoted,
             byte if byte == delimiter && !quoted => count += 1,
+            b'\n' if !quoted => {
+                counts.push(count);
+                count = 0;
+            }
             _ => {}
         }
         index += 1;
     }
-
-    count
+    if counts.len() < 32 && (!bytes.is_empty() && bytes.last() != Some(&b'\n')) {
+        counts.push(count);
+    }
+    counts
 }
 
 fn validate_delimiter(delimiter: u8) -> Result<(), CsvError> {
@@ -179,18 +206,66 @@ fn temporary_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-fn replace_file(temporary_path: &Path, destination: &Path) -> Result<(), CsvError> {
+pub fn replace_file_atomic(temporary_path: &Path, destination: &Path) -> Result<(), CsvError> {
     #[cfg(windows)]
-    if destination.exists() {
-        fs::remove_file(destination)?;
-    }
+    return finish_replace(temporary_path, destination, |temporary, destination| {
+        if destination.exists() {
+            replace_existing_windows(temporary, destination)
+        } else {
+            fs::rename(temporary, destination)
+        }
+    });
 
-    match fs::rename(temporary_path, destination) {
+    #[cfg(not(windows))]
+    finish_replace(temporary_path, destination, |temporary, destination| {
+        fs::rename(temporary, destination)
+    })
+}
+
+fn finish_replace(
+    temporary_path: &Path,
+    destination: &Path,
+    replace: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), CsvError> {
+    match replace(temporary_path, destination) {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = fs::remove_file(temporary_path);
             Err(CsvError::Io(error))
         }
+    }
+}
+
+#[cfg(windows)]
+fn replace_existing_windows(temporary_path: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::{os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let temporary = temporary_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // ReplaceFileW leaves the original destination intact when replacement fails.
+    let replaced = unsafe {
+        ReplaceFileW(
+            destination.as_ptr(),
+            temporary.as_ptr(),
+            ptr::null(),
+            0,
+            ptr::null(),
+            ptr::null(),
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -203,7 +278,7 @@ mod tests {
 
     use tablune_core::{CellPosition, TableDocument};
 
-    use super::{CsvDialect, LineEnding, read_bytes, read_path, write_path};
+    use super::{CsvDialect, LineEnding, finish_replace, read_bytes, read_path, write_path};
 
     #[test]
     fn parses_quoted_delimiters_and_newlines() {
@@ -225,6 +300,21 @@ mod tests {
                 line_ending: LineEnding::CrLf,
             }
         );
+    }
+
+    #[test]
+    fn delimiter_detection_prefers_consistent_tsv_over_commas_inside_values() {
+        let file = read_bytes(b"id\tlist\n1\ta,b,c,d\n2\te,f,g,h\n").expect("TSV should parse");
+        assert_eq!(file.dialect.delimiter, b'\t');
+        assert_eq!(file.document.rows()[1][1], "a,b,c,d");
+    }
+
+    #[test]
+    fn delimiter_detection_tracks_quoted_multiline_records() {
+        let file =
+            read_bytes(b"id;notes\n1;\"a,b\nc,d\"\n2;plain\n").expect("semicolon CSV should parse");
+        assert_eq!(file.dialect.delimiter, b';');
+        assert_eq!(file.document.rows()[1][1], "a,b\nc,d");
     }
 
     #[test]
@@ -255,5 +345,27 @@ mod tests {
         );
 
         fs::remove_file(path).expect("temporary CSV should be removed");
+    }
+
+    #[test]
+    fn failed_replacement_never_removes_the_original_destination() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("tablune-replace-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        let destination = directory.join("data.csv");
+        let temporary = directory.join("data.tmp");
+        fs::write(&destination, "original").unwrap();
+        fs::write(&temporary, "replacement").unwrap();
+
+        let result = finish_replace(&temporary, &destination, |_, _| {
+            Err(std::io::Error::other("simulated replacement failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "original");
+        assert!(!temporary.exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

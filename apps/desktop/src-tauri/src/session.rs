@@ -1,7 +1,9 @@
 use std::{
+    borrow::Cow,
     cmp::Ordering,
     collections::{HashMap, HashSet},
     fs,
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -19,6 +21,7 @@ const HISTORY_ENTRIES: usize = 500;
 const HISTORY_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_HISTORY_BYTES: usize = HISTORY_BYTES;
 static NEXT_SESSION_IDENTITY: AtomicU64 = AtomicU64::new(1);
+static NEXT_ATOMIC_WRITE: AtomicU64 = AtomicU64::new(1);
 
 fn next_session_identity() -> u64 {
     NEXT_SESSION_IDENTITY.fetch_add(1, AtomicOrdering::Relaxed)
@@ -161,6 +164,8 @@ pub struct SearchRequest {
     #[serde(default)]
     pub whole_cell: bool,
     pub range: Option<CellRange>,
+    #[serde(default)]
+    pub view_range: Option<CellRange>,
     #[serde(default = "default_search_limit")]
     pub limit: usize,
 }
@@ -194,6 +199,14 @@ pub struct ReplaceRequest {
     pub replacement: String,
     pub replace_all: bool,
     pub expected_revision: u64,
+    pub target: Option<ReplaceTarget>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceTarget {
+    pub source_row: usize,
+    pub column: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -266,6 +279,35 @@ struct WorkspaceRecoveryPayload {
     documents: Vec<RecoveryPayload>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryPayloadRef<'a> {
+    rows: &'a [Vec<String>],
+    path: Option<Cow<'a, str>>,
+    dialect: CsvDialect,
+    header_enabled: bool,
+    column_types: &'a HashMap<usize, ColumnType>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceRecoveryPayloadRef<'a> {
+    version: u8,
+    documents: Vec<RecoveryPayloadRef<'a>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryDocumentFingerprint {
+    identity: u64,
+    revision: u64,
+    path: Option<PathBuf>,
+    header_enabled: bool,
+    column_types: Vec<(usize, ColumnType)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryFingerprint(Vec<RecoveryDocumentFingerprint>);
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum StoredRecoveryPayload {
@@ -320,6 +362,19 @@ enum InternalOp {
 struct EditRecord {
     forward: InternalOp,
     inverse: InternalOp,
+    column_state: Option<ColumnStateChange>,
+}
+
+#[derive(Debug, Clone)]
+struct ColumnState {
+    column_types: HashMap<usize, ColumnType>,
+    view: ViewState,
+}
+
+#[derive(Debug, Clone)]
+struct ColumnStateChange {
+    before: ColumnState,
+    after: ColumnState,
 }
 
 pub struct DocumentSession {
@@ -369,6 +424,79 @@ impl Default for DocumentSession {
 }
 
 impl DocumentSession {
+    fn column_state(&self) -> ColumnState {
+        ColumnState {
+            column_types: self.column_types.clone(),
+            view: self.view.clone(),
+        }
+    }
+
+    fn restore_column_state(&mut self, state: &ColumnState) {
+        self.column_types = state.column_types.clone();
+        self.view = state.view.clone();
+    }
+
+    fn column_state_after_insert(&self, index: usize, count: usize) -> ColumnState {
+        let shift = |column: usize| {
+            if column >= index {
+                column.saturating_add(count)
+            } else {
+                column
+            }
+        };
+        let mut state = self.column_state();
+        state.column_types = state
+            .column_types
+            .into_iter()
+            .map(|(column, column_type)| (shift(column), column_type))
+            .collect();
+        for sort in &mut state.view.sorts {
+            sort.column = shift(sort.column);
+        }
+        for filter in &mut state.view.filters {
+            filter.column = shift(filter.column);
+        }
+        state
+    }
+
+    fn column_state_after_delete(&self, index: usize, count: usize) -> ColumnState {
+        let end = index.saturating_add(count);
+        let shifted = |column: usize| {
+            if column < index {
+                Some(column)
+            } else if column < end {
+                None
+            } else {
+                Some(column - count)
+            }
+        };
+        let mut state = self.column_state();
+        state.column_types = state
+            .column_types
+            .into_iter()
+            .filter_map(|(column, column_type)| shifted(column).map(|column| (column, column_type)))
+            .collect();
+        state.view.sorts = state
+            .view
+            .sorts
+            .into_iter()
+            .filter_map(|mut sort| {
+                sort.column = shifted(sort.column)?;
+                Some(sort)
+            })
+            .collect();
+        state.view.filters = state
+            .view
+            .filters
+            .into_iter()
+            .filter_map(|mut filter| {
+                filter.column = shifted(filter.column)?;
+                Some(filter)
+            })
+            .collect();
+        state
+    }
+
     fn from_file(path: PathBuf, file: tablune_csv::CsvFile, preferences: FilePreferences) -> Self {
         let suggested = suggest_header(file.document.rows());
         let header_enabled = preferences.header_enabled.unwrap_or(false);
@@ -639,20 +767,7 @@ impl DocumentSession {
                 self.document.delete_columns(*index, *count);
             }
             InternalOp::RestoreColumns { index, columns } => {
-                self.document.insert_columns(*index, columns.len());
-                for (offset, values) in columns.iter().enumerate() {
-                    for (row, value) in values.iter().enumerate() {
-                        if let Some(value) = value {
-                            self.document.set_cell(
-                                CellPosition {
-                                    row,
-                                    column: index + offset,
-                                },
-                                value.clone(),
-                            );
-                        }
-                    }
-                }
+                self.document.restore_columns(*index, columns);
             }
             InternalOp::SetDelimiter(delimiter) => self.dialect.delimiter = *delimiter,
             InternalOp::ReorderRows(ids) => self.reorder_by_ids(ids)?,
@@ -719,6 +834,19 @@ impl DocumentSession {
         }
 
         let before_columns = self.document.column_count();
+        let before_column_state = self.column_state();
+        let after_column_state = ColumnState {
+            column_types: if rows.iter().map(Vec::len).max().unwrap_or(0) == before_columns {
+                self.column_types.clone()
+            } else {
+                HashMap::new()
+            },
+            view: ViewState::default(),
+        };
+        let column_state = Some(ColumnStateChange {
+            before: before_column_state,
+            after: after_column_state,
+        });
         let same_shape = self.document.rows().len() == rows.len()
             && self
                 .document
@@ -757,6 +885,7 @@ impl DocumentSession {
                         cells: before,
                         restore_shape: None,
                     },
+                    column_state: column_state.clone(),
                 },
                 estimated_bytes,
             )?;
@@ -786,15 +915,11 @@ impl DocumentSession {
                         rows: before_rows,
                         ids: before_ids,
                     },
+                    column_state,
                 },
                 estimated_bytes,
             )?;
         }
-        self.view = ViewState::default();
-        if self.document.column_count() != before_columns {
-            self.column_types.clear();
-        }
-        self.rebuild_view();
         Ok(())
     }
 
@@ -824,6 +949,9 @@ impl DocumentSession {
 
     fn commit(&mut self, record: EditRecord, estimated_bytes: usize) -> Result<(), String> {
         self.execute(&record.forward)?;
+        if let Some(change) = &record.column_state {
+            self.restore_column_state(&change.after);
+        }
         let before_state = self.current_state;
         let after_state = self.next_state;
         self.next_state += 1;
@@ -880,6 +1008,7 @@ impl DocumentSession {
                                 cells: before,
                                 restore_shape: Some(original_shape),
                             },
+                            column_state: None,
                         },
                         bytes,
                     )?;
@@ -900,6 +1029,7 @@ impl DocumentSession {
                     EditRecord {
                         forward: InternalOp::InsertRows { index, rows, ids },
                         inverse: InternalOp::RemoveRows { index, count },
+                        column_state: None,
                     },
                     count * 32,
                 )?;
@@ -915,6 +1045,7 @@ impl DocumentSession {
                         EditRecord {
                             forward: InternalOp::RemoveRows { index, count },
                             inverse: InternalOp::InsertRows { index, rows, ids },
+                            column_state: None,
                         },
                         bytes,
                     )?;
@@ -922,10 +1053,16 @@ impl DocumentSession {
             }
             EditCommand::InsertColumns { index, count } => {
                 let count = count.clamp(1, 1_000);
+                let index = index.min(self.document.column_count());
+                let column_state = Some(ColumnStateChange {
+                    before: self.column_state(),
+                    after: self.column_state_after_insert(index, count),
+                });
                 self.commit(
                     EditRecord {
                         forward: InternalOp::InsertColumns { index, count },
                         inverse: InternalOp::RemoveColumns { index, count },
+                        column_state,
                     },
                     self.document.row_count() * count,
                 )?;
@@ -933,18 +1070,22 @@ impl DocumentSession {
             EditCommand::DeleteColumns { index, count } => {
                 let count = count.min(self.document.column_count().saturating_sub(index));
                 if count > 0 {
-                    let mut copy = self.document.clone();
-                    let columns = copy.delete_columns(index, count);
+                    let columns = self.document.columns(index, count);
                     let bytes = columns
                         .iter()
                         .flatten()
                         .filter_map(Option::as_ref)
                         .map(String::len)
                         .sum::<usize>();
+                    let column_state = Some(ColumnStateChange {
+                        before: self.column_state(),
+                        after: self.column_state_after_delete(index, count),
+                    });
                     self.commit(
                         EditRecord {
                             forward: InternalOp::RemoveColumns { index, count },
                             inverse: InternalOp::RestoreColumns { index, columns },
+                            column_state,
                         },
                         bytes,
                     )?;
@@ -960,6 +1101,7 @@ impl DocumentSession {
                         EditRecord {
                             forward: InternalOp::SetDelimiter(bytes[0]),
                             inverse: InternalOp::SetDelimiter(self.dialect.delimiter),
+                            column_state: None,
                         },
                         2,
                     )?;
@@ -976,15 +1118,20 @@ impl DocumentSession {
                         (self.data_start()..self.document.row_count()).collect();
                     all_rows.sort_by(|left, right| self.compare_rows(*left, *right));
                     after.extend(all_rows.iter().map(|row| self.row_ids[*row]));
-                    self.commit(
+                    let sorts = std::mem::take(&mut self.view.sorts);
+                    let result = self.commit(
                         EditRecord {
                             forward: InternalOp::ReorderRows(after),
                             inverse: InternalOp::ReorderRows(before),
+                            column_state: None,
                         },
                         self.row_ids.len() * 16,
-                    )?;
-                    self.view.sorts.clear();
-                    self.rebuild_view();
+                    );
+                    if let Err(error) = result {
+                        self.view.sorts = sorts;
+                        self.rebuild_view();
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -996,6 +1143,9 @@ impl DocumentSession {
             return Ok(());
         };
         self.execute(&transaction.value.inverse)?;
+        if let Some(change) = &transaction.value.column_state {
+            self.restore_column_state(&change.before);
+        }
         self.current_state = transaction.before_state;
         self.revision = self.revision.wrapping_add(1);
         self.history.finish_undo(transaction);
@@ -1008,6 +1158,9 @@ impl DocumentSession {
             return Ok(());
         };
         self.execute(&transaction.value.forward)?;
+        if let Some(change) = &transaction.value.column_state {
+            self.restore_column_state(&change.after);
+        }
         self.current_state = transaction.after_state;
         self.revision = self.revision.wrapping_add(1);
         self.history.finish_redo(transaction);
@@ -1024,7 +1177,7 @@ impl DocumentSession {
         } else {
             request.query.to_lowercase()
         };
-        let range = request.range.unwrap_or(CellRange {
+        let source_range = request.range.unwrap_or(CellRange {
             start_row: 0,
             end_row: self.document.row_count().saturating_sub(1),
             start_column: 0,
@@ -1037,16 +1190,29 @@ impl DocumentSession {
             .map(|(view, source)| (*source, view))
             .collect();
         let mut matches = Vec::new();
-        for row in range.start_row
-            ..=range
+        let rows = if let Some(range) = request.view_range {
+            let end = range.end_row.min(self.visible_rows.len().saturating_sub(1));
+            if range.start_row > end || self.visible_rows.is_empty() {
+                Vec::new()
+            } else {
+                self.visible_rows[range.start_row..=end].to_vec()
+            }
+        } else {
+            let end = source_range
                 .end_row
-                .min(self.document.row_count().saturating_sub(1))
-        {
-            for column in range.start_column
-                ..=range
-                    .end_column
-                    .min(self.document.column_count().saturating_sub(1))
-            {
+                .min(self.document.row_count().saturating_sub(1));
+            if source_range.start_row > end || self.document.row_count() == 0 {
+                Vec::new()
+            } else {
+                (source_range.start_row..=end).collect()
+            }
+        };
+        let column_range = request.view_range.unwrap_or(source_range);
+        let column_end = column_range
+            .end_column
+            .min(self.document.column_count().saturating_sub(1));
+        for row in rows {
+            for column in column_range.start_column..=column_end {
                 let value = self.cell_value(row, column);
                 let candidate = if request.case_sensitive {
                     value.to_string()
@@ -1072,6 +1238,57 @@ impl DocumentSession {
             }
         }
         matches
+    }
+
+    fn replace(&mut self, request: ReplaceRequest) -> Result<(), String> {
+        if request.expected_revision != self.revision {
+            return Err("the document changed; run the search again".to_string());
+        }
+        let mut search = request.search.clone();
+        if request.replace_all {
+            search.limit = usize::MAX;
+        }
+        let matches = self.search(&search);
+        let selected = if request.replace_all {
+            matches
+        } else {
+            let target = request
+                .target
+                .ok_or_else(|| "select a current match before replacing it".to_string())?;
+            vec![
+                matches
+                    .into_iter()
+                    .find(|found| {
+                        found.source_row == target.source_row && found.column == target.column
+                    })
+                    .ok_or_else(|| "the selected match is no longer available".to_string())?,
+            ]
+        };
+        let cells = selected
+            .into_iter()
+            .map(|found| {
+                let value = if request.search.whole_cell {
+                    request.replacement.clone()
+                } else if request.search.case_sensitive {
+                    found
+                        .value
+                        .replacen(&request.search.query, &request.replacement, 1)
+                } else {
+                    replace_case_insensitive_once(
+                        &found.value,
+                        &request.search.query,
+                        &request.replacement,
+                    )
+                };
+                CellInput {
+                    row: found.source_row,
+                    column: found.column,
+                    value,
+                }
+            })
+            .collect();
+        let revision = self.revision;
+        self.apply_edit(EditCommand::SetCells { cells }, revision)
     }
 
     fn profile(&self, column: usize) -> ColumnProfile {
@@ -1170,12 +1387,14 @@ pub(crate) type DocumentHandle = Arc<Mutex<DocumentSession>>;
 
 pub struct WorkspaceState {
     documents: Mutex<Vec<DocumentHandle>>,
+    last_recovery: Mutex<Option<RecoveryFingerprint>>,
 }
 
 impl Default for WorkspaceState {
     fn default() -> Self {
         Self {
             documents: Mutex::new(vec![Arc::new(Mutex::new(DocumentSession::default()))]),
+            last_recovery: Mutex::new(None),
         }
     }
 }
@@ -1285,6 +1504,7 @@ fn find_document_by_path(
     Ok(None)
 }
 
+#[cfg(test)]
 fn recovery_payload(session: &DocumentSession) -> Option<RecoveryPayload> {
     (session.current_state != session.saved_state).then(|| RecoveryPayload {
         rows: session.document.rows().to_vec(),
@@ -1298,6 +1518,7 @@ fn recovery_payload(session: &DocumentSession) -> Option<RecoveryPayload> {
     })
 }
 
+#[cfg(test)]
 fn workspace_recovery_payload(
     state: &WorkspaceState,
     excluded_document_id: Option<u64>,
@@ -1316,6 +1537,93 @@ fn workspace_recovery_payload(
         version: 1,
         documents,
     }))
+}
+
+fn workspace_recovery_encoding(
+    state: &WorkspaceState,
+    excluded_document_id: Option<u64>,
+) -> Result<(RecoveryFingerprint, Option<Vec<u8>>), String> {
+    let handles = lock_workspace(state)?.clone();
+    let sessions = handles
+        .iter()
+        .map(lock_document)
+        .collect::<Result<Vec<_>, _>>()?;
+    let dirty_sessions = sessions
+        .iter()
+        .filter(|session| {
+            Some(session.identity) != excluded_document_id
+                && session.current_state != session.saved_state
+        })
+        .collect::<Vec<_>>();
+    let fingerprint = RecoveryFingerprint(
+        dirty_sessions
+            .iter()
+            .map(|session| {
+                let mut column_types = session
+                    .column_types
+                    .iter()
+                    .map(|(column, column_type)| (*column, *column_type))
+                    .collect::<Vec<_>>();
+                column_types.sort_by_key(|(column, _)| *column);
+                RecoveryDocumentFingerprint {
+                    identity: session.identity,
+                    revision: session.revision,
+                    path: session.path.clone(),
+                    header_enabled: session.header_enabled,
+                    column_types,
+                }
+            })
+            .collect(),
+    );
+    if dirty_sessions.is_empty() {
+        return Ok((fingerprint, None));
+    }
+    let documents = dirty_sessions
+        .iter()
+        .map(|session| RecoveryPayloadRef {
+            rows: session.document.rows(),
+            path: session.path.as_ref().map(|path| path.to_string_lossy()),
+            dialect: session.dialect,
+            header_enabled: session.header_enabled,
+            column_types: &session.column_types,
+        })
+        .collect();
+    let bytes = serde_json::to_vec(&WorkspaceRecoveryPayloadRef {
+        version: 1,
+        documents,
+    })
+    .map_err(|error| error.to_string())?;
+    Ok((fingerprint, Some(bytes)))
+}
+
+fn workspace_recovery_fingerprint(
+    state: &WorkspaceState,
+    excluded_document_id: Option<u64>,
+) -> Result<RecoveryFingerprint, String> {
+    let handles = lock_workspace(state)?.clone();
+    let mut documents = Vec::new();
+    for handle in handles {
+        let session = lock_document(&handle)?;
+        if Some(session.identity) == excluded_document_id
+            || session.current_state == session.saved_state
+        {
+            continue;
+        }
+        let mut column_types = session
+            .column_types
+            .iter()
+            .map(|(column, column_type)| (*column, *column_type))
+            .collect::<Vec<_>>();
+        column_types.sort_by_key(|(column, _)| *column);
+        documents.push(RecoveryDocumentFingerprint {
+            identity: session.identity,
+            revision: session.revision,
+            path: session.path.clone(),
+            header_enabled: session.header_enabled,
+            column_types,
+        });
+    }
+    Ok(RecoveryFingerprint(documents))
 }
 
 fn session_from_recovery(payload: RecoveryPayload) -> DocumentSession {
@@ -1349,10 +1657,46 @@ fn write_workspace_recovery_internal(
     excluded_document_id: Option<u64>,
 ) -> Result<(), String> {
     let path = recovery_path(app)?;
-    let Some(payload) = workspace_recovery_payload(state, excluded_document_id)? else {
-        return remove_if_exists(&path).map_err(|error| error.to_string());
-    };
-    write_json_atomic(&path, &payload)
+    let candidate = workspace_recovery_fingerprint(state, excluded_document_id)?;
+    if recovery_is_current(state, &candidate)? {
+        return Ok(());
+    }
+    let (fingerprint, bytes) = workspace_recovery_encoding(state, excluded_document_id)?;
+    // Another writer, or a concurrent edit reverting to the cached state, may have
+    // made the second snapshot current while it was being encoded.
+    if recovery_is_current(state, &fingerprint)? {
+        return Ok(());
+    }
+    if let Some(bytes) = bytes {
+        write_bytes_atomic(&path, &bytes)?;
+    } else {
+        remove_if_exists(&path).map_err(|error| error.to_string())?;
+    }
+    *state
+        .last_recovery
+        .lock()
+        .map_err(|_| "recovery state is unavailable".to_string())? = Some(fingerprint);
+    Ok(())
+}
+
+fn recovery_is_current(
+    state: &WorkspaceState,
+    fingerprint: &RecoveryFingerprint,
+) -> Result<bool, String> {
+    Ok(state
+        .last_recovery
+        .lock()
+        .map_err(|_| "recovery state is unavailable".to_string())?
+        .as_ref()
+        == Some(fingerprint))
+}
+
+fn reset_recovery_fingerprint(state: &WorkspaceState) -> Result<(), String> {
+    *state
+        .last_recovery
+        .lock()
+        .map_err(|_| "recovery state is unavailable".to_string())? = None;
+    Ok(())
 }
 
 fn ensure_path_available(
@@ -1520,12 +1864,13 @@ pub fn session_save(
         let mut session = lock_document(&handle)?;
         tablune_csv::write_path(&destination, &session.document, session.dialect)
             .map_err(|error| error.to_string())?;
-        session.path = Some(destination);
-        session.saved_state = session.current_state;
-        save_file_preferences(&app, &session)?;
-        session.summary()
+        finalize_successful_save(&mut session, destination, |session| {
+            save_file_preferences(&app, session)
+        })
     };
-    write_workspace_recovery_internal(&app, &state, None)?;
+    if let Err(error) = write_workspace_recovery_internal(&app, &state, None) {
+        report_nonfatal("refreshing recovery after save", &error);
+    }
     Ok(summary)
 }
 
@@ -1549,8 +1894,7 @@ pub fn session_duplicate(
     tablune_csv::write_path(&destination, &duplicate.document, duplicate.dialect)
         .map_err(|error| error.to_string())?;
     if let Err(error) = save_file_preferences(&app, &duplicate) {
-        let _ = fs::remove_file(&destination);
-        return Err(error);
+        report_nonfatal("saving preferences for the duplicated document", &error);
     }
 
     let duplicate_handle = Arc::new(Mutex::new(duplicate));
@@ -1594,10 +1938,14 @@ pub fn session_rename(
     let summary = {
         let mut session = lock_document(&handle)?;
         session.path = Some(super::rename_document_path(&source, new_name.trim())?);
-        save_file_preferences(&app, &session)?;
+        if let Err(error) = save_file_preferences(&app, &session) {
+            report_nonfatal("saving preferences after rename", &error);
+        }
         session.summary()
     };
-    write_workspace_recovery_internal(&app, &state, None)?;
+    if let Err(error) = write_workspace_recovery_internal(&app, &state, None) {
+        report_nonfatal("refreshing recovery after rename", &error);
+    }
     Ok(summary)
 }
 
@@ -1645,7 +1993,9 @@ pub fn session_undo(
         session.undo()?;
         session.summary()
     };
-    write_workspace_recovery_internal(&app, &state, None)?;
+    if let Err(error) = write_workspace_recovery_internal(&app, &state, None) {
+        report_nonfatal("refreshing recovery after undo", &error);
+    }
     Ok(summary)
 }
 
@@ -1681,13 +2031,26 @@ pub fn session_set_header(
     enabled: bool,
 ) -> Result<DocumentSummary, String> {
     let handle = document_handle(&state, document_id)?;
-    let mut session = lock_document(&handle)?;
-    session.header_enabled = enabled;
-    session.header_suggested = false;
-    session.view = ViewState::default();
-    session.rebuild_view();
-    save_file_preferences(&app, &session)?;
-    Ok(session.summary())
+    let summary = {
+        let mut session = lock_document(&handle)?;
+        save_file_preferences_for(
+            &app,
+            session.path.as_deref(),
+            enabled,
+            &session.column_types,
+        )?;
+        session.header_enabled = enabled;
+        session.header_suggested = false;
+        session.view = ViewState::default();
+        session.rebuild_view();
+        session.summary()
+    };
+    if summary.dirty
+        && let Err(error) = write_workspace_recovery_internal(&app, &state, None)
+    {
+        report_nonfatal("refreshing recovery after header change", &error);
+    }
+    Ok(summary)
 }
 
 #[tauri::command]
@@ -1699,11 +2062,26 @@ pub fn session_set_column_type(
     column_type: ColumnType,
 ) -> Result<DocumentSummary, String> {
     let handle = document_handle(&state, document_id)?;
-    let mut session = lock_document(&handle)?;
-    session.column_types.insert(column, column_type);
-    session.rebuild_view();
-    save_file_preferences(&app, &session)?;
-    Ok(session.summary())
+    let summary = {
+        let mut session = lock_document(&handle)?;
+        let mut column_types = session.column_types.clone();
+        column_types.insert(column, column_type);
+        save_file_preferences_for(
+            &app,
+            session.path.as_deref(),
+            session.header_enabled,
+            &column_types,
+        )?;
+        session.column_types = column_types;
+        session.rebuild_view();
+        session.summary()
+    };
+    if summary.dirty
+        && let Err(error) = write_workspace_recovery_internal(&app, &state, None)
+    {
+        report_nonfatal("refreshing recovery after column type change", &error);
+    }
+    Ok(summary)
 }
 
 #[tauri::command]
@@ -1723,40 +2101,7 @@ pub fn session_replace(
 ) -> Result<DocumentSummary, String> {
     let handle = document_handle(&state, document_id)?;
     let mut session = lock_document(&handle)?;
-    if request.expected_revision != session.revision {
-        return Err("the document changed; run the search again".to_string());
-    }
-    let matches = session.search(&request.search);
-    let selected = if request.replace_all {
-        matches
-    } else {
-        matches.into_iter().take(1).collect()
-    };
-    let cells = selected
-        .into_iter()
-        .map(|found| {
-            let value = if request.search.whole_cell {
-                request.replacement.clone()
-            } else if request.search.case_sensitive {
-                found
-                    .value
-                    .replacen(&request.search.query, &request.replacement, 1)
-            } else {
-                replace_case_insensitive_once(
-                    &found.value,
-                    &request.search.query,
-                    &request.replacement,
-                )
-            };
-            CellInput {
-                row: found.source_row,
-                column: found.column,
-                value,
-            }
-        })
-        .collect();
-    let revision = session.revision;
-    session.apply_edit(EditCommand::SetCells { cells }, revision)?;
+    session.replace(request)?;
     Ok(session.summary())
 }
 
@@ -1840,12 +2185,17 @@ pub fn workspace_restore_recovery(
         .map(|payload| Arc::new(Mutex::new(session_from_recovery(payload))))
         .collect();
     *lock_workspace(&state)? = documents;
+    reset_recovery_fingerprint(&state)?;
     workspace_summary_value(&state)
 }
 
 #[tauri::command]
-pub fn workspace_discard_recovery(app: AppHandle) -> Result<(), String> {
-    remove_if_exists(&recovery_path(&app)?).map_err(|error| error.to_string())
+pub fn workspace_discard_recovery(
+    app: AppHandle,
+    state: State<'_, WorkspaceState>,
+) -> Result<(), String> {
+    remove_if_exists(&recovery_path(&app)?).map_err(|error| error.to_string())?;
+    reset_recovery_fingerprint(&state)
 }
 
 pub(crate) fn estimate_macro_history(before: &[Vec<String>], after: &[Vec<String>]) -> usize {
@@ -1953,18 +2303,49 @@ pub(crate) fn save_python_macro_folder(app: &AppHandle, path: String) -> Result<
 }
 
 fn save_file_preferences(app: &AppHandle, session: &DocumentSession) -> Result<(), String> {
-    let Some(path) = &session.path else {
+    save_file_preferences_for(
+        app,
+        session.path.as_deref(),
+        session.header_enabled,
+        &session.column_types,
+    )
+}
+
+fn save_file_preferences_for(
+    app: &AppHandle,
+    path: Option<&Path>,
+    header_enabled: bool,
+    column_types: &HashMap<usize, ColumnType>,
+) -> Result<(), String> {
+    let Some(path) = path else {
         return Ok(());
     };
     let mut preferences = load_preferences(app)?;
     preferences.files.insert(
         canonical_key(path),
         FilePreferences {
-            header_enabled: Some(session.header_enabled),
-            column_types: session.column_types.clone(),
+            header_enabled: Some(header_enabled),
+            column_types: column_types.clone(),
         },
     );
     write_json_atomic(&preferences_path(app)?, &preferences)
+}
+
+fn finalize_successful_save(
+    session: &mut DocumentSession,
+    destination: PathBuf,
+    persist_preferences: impl FnOnce(&DocumentSession) -> Result<(), String>,
+) -> DocumentSummary {
+    session.path = Some(destination);
+    session.saved_state = session.current_state;
+    if let Err(error) = persist_preferences(session) {
+        report_nonfatal("saving preferences after the CSV was saved", &error);
+    }
+    session.summary()
+}
+
+fn report_nonfatal(context: &str, error: &str) {
+    eprintln!("Tablune warning while {context}: {error}");
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
@@ -1973,10 +2354,25 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
-    let temporary = path.with_extension("tmp");
     let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
-    fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
-    fs::rename(&temporary, path).map_err(|error| error.to_string())
+    write_bytes_atomic(path, &bytes)
+}
+
+fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let write_id = NEXT_ATOMIC_WRITE.fetch_add(1, AtomicOrdering::Relaxed);
+    let temporary = path.with_extension(format!("tablune-tmp-{}-{write_id}", std::process::id()));
+    let file = fs::File::create(&temporary).map_err(|error| error.to_string())?;
+    let mut writer = BufWriter::new(file);
+    let write_result = writer
+        .write_all(bytes)
+        .and_then(|()| writer.flush())
+        .and_then(|()| writer.get_ref().sync_all());
+    drop(writer);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    tablune_csv::replace_file_atomic(&temporary, path).map_err(|error| error.to_string())
 }
 
 fn remove_if_exists(path: &Path) -> std::io::Result<()> {
@@ -2055,15 +2451,30 @@ fn parse_boolean(value: &str) -> Option<bool> {
 
 fn parse_date(value: &str) -> Option<(i32, u32, u32)> {
     let mut parts = value.split('-');
-    let year = parts.next()?.parse().ok()?;
-    let month = parts.next()?.parse().ok()?;
+    let year_text = parts.next()?;
+    let month_text = parts.next()?;
     let day_text = parts.next()?;
-    if parts.next().is_some() {
+    if parts.next().is_some()
+        || year_text.len() != 4
+        || month_text.len() != 2
+        || day_text.len() != 2
+        || !year_text.bytes().all(|byte| byte.is_ascii_digit())
+        || !month_text.bytes().all(|byte| byte.is_ascii_digit())
+        || !day_text.bytes().all(|byte| byte.is_ascii_digit())
+    {
         return None;
     }
-    let day = day_text.get(..2)?.parse().ok()?;
-    (1..=12).contains(&month).then_some(())?;
-    (1..=31).contains(&day).then_some(())?;
+    let year = year_text.parse().ok()?;
+    let month = month_text.parse().ok()?;
+    let day = day_text.parse().ok()?;
+    let maximum_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => return None,
+    };
+    (1..=maximum_day).contains(&day).then_some(())?;
     Some((year, month, day))
 }
 
@@ -2130,16 +2541,44 @@ fn column_name(index: usize) -> String {
 }
 
 fn replace_case_insensitive_once(value: &str, query: &str, replacement: &str) -> String {
-    let lower_value = value.to_lowercase();
     let lower_query = query.to_lowercase();
+    if lower_query.is_empty() {
+        return value.to_string();
+    }
+    let mut lower_value = String::new();
+    let mut segments = Vec::new();
+    for (original_start, character) in value.char_indices() {
+        let original_end = original_start + character.len_utf8();
+        let lower_start = lower_value.len();
+        lower_value.extend(character.to_lowercase());
+        segments.push((lower_start, lower_value.len(), original_start, original_end));
+    }
     let Some(start) = lower_value.find(&lower_query) else {
         return value.to_string();
     };
-    let end = start + query.len();
-    if !value.is_char_boundary(start) || !value.is_char_boundary(end) {
+    let lower_end = start + lower_query.len();
+    let Some(original_start) = segments
+        .iter()
+        .find(|(segment_start, segment_end, _, _)| *segment_start <= start && start < *segment_end)
+        .map(|(_, _, original_start, _)| *original_start)
+    else {
         return value.to_string();
-    }
-    format!("{}{}{}", &value[..start], replacement, &value[end..])
+    };
+    let Some(original_end) = segments
+        .iter()
+        .find(|(segment_start, segment_end, _, _)| {
+            *segment_start < lower_end && lower_end <= *segment_end
+        })
+        .map(|(_, _, _, original_end)| *original_end)
+    else {
+        return value.to_string();
+    };
+    format!(
+        "{}{}{}",
+        &value[..original_start],
+        replacement,
+        &value[original_end..]
+    )
 }
 
 #[cfg(test)]
@@ -2227,6 +2666,7 @@ mod tests {
     fn workspace_documents_keep_independent_history_and_views() {
         let workspace = WorkspaceState {
             documents: Mutex::new(Vec::new()),
+            last_recovery: Mutex::new(None),
         };
         let first_id = add_session(&workspace, DocumentSession::default());
         let second_id = add_session(&workspace, DocumentSession::default());
@@ -2305,6 +2745,7 @@ mod tests {
     fn workspace_reorder_requires_the_exact_open_document_set() {
         let workspace = WorkspaceState {
             documents: Mutex::new(Vec::new()),
+            last_recovery: Mutex::new(None),
         };
         let first_id = add_session(&workspace, DocumentSession::default());
         let second_id = add_session(&workspace, DocumentSession::default());
@@ -2354,6 +2795,7 @@ mod tests {
         let document_id = session.identity;
         let workspace = WorkspaceState {
             documents: Mutex::new(vec![Arc::new(Mutex::new(session))]),
+            last_recovery: Mutex::new(None),
         };
 
         let equivalent = directory.join(".").join("data.csv");
@@ -2408,6 +2850,7 @@ mod tests {
                 Arc::new(Mutex::new(dirty)),
                 Arc::new(Mutex::new(second_dirty)),
             ]),
+            last_recovery: Mutex::new(None),
         };
         let workspace = workspace_recovery_payload(&state, None).unwrap().unwrap();
         assert_eq!(workspace.documents.len(), 2);
@@ -2422,6 +2865,62 @@ mod tests {
         let restored = session_from_recovery(payload);
         assert!(restored.summary().dirty);
         assert_eq!(restored.cell_value(0, 0), "recover");
+    }
+
+    #[test]
+    fn recovery_serializes_borrowed_rows_and_skips_unchanged_revisions() {
+        let mut dirty = DocumentSession::default();
+        dirty
+            .apply_edit(
+                EditCommand::SetCells {
+                    cells: vec![CellInput {
+                        row: 0,
+                        column: 0,
+                        value: "recover once".into(),
+                    }],
+                },
+                0,
+            )
+            .unwrap();
+        let handle = Arc::new(Mutex::new(dirty));
+        let state = WorkspaceState {
+            documents: Mutex::new(vec![handle.clone()]),
+            last_recovery: Mutex::new(None),
+        };
+
+        let (fingerprint, bytes) = workspace_recovery_encoding(&state, None).unwrap();
+        assert_eq!(
+            workspace_recovery_fingerprint(&state, None).unwrap(),
+            fingerprint
+        );
+        let stored: StoredRecoveryPayload =
+            serde_json::from_slice(bytes.as_deref().unwrap()).unwrap();
+        let StoredRecoveryPayload::Workspace(payload) = stored else {
+            panic!("workspace recovery should use the versioned manifest");
+        };
+        assert_eq!(payload.documents[0].rows[0][0], "recover once");
+        assert!(!recovery_is_current(&state, &fingerprint).unwrap());
+        *state.last_recovery.lock().unwrap() = Some(fingerprint.clone());
+        assert!(recovery_is_current(&state, &fingerprint).unwrap());
+        reset_recovery_fingerprint(&state).unwrap();
+        assert!(!recovery_is_current(&state, &fingerprint).unwrap());
+        *state.last_recovery.lock().unwrap() = Some(fingerprint.clone());
+
+        lock_document(&handle)
+            .unwrap()
+            .apply_edit(
+                EditCommand::SetCells {
+                    cells: vec![CellInput {
+                        row: 0,
+                        column: 0,
+                        value: "recover twice".into(),
+                    }],
+                },
+                1,
+            )
+            .unwrap();
+        let (updated, _) = workspace_recovery_encoding(&state, None).unwrap();
+        assert!(!recovery_is_current(&state, &updated).unwrap());
     }
 
     #[test]
@@ -2448,6 +2947,31 @@ mod tests {
         assert_eq!(session.document.column_count(), 0);
         session.redo().unwrap();
         assert_eq!(session.cell_value(2, 3), "value");
+    }
+
+    #[test]
+    fn successful_csv_save_remains_clean_when_preferences_fail_afterward() {
+        let mut session = DocumentSession::default();
+        session
+            .apply_edit(
+                EditCommand::SetCells {
+                    cells: vec![CellInput {
+                        row: 0,
+                        column: 0,
+                        value: "saved".into(),
+                    }],
+                },
+                0,
+            )
+            .unwrap();
+        let destination = PathBuf::from("/tmp/saved.csv");
+        let summary = finalize_successful_save(&mut session, destination.clone(), |_| {
+            Err("simulated preferences failure".to_string())
+        });
+
+        assert!(!summary.dirty);
+        assert_eq!(session.path.as_ref(), Some(&destination));
+        assert_eq!(session.saved_state, session.current_state);
     }
 
     #[test]
@@ -2528,6 +3052,28 @@ mod tests {
     }
 
     #[test]
+    fn date_parsing_rejects_impossible_or_trailing_values() {
+        assert_eq!(parse_date("2024-02-29"), Some((2024, 2, 29)));
+        assert_eq!(parse_date("2026-02-29"), None);
+        assert_eq!(parse_date("2026-04-31"), None);
+        assert_eq!(parse_date("2026-01-01T12:30:00"), None);
+        assert_eq!(parse_date("26-01-01"), None);
+    }
+
+    #[test]
+    fn case_insensitive_replacement_maps_unicode_expansions_to_original_bytes() {
+        assert_eq!(
+            replace_case_insensitive_once("İstanbul", "i", "X"),
+            "Xstanbul"
+        );
+        assert_eq!(replace_case_insensitive_once("CAFÉ", "é", "tea"), "CAFtea");
+        assert_eq!(
+            replace_case_insensitive_once("unchanged", "ø", "x"),
+            "unchanged"
+        );
+    }
+
+    #[test]
     fn filters_and_profiles_never_change_raw_values() {
         let file = tablune_csv::read_bytes(b"name,score\nAda,10\nLinus,2\n").unwrap();
         let mut session = DocumentSession::from_file(
@@ -2578,6 +3124,172 @@ mod tests {
             .map(|row| session.cell_value(*row, 0))
             .collect::<Vec<_>>();
         assert_eq!(values, vec!["10", "2", ""]);
+    }
+
+    fn search_request(query: &str, limit: usize) -> SearchRequest {
+        SearchRequest {
+            query: query.to_string(),
+            case_sensitive: true,
+            whole_cell: true,
+            range: None,
+            view_range: None,
+            limit,
+        }
+    }
+
+    #[test]
+    fn replace_uses_the_selected_match_and_replace_all_ignores_display_limit() {
+        let mut session = DocumentSession {
+            document: TableDocument::from_rows(
+                (0..10_001).map(|_| vec!["match".to_string()]).collect(),
+            ),
+            ..Default::default()
+        };
+        session.ensure_row_ids();
+        session.rebuild_view();
+        session
+            .replace(ReplaceRequest {
+                search: search_request("match", 10_000),
+                replacement: "selected".to_string(),
+                replace_all: false,
+                expected_revision: 0,
+                target: Some(ReplaceTarget {
+                    source_row: 5,
+                    column: 0,
+                }),
+            })
+            .unwrap();
+        assert_eq!(session.cell_value(0, 0), "match");
+        assert_eq!(session.cell_value(5, 0), "selected");
+
+        session
+            .replace(ReplaceRequest {
+                search: search_request("match", 10_000),
+                replacement: "all".to_string(),
+                replace_all: true,
+                expected_revision: 1,
+                target: None,
+            })
+            .unwrap();
+        assert_eq!(session.cell_value(0, 0), "all");
+        assert_eq!(session.cell_value(10_000, 0), "all");
+        assert_eq!(session.cell_value(5, 0), "selected");
+    }
+
+    #[test]
+    fn search_view_range_maps_filtered_rows_back_to_sources() {
+        let mut session = DocumentSession {
+            document: TableDocument::from_rows(vec![
+                vec!["hidden".into()],
+                vec!["match".into()],
+                vec!["hidden".into()],
+                vec!["match".into()],
+            ]),
+            ..Default::default()
+        };
+        session.ensure_row_ids();
+        session.view.filters.push(FilterSpec {
+            column: 0,
+            operator: "equals".into(),
+            value: "match".into(),
+            second_value: String::new(),
+            values: Vec::new(),
+            column_type: ColumnType::Text,
+            case_sensitive: true,
+        });
+        session.rebuild_view();
+        let matches = session.search(&SearchRequest {
+            view_range: Some(CellRange {
+                start_row: 1,
+                end_row: 1,
+                start_column: 0,
+                end_column: 0,
+            }),
+            ..search_request("match", 10_000)
+        });
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].source_row, 3);
+        assert_eq!(matches[0].view_row, Some(1));
+    }
+
+    #[test]
+    fn column_edits_and_history_preserve_ragged_rows_and_column_metadata() {
+        let original = vec![
+            vec!["a".into()],
+            vec!["b".into(), "2".into(), "2026-01-01".into()],
+            Vec::new(),
+        ];
+        let mut session = DocumentSession {
+            document: TableDocument::from_rows(original.clone()),
+            column_types: HashMap::from([
+                (0, ColumnType::Text),
+                (1, ColumnType::Number),
+                (2, ColumnType::Date),
+            ]),
+            view: ViewState {
+                sorts: vec![SortSpec {
+                    column: 2,
+                    direction: SortDirection::Ascending,
+                    column_type: ColumnType::Date,
+                }],
+                filters: vec![FilterSpec {
+                    column: 1,
+                    operator: "greaterThan".into(),
+                    value: "1".into(),
+                    second_value: String::new(),
+                    values: Vec::new(),
+                    column_type: ColumnType::Number,
+                    case_sensitive: false,
+                }],
+            },
+            ..Default::default()
+        };
+        session.ensure_row_ids();
+        session.rebuild_view();
+
+        session
+            .apply_edit(EditCommand::InsertColumns { index: 1, count: 1 }, 0)
+            .unwrap();
+        assert_eq!(session.document.rows()[0], ["a", ""]);
+        assert_eq!(session.document.rows()[1], ["b", "", "2", "2026-01-01"]);
+        assert_eq!(session.column_types.get(&2), Some(&ColumnType::Number));
+        assert_eq!(session.column_types.get(&3), Some(&ColumnType::Date));
+        assert_eq!(session.view.filters[0].column, 2);
+        assert_eq!(session.view.sorts[0].column, 3);
+
+        session.undo().unwrap();
+        assert_eq!(session.document.rows(), original);
+        assert_eq!(session.column_types.get(&1), Some(&ColumnType::Number));
+        assert_eq!(session.column_types.get(&2), Some(&ColumnType::Date));
+        assert_eq!(session.view.filters[0].column, 1);
+        assert_eq!(session.view.sorts[0].column, 2);
+
+        session.redo().unwrap();
+        assert_eq!(session.view.filters[0].column, 2);
+        assert_eq!(session.view.sorts[0].column, 3);
+        session.undo().unwrap();
+
+        session
+            .apply_edit(
+                EditCommand::DeleteColumns { index: 1, count: 1 },
+                session.revision,
+            )
+            .unwrap();
+        assert_eq!(session.document.rows()[0], ["a"]);
+        assert_eq!(session.document.rows()[1], ["b", "2026-01-01"]);
+        assert_eq!(session.column_types.get(&1), Some(&ColumnType::Date));
+        assert!(!session.column_types.contains_key(&2));
+        assert!(session.view.filters.is_empty());
+        assert_eq!(session.view.sorts[0].column, 1);
+
+        session.undo().unwrap();
+        assert_eq!(session.document.rows(), original);
+        assert_eq!(session.column_types.get(&1), Some(&ColumnType::Number));
+        assert_eq!(session.column_types.get(&2), Some(&ColumnType::Date));
+        assert_eq!(session.view.filters[0].column, 1);
+        assert_eq!(session.view.sorts[0].column, 2);
+        session.redo().unwrap();
+        assert_eq!(session.document.rows()[1], ["b", "2026-01-01"]);
     }
 
     #[test]

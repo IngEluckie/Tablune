@@ -3,7 +3,7 @@
 import { deleteBracketPair, insertBracket } from "@codemirror/autocomplete";
 import { indentWithTab, insertNewlineAndIndent } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import PythonMacroEditor from "./PythonMacroEditor";
 
@@ -24,7 +24,7 @@ function replaceDocument(view: EditorView, doc: string, anchor = doc.length, hea
 }
 
 describe("PythonMacroEditor", () => {
-  it("highlights standard Python token categories", () => {
+  it("highlights standard Python token categories", async () => {
     render(
       <PythonMacroEditor
         value={'def total(values):\n    # note\n    return "sum" + 42'}
@@ -33,11 +33,13 @@ describe("PythonMacroEditor", () => {
       />,
     );
 
-    expect(document.querySelector(".cm-py-keyword")?.textContent).toBe("def");
-    expect(document.querySelector(".cm-py-definition")?.textContent).toBe("total");
-    expect(document.querySelector(".cm-py-comment")?.textContent).toBe("# note");
-    expect(document.querySelector(".cm-py-string")?.textContent).toBe('"sum"');
-    expect(document.querySelector(".cm-py-number")?.textContent).toBe("42");
+    await waitFor(() => {
+      expect(document.querySelector(".cm-py-keyword")?.textContent).toBe("def");
+      expect(document.querySelector(".cm-py-definition")?.textContent).toBe("total");
+      expect(document.querySelector(".cm-py-comment")?.textContent).toBe("# note");
+      expect(document.querySelector(".cm-py-string")?.textContent).toBe('"sum"');
+      expect(document.querySelector(".cm-py-number")?.textContent).toBe("42");
+    });
   });
 
   it("closes, skips, wraps and deletes only bracket pairs", () => {

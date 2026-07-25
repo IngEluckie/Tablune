@@ -34,6 +34,14 @@ export default function SearchBar({ summary, selection, readOnly = false, onSumm
           startColumn: range.startColumn,
           endColumn: range.endColumn,
         };
+    const viewRange = summary.filtersActive || summary.sortCount > 0
+      ? {
+          startRow: range.startRow,
+          endRow: range.endRow,
+          startColumn: range.startColumn,
+          endColumn: range.endColumn,
+        }
+      : null;
     return {
       query,
       caseSensitive,
@@ -41,6 +49,9 @@ export default function SearchBar({ summary, selection, readOnly = false, onSumm
       range: scope === "document" ? null : scope === "cell"
         ? sourceRange && { ...sourceRange, endRow: sourceRange.startRow, endColumn: sourceRange.startColumn }
         : sourceRange,
+      viewRange: scope === "document" ? null : scope === "cell"
+        ? viewRange && { ...viewRange, endRow: viewRange.startRow, endColumn: viewRange.startColumn }
+        : viewRange,
       limit: 10_000,
     };
   }, [caseSensitive, query, scope, selection, summary.filtersActive, summary.headerEnabled, summary.sortCount, wholeCell]);
@@ -81,7 +92,16 @@ export default function SearchBar({ summary, selection, readOnly = false, onSumm
   const replace = async (replaceAll: boolean) => {
     if (!query || readOnly) return;
     try {
-      const next = await replaceSession(summary.documentId, { search: request, replacement, replaceAll, expectedRevision: summary.revision });
+      const activeMatch = active >= 0 ? matches[active] : null;
+      const next = await replaceSession(summary.documentId, {
+        search: request,
+        replacement,
+        replaceAll,
+        expectedRevision: summary.revision,
+        target: !replaceAll && activeMatch
+          ? { sourceRow: activeMatch.sourceRow, column: activeMatch.column }
+          : null,
+      });
       onSummary(next);
       setMatches([]);
       setActive(-1);
@@ -105,7 +125,7 @@ export default function SearchBar({ summary, selection, readOnly = false, onSumm
       <button onClick={() => void replace(true)} disabled={readOnly || !matches.length}>Replace All</button>
       <label><input type="checkbox" checked={caseSensitive} onChange={(event) => setCaseSensitive(event.target.checked)} /> Aa</label>
       <label><input type="checkbox" checked={wholeCell} onChange={(event) => setWholeCell(event.target.checked)} /> Whole cell</label>
-      <select aria-label="Search scope" value={scope} onChange={(event) => setScope(event.target.value as typeof scope)} disabled={(summary.filtersActive || summary.sortCount > 0) && scope !== "document"}>
+      <select aria-label="Search scope" value={scope} onChange={(event) => setScope(event.target.value as typeof scope)}>
         <option value="document">Document</option>
         <option value="selection">Selection</option>
         <option value="cell">Active cell</option>

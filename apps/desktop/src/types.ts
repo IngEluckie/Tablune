@@ -1,12 +1,6 @@
 export type LineEnding = "lf" | "crlf";
 export type DocumentId = number;
 
-export interface CsvPayload {
-  rows: string[][];
-  delimiter: string;
-  lineEnding: LineEnding;
-}
-
 export interface Selection {
   row: number;
   column: number;
@@ -128,6 +122,7 @@ export interface SearchRequest {
   caseSensitive: boolean;
   wholeCell: boolean;
   range: CellRange | null;
+  viewRange: CellRange | null;
   limit: number;
 }
 

@@ -3,54 +3,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::{Deserialize, Serialize};
-use tablune_core::TableDocument;
-use tablune_csv::{CsvDialect, LineEnding};
-
 mod python_macros;
 mod session;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CsvPayload {
-    rows: Vec<Vec<String>>,
-    delimiter: String,
-    line_ending: LineEnding,
-}
-
-#[tauri::command]
-fn read_csv_document(path: String) -> Result<CsvPayload, String> {
-    let file = tablune_csv::read_path(path).map_err(|error| error.to_string())?;
-    Ok(CsvPayload {
-        rows: file.document.into_rows(),
-        delimiter: char::from(file.dialect.delimiter).to_string(),
-        line_ending: file.dialect.line_ending,
-    })
-}
-
-#[tauri::command]
-fn write_csv_document(path: String, payload: CsvPayload) -> Result<(), String> {
-    let delimiter = payload
-        .delimiter
-        .as_bytes()
-        .first()
-        .copied()
-        .ok_or_else(|| "delimiter cannot be empty".to_string())?;
-    if payload.delimiter.len() != 1 {
-        return Err("delimiter must be one ASCII character".to_string());
-    }
-
-    let document = TableDocument::from_rows(payload.rows);
-    tablune_csv::write_path(
-        path,
-        &document,
-        CsvDialect {
-            delimiter,
-            line_ending: payload.line_ending,
-        },
-    )
-    .map_err(|error| error.to_string())
-}
 
 fn rename_document_path(path: &Path, new_name: &str) -> Result<PathBuf, String> {
     if new_name.is_empty()
@@ -76,12 +30,6 @@ fn rename_document_path(path: &Path, new_name: &str) -> Result<PathBuf, String> 
 }
 
 #[tauri::command]
-fn rename_csv_document(path: String, new_name: String) -> Result<String, String> {
-    let destination = rename_document_path(Path::new(&path), new_name.trim())?;
-    Ok(destination.to_string_lossy().into_owned())
-}
-
-#[tauri::command]
 fn exit_application(app: tauri::AppHandle) {
     app.exit(0);
 }
@@ -93,9 +41,6 @@ pub fn run() {
         .manage(session::WorkspaceState::default())
         .manage(python_macros::PythonRuntimeState::default())
         .invoke_handler(tauri::generate_handler![
-            read_csv_document,
-            write_csv_document,
-            rename_csv_document,
             exit_application,
             session::workspace_summary,
             session::workspace_reorder,
@@ -176,5 +121,18 @@ mod tests {
         let source = Path::new("/tmp/source.csv");
         assert!(rename_document_path(source, "folder/other.csv").is_err());
         assert!(rename_document_path(source, "..").is_err());
+    }
+
+    #[test]
+    fn production_configuration_enables_a_restrictive_csp() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let csp = config["app"]["security"]["csp"]
+            .as_str()
+            .expect("production CSP should be configured");
+        assert!(csp.contains("default-src 'self'"));
+        assert!(csp.contains("connect-src ipc: http://ipc.localhost"));
+        assert!(!csp.contains("https:"));
+        assert!(!csp.contains("'unsafe-eval'"));
     }
 }

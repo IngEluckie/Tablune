@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import SearchBar from "./SearchBar";
 import { replaceSession, searchSession } from "./ipc";
@@ -63,5 +63,56 @@ describe("SearchBar read-only mode", () => {
     expect((screen.getByRole("button", { name: "Replace All" }) as HTMLButtonElement).disabled).toBe(true);
     expect(searchSession).not.toHaveBeenCalled();
     expect(replaceSession).not.toHaveBeenCalled();
+  });
+
+  it("replaces the active match instead of the first match", async () => {
+    vi.mocked(searchSession).mockResolvedValue([
+      { sourceRow: 1, viewRow: 1, column: 0, value: "Ada" },
+      { sourceRow: 8, viewRow: 8, column: 2, value: "Ada" },
+    ]);
+    vi.mocked(replaceSession).mockResolvedValue({ ...summary, revision: 1, dirty: true });
+    render(<SearchBar
+      summary={summary}
+      selection={selection}
+      onSummary={vi.fn()}
+      onNavigate={vi.fn()}
+      onClose={vi.fn()}
+      onError={vi.fn()}
+    />);
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Find" }), { target: { value: "Ada" } });
+    await waitFor(() => expect(screen.getByText("1 / 2")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Next match" }));
+    await waitFor(() => expect(screen.getByText("2 / 2")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Replace" }));
+
+    await waitFor(() => expect(replaceSession).toHaveBeenCalledWith(1, expect.objectContaining({
+      replaceAll: false,
+      target: { sourceRow: 8, column: 2 },
+    })));
+  });
+
+  it("sends a view-relative selection when filters are active", async () => {
+    vi.mocked(searchSession).mockResolvedValue([]);
+    render(<SearchBar
+      summary={{ ...summary, filtersActive: true, visibleRowCount: 10 }}
+      selection={{
+        anchor: { row: 2, column: 3 },
+        focus: { row: 5, column: 7 },
+        mode: "cells",
+      }}
+      onSummary={vi.fn()}
+      onNavigate={vi.fn()}
+      onClose={vi.fn()}
+      onError={vi.fn()}
+    />);
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Search scope" }), { target: { value: "selection" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Find" }), { target: { value: "Ada" } });
+
+    await waitFor(() => expect(searchSession).toHaveBeenCalledWith(1, expect.objectContaining({
+      range: null,
+      viewRange: { startRow: 2, endRow: 5, startColumn: 3, endColumn: 7 },
+    })));
   });
 });

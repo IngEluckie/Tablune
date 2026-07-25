@@ -124,7 +124,13 @@ impl TemporaryDirectory {
     fn create() -> Result<Self, String> {
         let id = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("tablune-macro-{}-{id}", std::process::id()));
-        fs::create_dir(&path).map_err(|error| error.to_string())?;
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path).map_err(|error| error.to_string())?;
         Ok(Self(path))
     }
 }
@@ -303,9 +309,25 @@ pub fn python_set_macro_folder(app: AppHandle, path: String) -> Result<String, S
     Ok(path)
 }
 
+fn validated_macro_script_path(path: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(path.trim());
+    if path.as_os_str().is_empty()
+        || !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("py"))
+    {
+        return Err("macro files must use the .py extension".to_string());
+    }
+    Ok(path)
+}
+
 #[tauri::command]
 pub fn macro_read_script(path: String) -> Result<String, String> {
+    let path = validated_macro_script_path(&path)?;
     let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("the macro path is not a file".to_string());
+    }
     if metadata.len() > CODE_LIMIT as u64 {
         return Err("macro files cannot exceed 1 MiB".to_string());
     }
@@ -316,6 +338,13 @@ pub fn macro_read_script(path: String) -> Result<String, String> {
 pub fn macro_write_script(path: String, code: String) -> Result<(), String> {
     if code.len() > CODE_LIMIT {
         return Err("macro code cannot exceed 1 MiB".to_string());
+    }
+    let path = validated_macro_script_path(&path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the macro path does not have a parent folder".to_string())?;
+    if !parent.is_dir() {
+        return Err("the macro parent folder is unavailable".to_string());
     }
     fs::write(path, code).map_err(|error| error.to_string())
 }
@@ -362,6 +391,34 @@ fn validate_rows(rows: &[Vec<String>]) -> Result<(), String> {
         return Err("the macro returned too many cells".to_string());
     }
     Ok(())
+}
+
+fn configure_macro_process(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+}
+
+fn terminate_process_tree(process: &mut Child) {
+    #[cfg(unix)]
+    {
+        let process_group = -(process.id() as i32);
+        // The macro is launched as the leader of its own process group.
+        let _ = unsafe { libc::kill(process_group, libc::SIGKILL) };
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let process_id = process.id().to_string();
+        let _ = Command::new("taskkill")
+            .args(["/PID", &process_id, "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
+    let _ = process.kill();
 }
 
 fn run_macro(
@@ -420,6 +477,7 @@ fn run_macro(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
+    configure_macro_process(&mut command);
     let child = Arc::new(Mutex::new(
         command
             .spawn()
@@ -429,7 +487,9 @@ fn run_macro(
         let mut runtime = lock_runtime(&inner)?;
         runtime.child = Some(child.clone());
         if runtime.cancel_requested {
-            let _ = child.lock().map(|mut process| process.kill());
+            if let Ok(mut process) = child.lock() {
+                terminate_process_tree(&mut process);
+            }
         }
     }
 
@@ -441,10 +501,10 @@ fn run_macro(
             .lock()
             .map_err(|_| "the Python process is unavailable".to_string())?;
         if cancel_requested {
-            let _ = process.kill();
+            terminate_process_tree(&mut process);
             cancelled = true;
         } else if started.elapsed() >= EXECUTION_TIMEOUT {
-            let _ = process.kill();
+            terminate_process_tree(&mut process);
         }
         match process.try_wait().map_err(|error| error.to_string())? {
             Some(status) => break status,
@@ -651,7 +711,7 @@ pub fn python_cancel_macro(runtime_state: State<'_, PythonRuntimeState>) -> Resu
         let mut process = child
             .lock()
             .map_err(|_| "the Python process is unavailable".to_string())?;
-        let _ = process.kill();
+        terminate_process_tree(&mut process);
     }
     Ok(true)
 }
@@ -720,6 +780,24 @@ mod tests {
                 .contains("not a directory")
         );
         assert!(validated_macro_folder("").is_err());
+    }
+
+    #[test]
+    fn macro_file_commands_only_accept_python_scripts() {
+        assert!(validated_macro_script_path("macro.py").is_ok());
+        assert!(validated_macro_script_path("MACRO.PY").is_ok());
+        assert!(validated_macro_script_path("notes.txt").is_err());
+        assert!(validated_macro_script_path("").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_macro_directories_are_private_to_the_current_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TemporaryDirectory::create().unwrap();
+        let mode = fs::metadata(&directory.0).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[test]
@@ -884,10 +962,27 @@ mod tests {
 
     #[test]
     fn running_macro_can_be_cancelled() {
-        let Ok(interpreter) = inspect_interpreter("python3") else {
+        let Some(interpreter) = [
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+            "python3",
+            "python",
+        ]
+        .into_iter()
+        .find_map(|candidate| inspect_interpreter(candidate).ok()) else {
             return;
         };
         let runtime = PythonRuntimeState::default();
+        let marker_directory = TemporaryDirectory::create().unwrap();
+        let marker = marker_directory.0.join("child-survived.txt");
+        let marker_literal = serde_json::to_string(marker.to_str().unwrap()).unwrap();
+        let child_code = format!(
+            "import time; from pathlib import Path; time.sleep(1); Path({marker_literal}).write_text('alive')"
+        );
+        let child_code_literal = serde_json::to_string(&child_code).unwrap();
+        let macro_code = format!(
+            "import subprocess, sys, time\ndef transform(rows, context):\n    subprocess.Popen([sys.executable, '-c', {child_code_literal}])\n    time.sleep(30)\n    return rows\n"
+        );
         runtime.inner.lock().unwrap().active = true;
         let inner = runtime.inner.clone();
         let runner = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -910,8 +1005,7 @@ mod tests {
                 interpreter,
                 runner,
                 snapshot,
-                "import time\ndef transform(rows, context):\n    time.sleep(30)\n    return rows\n"
-                    .into(),
+                macro_code,
                 None,
             )
         });
@@ -921,14 +1015,20 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(10));
         }
+        thread::sleep(Duration::from_millis(300));
         {
             let mut state = inner.lock().unwrap();
             state.cancel_requested = true;
             if let Some(child) = &state.child {
-                let _ = child.lock().unwrap().kill();
+                terminate_process_tree(&mut child.lock().unwrap());
             }
         }
         assert!(handle.join().unwrap().unwrap_err().contains("cancelled"));
+        thread::sleep(Duration::from_millis(1_300));
+        assert!(
+            !marker.exists(),
+            "a child process survived macro cancellation"
+        );
     }
 
     #[test]

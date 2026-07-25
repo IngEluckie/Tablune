@@ -38,6 +38,8 @@ const MIN_ROWS = 100;
 const MIN_COLUMNS = 26;
 const WINDOW_OVERSCAN = 12;
 const RESIZE_HIT_RADIUS = 5;
+const SELECTION_ROW_CHUNK = 400;
+export const GRID_WINDOW_COLUMN_LIMIT = 200;
 
 interface CsvGridProps {
   summary: DocumentSummary;
@@ -139,6 +141,67 @@ export function parseClipboardMatrix(text: string): string[][] {
     rows.pop();
   }
   return rows;
+}
+
+type GridWindowLoader = (
+  documentId: number,
+  rowStart: number,
+  rowCount: number,
+  columnStart: number,
+  columnCount: number,
+) => Promise<GridWindow>;
+
+export async function fetchGridSelectionMatrix(
+  documentId: number,
+  range: ReturnType<typeof normalizeSelection>,
+  loadWindow: GridWindowLoader = getGridWindow,
+): Promise<{ matrix: string[][]; sourceRows: number[] }> {
+  const rowAmount = range.endRow - range.startRow + 1;
+  const columnAmount = range.endColumn - range.startColumn + 1;
+  const matrix: string[][] = [];
+  const sourceRows: number[] = [];
+  let expectedRevision: number | null = null;
+  let expectedViewRevision: number | null = null;
+
+  for (let rowOffset = 0; rowOffset < rowAmount; rowOffset += SELECTION_ROW_CHUNK) {
+    const chunkMatrix: string[][] = [];
+    const chunkSourceRows: number[] = [];
+    for (let columnOffset = 0; columnOffset < columnAmount; columnOffset += GRID_WINDOW_COLUMN_LIMIT) {
+      const data = await loadWindow(
+        documentId,
+        range.startRow + rowOffset,
+        Math.min(SELECTION_ROW_CHUNK, rowAmount - rowOffset),
+        range.startColumn + columnOffset,
+        Math.min(GRID_WINDOW_COLUMN_LIMIT, columnAmount - columnOffset),
+      );
+      if (data.documentId !== documentId) {
+        throw new Error("The document changed while reading the selection.");
+      }
+      if (expectedRevision === null) {
+        expectedRevision = data.revision;
+        expectedViewRevision = data.viewRevision;
+      } else if (data.revision !== expectedRevision || data.viewRevision !== expectedViewRevision) {
+        throw new Error("The document view changed while reading the selection.");
+      }
+      if (columnOffset === 0) {
+        for (const row of data.rows) {
+          chunkMatrix.push([...row.cells]);
+          chunkSourceRows.push(row.sourceRow);
+        }
+      } else {
+        if (data.rows.length !== chunkMatrix.length
+          || data.rows.some((row, index) => row.sourceRow !== chunkSourceRows[index])) {
+          throw new Error("The document view changed while reading the selection.");
+        }
+        for (let index = 0; index < data.rows.length; index += 1) {
+          chunkMatrix[index].push(...data.rows[index].cells);
+        }
+      }
+    }
+    matrix.push(...chunkMatrix);
+    sourceRows.push(...chunkSourceRows);
+  }
+  return { matrix, sourceRows };
 }
 
 async function writeClipboard(text: string): Promise<void> {
@@ -556,25 +619,7 @@ export default function CsvGrid({
 
   const fetchSelectionMatrix = async (): Promise<{ matrix: string[][]; sourceRows: number[] }> => {
     const range = normalizeSelection(selection);
-    const rowAmount = range.endRow - range.startRow + 1;
-    const columnAmount = range.endColumn - range.startColumn + 1;
-    const matrix: string[][] = [];
-    const sourceRows: number[] = [];
-    for (let offset = 0; offset < rowAmount; offset += 400) {
-      const data = await getGridWindow(
-        summary.documentId,
-        range.startRow + offset,
-        Math.min(400, rowAmount - offset),
-        range.startColumn,
-        columnAmount,
-      );
-      if (data.documentId !== summary.documentId) continue;
-      for (const row of data.rows) {
-        matrix.push(row.cells);
-        sourceRows.push(row.sourceRow);
-      }
-    }
-    return { matrix, sourceRows };
+    return fetchGridSelectionMatrix(summary.documentId, range);
   };
 
   const copySelection = async () => {

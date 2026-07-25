@@ -2,7 +2,6 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   ColumnProfile,
   ColumnType,
-  CsvPayload,
   DocumentId,
   DocumentSummary,
   EditCommand,
@@ -15,18 +14,6 @@ import type {
   ViewState,
   WorkspaceSummary,
 } from "./types";
-
-export function readCsvDocument(path: string): Promise<CsvPayload> {
-  return invoke<CsvPayload>("read_csv_document", { path });
-}
-
-export function writeCsvDocument(path: string, payload: CsvPayload): Promise<void> {
-  return invoke<void>("write_csv_document", { path, payload });
-}
-
-export function renameCsvDocument(path: string, newName: string): Promise<string> {
-  return invoke<string>("rename_csv_document", { path, newName });
-}
 
 export const getWorkspaceSummary = () => invoke<WorkspaceSummary>("workspace_summary");
 export const reorderWorkspace = (documentIds: DocumentId[]) =>
@@ -61,6 +48,7 @@ export const replaceSession = (documentId: DocumentId, request: {
   replacement: string;
   replaceAll: boolean;
   expectedRevision: number;
+  target: { sourceRow: number; column: number } | null;
 }) => invoke<DocumentSummary>("session_replace", { documentId, request });
 export const getColumnProfile = (documentId: DocumentId, column: number) =>
   invoke<ColumnProfile>("session_column_profile", { documentId, column });

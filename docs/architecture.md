@@ -31,7 +31,7 @@ The desktop backend may launch a user-selected Python 3.10+ interpreter as a chi
 
 Macro execution produces a revision-bound preview. Rust retains the transformed rows, sends only summary metrics and bounded samples to React, and applies an accepted result as one undoable transaction. Cell-only transformations use compact cell edits; structural transformations replace the document atomically. Results requiring more than the 64 MiB history budget cannot be applied.
 
-Python code runs with the current user's normal permissions. Tablune provides timeout and cancellation controls, but the prototype is not a security sandbox and does not install interpreters or packages.
+Python code runs with the current user's normal permissions. Script selection accepts `.py` files only. Tablune creates private temporary directories and terminates the launched process tree on timeout or cancellation, but the prototype is not a security sandbox and does not install interpreters or packages.
 
 ## Performance direction
 
@@ -45,13 +45,17 @@ Rust owns an ordered workspace of independently locked document sessions. Every 
 
 Canonical file paths are unique within a workspace. Opening an already open path reuses its session, and saving or renaming cannot claim a path owned by another document. The workspace lock is used only to locate or change the collection; parsing, grid queries, edits, and serialization use the selected document lock.
 
-Crash recovery is a versioned workspace manifest containing every dirty session. Clean documents are not restored between launches. Legacy single-document recovery payloads remain readable and are promoted to a one-document workspace during restoration.
+Crash recovery is a versioned workspace manifest containing every dirty session. Clean documents are not restored between launches. Recovery serialization borrows the in-memory rows instead of cloning the full workspace, and an identity/revision fingerprint avoids rewriting an unchanged manifest. Legacy single-document recovery payloads remain readable and are promoted to a one-document workspace during restoration.
+
+Successful CSV replacement is the save commit point. Once it succeeds, the session path and clean revision are updated even if a later preference or recovery-maintenance write fails; those secondary failures are reported without leaving the UI in a false unsaved state.
 
 ## Active document and tabs
 
 React is the sole owner of `activeDocumentId`. The bottom document bar renders the ordered workspace returned by Rust and sends a complete ID permutation back when tabs are reordered. Rust validates that the permutation contains every open document exactly once before changing workspace order, so recovery uses that same ordering.
 
 Each open document has a frontend `TabUiState` keyed by `documentId`. It preserves the current `ViewState`, grid selection, horizontal and vertical scroll offsets, and sparse visual row/column sizing overrides while another tab is active. Sizing overrides are intentionally session-only, never mark CSV data dirty, and are discarded when the corresponding row or column mapping changes. Search, Data Explorer, and Python macro surfaces are intentionally transient and close when the active ID changes. Asynchronous grid and panel callbacks retain their originating document ID and cannot be applied to whichever tab happens to be active later.
+
+Search ranges are expressed either in source coordinates or in current-view coordinates. A selection search in a sorted or filtered grid follows the visible rows, while document-wide search follows source order. Replace-one targets the active result explicitly; replace-all is exhaustive rather than inheriting the interactive result-display limit.
 
 Creating or opening a document never closes another tab. Multi-file open is sequential so header suggestions can be resolved per file; successful documents remain open when another selected path fails. Only dirty sessions participate in restart recovery, and closing the final tab creates a new empty session before removing it so the desktop UI always has a visible document.
 

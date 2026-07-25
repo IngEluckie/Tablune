@@ -21,14 +21,14 @@ Tablune Sheets 0.3 is a desktop editor and non-destructive explorer for delimite
 - Delimiter and line-ending detection
 - UTF-8 and UTF-8 BOM input
 - Continuous range and whole row/column selection
-- Find and replace
+- Find and replace, including visible selections in sorted or filtered views
 - Optional first-row headers
 - Unsaved-change protection and crash recovery
 - Stable multi-column sorting and typed filters
 - Facets, inferred types, and column profiles
 - Export current view and apply sort explicitly
 - Full-document Python macros using a user-managed Python environment
-- Macro editor, script open/save, mandatory preview, cancellation, and atomic undo
+- Macro editor, `.py` script open/save, mandatory preview, process-tree cancellation, and atomic undo
 
 ## Excluded
 

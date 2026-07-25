@@ -2939,12 +2939,14 @@ dependencies = [
  "serde",
  "tablune-core",
  "thiserror 2.0.19",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "tablune-desktop"
 version = "0.3.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "tablune-core",

@@ -85,13 +85,23 @@ impl TableDocument {
 
     pub fn insert_column(&mut self, index: usize) {
         for row in &mut self.rows {
-            row.insert(index.min(row.len()), String::new());
+            if index <= row.len() {
+                row.insert(index, String::new());
+            }
         }
     }
 
     pub fn insert_columns(&mut self, index: usize, count: usize) {
-        for _ in 0..count {
-            self.insert_column(index);
+        if count == 0 {
+            return;
+        }
+        for row in &mut self.rows {
+            if index <= row.len() {
+                row.splice(
+                    index..index,
+                    std::iter::repeat_with(String::new).take(count),
+                );
+            }
         }
     }
 
@@ -103,7 +113,47 @@ impl TableDocument {
     }
 
     pub fn delete_columns(&mut self, index: usize, count: usize) -> Vec<Vec<Option<String>>> {
-        (0..count).map(|_| self.delete_column(index)).collect()
+        let mut columns = (0..count)
+            .map(|_| Vec::with_capacity(self.rows.len()))
+            .collect::<Vec<_>>();
+        for row in &mut self.rows {
+            let available = row.len().saturating_sub(index).min(count);
+            let mut removed = if available == 0 {
+                Vec::new().into_iter()
+            } else {
+                row.drain(index..index + available)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+            };
+            for column in &mut columns {
+                column.push(removed.next());
+            }
+        }
+        columns
+    }
+
+    #[must_use]
+    pub fn columns(&self, index: usize, count: usize) -> Vec<Vec<Option<String>>> {
+        (0..count)
+            .map(|offset| {
+                self.rows
+                    .iter()
+                    .map(|row| row.get(index.saturating_add(offset)).cloned())
+                    .collect()
+            })
+            .collect()
+    }
+
+    pub fn restore_columns(&mut self, index: usize, columns: &[Vec<Option<String>>]) {
+        for (row_index, row) in self.rows.iter_mut().enumerate() {
+            let values = columns
+                .iter()
+                .filter_map(|column| column.get(row_index).cloned().flatten())
+                .collect::<Vec<_>>();
+            if !values.is_empty() && index <= row.len() {
+                row.splice(index..index, values);
+            }
+        }
     }
 
     pub fn reorder_rows(&mut self, order: &[usize]) -> Result<(), &'static str> {
@@ -164,5 +214,27 @@ mod tests {
         document.reorder_rows(&[1, 0]).unwrap();
         assert_eq!(document.rows()[0][0], "b");
         assert_eq!(document.rows()[1][0], "middle");
+    }
+
+    #[test]
+    fn column_operations_preserve_ragged_row_shapes_exactly() {
+        let original = vec![
+            vec!["a".into()],
+            vec!["b".into(), "c".into(), "d".into()],
+            Vec::new(),
+        ];
+        let mut document = TableDocument::from_rows(original.clone());
+
+        document.insert_columns(2, 2);
+        assert_eq!(document.rows()[0], ["a"]);
+        assert_eq!(document.rows()[1], ["b", "c", "", "", "d"]);
+        assert!(document.rows()[2].is_empty());
+        document.delete_columns(2, 2);
+        assert_eq!(document.rows(), original);
+
+        let removed = document.columns(1, 2);
+        document.delete_columns(1, 2);
+        document.restore_columns(1, &removed);
+        assert_eq!(document.rows(), original);
     }
 }
