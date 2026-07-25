@@ -124,6 +124,8 @@ pub fn run() {
             session::workspace_discard_recovery,
             python_macros::python_status,
             python_macros::python_set_interpreter,
+            python_macros::python_macro_folder,
+            python_macros::python_set_macro_folder,
             python_macros::macro_read_script,
             python_macros::macro_write_script,
             python_macros::python_preview_macro,

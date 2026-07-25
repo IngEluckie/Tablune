@@ -90,6 +90,7 @@ button { cursor: default; }
 .app-shell textarea { color: var(--text-strong); }
 
 .macro-panel {
+  container: macro-panel / inline-size;
   position: relative;
   display: grid;
   grid-template-rows: auto auto auto minmax(90px, 1fr) clamp(120px, 30%, 240px) auto;
@@ -165,6 +166,23 @@ button { cursor: default; }
 .macro-python-status span { flex: 1; overflow: hidden; color: var(--text-muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .macro-python-status span.available { color: var(--accent-strong); }
 .macro-python-status span.unavailable { color: var(--error); }
+.macro-toolbar > button { flex: 0 0 auto; }
+.macro-folder-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin-left: auto;
+  padding-right: 10px !important;
+  padding-left: 10px !important;
+  white-space: nowrap;
+}
+.macro-folder-button svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-linejoin: round; stroke-width: 1.8; }
+.macro-folder-button.configured { border-color: var(--accent-border); color: var(--accent-strong); }
+@container macro-panel (max-width: 440px) {
+  .macro-folder-button { width: 32px; padding-right: 0 !important; padding-left: 0 !important; }
+  .macro-folder-button span { display: none; }
+}
 .macro-editor-panel {
   display: grid;
   grid-template-rows: 30px minmax(0, 1fr);

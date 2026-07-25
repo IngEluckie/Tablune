@@ -1,14 +1,19 @@
 // @vitest-environment jsdom
 
-import { ask } from "@tauri-apps/plugin-dialog";
+import { ask, open, save } from "@tauri-apps/plugin-dialog";
+import { join } from "@tauri-apps/api/path";
 import { EditorView } from "@codemirror/view";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyPythonPreview,
   cancelPythonMacro,
+  getPythonMacroFolder,
   getPythonStatus,
   previewPythonMacro,
+  readMacroScript,
+  setPythonMacroFolder,
+  writeMacroScript,
 } from "./ipc";
 import PythonMacroDialog from "./PythonMacroDialog";
 import type { DocumentSummary, MacroPreview } from "./types";
@@ -19,13 +24,19 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   save: vi.fn(),
 }));
 
+vi.mock("@tauri-apps/api/path", () => ({
+  join: vi.fn(),
+}));
+
 vi.mock("./ipc", () => ({
   applyPythonPreview: vi.fn(),
   cancelPythonMacro: vi.fn(),
+  getPythonMacroFolder: vi.fn(),
   getPythonStatus: vi.fn(),
   previewPythonMacro: vi.fn(),
   readMacroScript: vi.fn(),
   setPythonInterpreter: vi.fn(),
+  setPythonMacroFolder: vi.fn(),
   writeMacroScript: vi.fn(),
 }));
 
@@ -86,6 +97,10 @@ describe("PythonMacroDialog", () => {
       available: true,
       error: null,
     });
+    vi.mocked(getPythonMacroFolder).mockResolvedValue(null);
+    vi.mocked(join).mockImplementation(async (...parts) => parts.join("/"));
+    vi.mocked(readMacroScript).mockResolvedValue("def run(rows, context):\n    pass\n");
+    vi.mocked(writeMacroScript).mockResolvedValue();
     vi.mocked(ask).mockResolvedValue(true);
     vi.mocked(previewPythonMacro).mockResolvedValue(preview);
     vi.mocked(applyPythonPreview).mockResolvedValue({ ...summary, revision: 3, dirty: true, canUndo: true });
@@ -168,6 +183,58 @@ describe("PythonMacroDialog", () => {
       null,
       2,
     ));
+  });
+
+  it("uses the preferred macros folder without restricting Open to it", async () => {
+    vi.mocked(getPythonMacroFolder).mockResolvedValue("/Users/test/Macros");
+    vi.mocked(open).mockResolvedValue("/Users/test/Elsewhere/example.py");
+    render(<PythonMacroDialog {...props} trustAcknowledged />);
+    await screen.findByRole("button", { name: /Current folder: \/Users\/test\/Macros/ });
+
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+
+    await waitFor(() => expect(readMacroScript).toHaveBeenCalledWith("/Users/test/Elsewhere/example.py"));
+    expect(open).toHaveBeenCalledWith(expect.objectContaining({
+      directory: false,
+      defaultPath: "/Users/test/Macros",
+    }));
+    expect(screen.getByText("example.py")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Current folder: \/Users\/test\/Macros/ })).toBeTruthy();
+  });
+
+  it("starts Save As in the preferred folder", async () => {
+    vi.mocked(getPythonMacroFolder).mockResolvedValue("/Users/test/Macros");
+    vi.mocked(save).mockResolvedValue("/Users/test/Macros/Untitled macro.py");
+    render(<PythonMacroDialog {...props} trustAcknowledged />);
+    await screen.findByRole("button", { name: /Current folder: \/Users\/test\/Macros/ });
+
+    fireEvent.click(screen.getByRole("button", { name: "Save As" }));
+
+    await waitFor(() => expect(writeMacroScript).toHaveBeenCalledWith(
+      "/Users/test/Macros/Untitled macro.py",
+      expect.stringContaining("def run"),
+    ));
+    expect(join).toHaveBeenCalledWith("/Users/test/Macros", "Untitled macro.py");
+    expect(save).toHaveBeenCalledWith(expect.objectContaining({
+      defaultPath: "/Users/test/Macros/Untitled macro.py",
+    }));
+  });
+
+  it("changes the preferred folder from the compact toolbar button", async () => {
+    vi.mocked(open).mockResolvedValue("/Users/test/New Macros");
+    vi.mocked(setPythonMacroFolder).mockResolvedValue("/Users/test/New Macros");
+    render(<PythonMacroDialog {...props} trustAcknowledged />);
+    await screen.findByRole("button", { name: "Choose macros folder" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Choose macros folder" }));
+
+    await waitFor(() => expect(setPythonMacroFolder).toHaveBeenCalledWith("/Users/test/New Macros"));
+    expect(open).toHaveBeenCalledWith(expect.objectContaining({
+      title: "Choose macros folder",
+      directory: true,
+      canCreateDirectories: true,
+    }));
+    expect(screen.getByRole("button", { name: /Current folder: \/Users\/test\/New Macros/ })).toBeTruthy();
   });
 
   it("switches to Console when execution fails", async () => {

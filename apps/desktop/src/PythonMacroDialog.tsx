@@ -1,12 +1,15 @@
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
+import { join } from "@tauri-apps/api/path";
 import { Suspense, lazy, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   applyPythonPreview,
   cancelPythonMacro,
+  getPythonMacroFolder,
   getPythonStatus,
   previewPythonMacro,
   readMacroScript,
   setPythonInterpreter,
+  setPythonMacroFolder,
   writeMacroScript,
 } from "./ipc";
 import type { DocumentSummary, MacroPreview, PythonStatus } from "./types";
@@ -60,6 +63,7 @@ export default function PythonMacroPanel({
   onClose,
 }: PythonMacroPanelProps) {
   const [python, setPython] = useState<PythonStatus | null>(null);
+  const [macroFolder, setMacroFolder] = useState<string | null>(null);
   const [sourcePath, setSourcePath] = useState<string | null>(null);
   const [code, setCode] = useState(STARTER_MACRO);
   const [savedCode, setSavedCode] = useState(STARTER_MACRO);
@@ -105,6 +109,18 @@ export default function PythonMacroPanel({
   }, []);
 
   useEffect(() => {
+    let active = true;
+    void getPythonMacroFolder()
+      .then((folder) => {
+        if (active) setMacroFolder(folder);
+      })
+      .catch((reason) => {
+        if (active) setConsoleError(String(reason));
+      });
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
     if (consoleError) setResultTab("console");
   }, [consoleError]);
 
@@ -124,8 +140,17 @@ export default function PythonMacroPanel({
   const saveCurrent = async (saveAs = false): Promise<boolean> => {
     let destination = saveAs ? null : sourcePath;
     if (!destination) {
+      let defaultPath = fileName(sourcePath);
+      if (macroFolder) {
+        try {
+          defaultPath = await join(macroFolder, defaultPath);
+        } catch (reason) {
+          setConsoleError(String(reason));
+          return false;
+        }
+      }
       destination = await save({
-        defaultPath: fileName(sourcePath),
+        defaultPath,
         filters: [{ name: "Python macro", extensions: ["py"] }],
       });
     }
@@ -172,6 +197,7 @@ export default function PythonMacroPanel({
     const selected = await open({
       multiple: false,
       directory: false,
+      defaultPath: macroFolder ?? undefined,
       filters: [{ name: "Python macro", extensions: ["py"] }],
     });
     if (typeof selected !== "string") return;
@@ -196,6 +222,26 @@ export default function PythonMacroPanel({
     setWorking(true);
     try {
       setPython(await setPythonInterpreter(selected));
+      setConsoleError("");
+    } catch (reason) {
+      setConsoleError(String(reason));
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const chooseMacroFolder = async () => {
+    const selected = await open({
+      title: "Choose macros folder",
+      multiple: false,
+      directory: true,
+      canCreateDirectories: true,
+      defaultPath: macroFolder ?? undefined,
+    });
+    if (typeof selected !== "string") return;
+    setWorking(true);
+    try {
+      setMacroFolder(await setPythonMacroFolder(selected));
       setConsoleError("");
     } catch (reason) {
       setConsoleError(String(reason));
@@ -347,6 +393,18 @@ export default function PythonMacroPanel({
         <button onClick={() => void openMacro()} disabled={working || running}>Open</button>
         <button onClick={() => void saveCurrent(false)} disabled={working || running || !dirty}>Save</button>
         <button onClick={() => void saveCurrent(true)} disabled={working || running}>Save As</button>
+        <button
+          className={`macro-folder-button${macroFolder ? " configured" : ""}`}
+          onClick={() => void chooseMacroFolder()}
+          disabled={working || running}
+          aria-label={macroFolder ? `Change macros folder. Current folder: ${macroFolder}` : "Choose macros folder"}
+          title={macroFolder ? `Macros folder: ${macroFolder}` : "Choose macros folder"}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M3.5 6.5h6l2 2h9v9.75a1.25 1.25 0 0 1-1.25 1.25H4.75a1.25 1.25 0 0 1-1.25-1.25z" />
+          </svg>
+          <span>Macro Folder…</span>
+        </button>
       </div>
 
       <div className="macro-editor-panel">

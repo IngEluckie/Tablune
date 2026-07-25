@@ -273,6 +273,36 @@ pub fn python_set_interpreter(app: AppHandle, path: String) -> Result<PythonStat
     })
 }
 
+fn validated_macro_folder(path: &str) -> Result<String, String> {
+    let path = Path::new(path.trim());
+    if path.as_os_str().is_empty() {
+        return Err("the macros folder path cannot be empty".to_string());
+    }
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("the macros folder is unavailable: {error}"))?;
+    if !metadata.is_dir() {
+        return Err("the macros folder path is not a directory".to_string());
+    }
+    path.canonicalize()
+        .map_err(|error| format!("the macros folder is unavailable: {error}"))
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub fn python_macro_folder(app: AppHandle) -> Result<Option<String>, String> {
+    let Some(path) = session::load_python_macro_folder(&app)? else {
+        return Ok(None);
+    };
+    Ok(validated_macro_folder(&path).ok())
+}
+
+#[tauri::command]
+pub fn python_set_macro_folder(app: AppHandle, path: String) -> Result<String, String> {
+    let path = validated_macro_folder(&path)?;
+    session::save_python_macro_folder(&app, path.clone())?;
+    Ok(path)
+}
+
 #[tauri::command]
 pub fn macro_read_script(path: String) -> Result<String, String> {
     let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
@@ -671,6 +701,25 @@ mod tests {
             assert!(!info.path.is_empty());
             assert!(!info.version.is_empty());
         }
+    }
+
+    #[test]
+    fn validates_macro_folders() {
+        let directory = TemporaryDirectory::create().unwrap();
+        let canonical = validated_macro_folder(directory.0.to_str().unwrap()).unwrap();
+        assert_eq!(
+            PathBuf::from(canonical),
+            directory.0.canonicalize().unwrap()
+        );
+
+        let file = directory.0.join("macro.py");
+        fs::write(&file, "def run(rows, context):\n    pass\n").unwrap();
+        assert!(
+            validated_macro_folder(file.to_str().unwrap())
+                .unwrap_err()
+                .contains("not a directory")
+        );
+        assert!(validated_macro_folder("").is_err());
     }
 
     #[test]

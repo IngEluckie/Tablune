@@ -244,6 +244,8 @@ struct Preferences {
     #[serde(default)]
     python_interpreter: Option<String>,
     #[serde(default)]
+    python_macro_folder: Option<String>,
+    #[serde(default)]
     files: HashMap<String, FilePreferences>,
 }
 
@@ -1940,6 +1942,16 @@ pub(crate) fn save_python_interpreter(app: &AppHandle, path: String) -> Result<(
     write_json_atomic(&preferences_path(app)?, &preferences)
 }
 
+pub(crate) fn load_python_macro_folder(app: &AppHandle) -> Result<Option<String>, String> {
+    Ok(load_preferences(app)?.python_macro_folder)
+}
+
+pub(crate) fn save_python_macro_folder(app: &AppHandle, path: String) -> Result<(), String> {
+    let mut preferences = load_preferences(app)?;
+    preferences.python_macro_folder = Some(path);
+    write_json_atomic(&preferences_path(app)?, &preferences)
+}
+
 fn save_file_preferences(app: &AppHandle, session: &DocumentSession) -> Result<(), String> {
     let Some(path) = &session.path else {
         return Ok(());
@@ -2436,6 +2448,18 @@ mod tests {
         assert_eq!(session.document.column_count(), 0);
         session.redo().unwrap();
         assert_eq!(session.cell_value(2, 3), "value");
+    }
+
+    #[test]
+    fn legacy_preferences_default_the_macros_folder() {
+        let preferences: Preferences =
+            serde_json::from_str(r#"{"python_interpreter":"/usr/bin/python3","files":{}}"#)
+                .unwrap();
+        assert_eq!(
+            preferences.python_interpreter.as_deref(),
+            Some("/usr/bin/python3")
+        );
+        assert!(preferences.python_macro_folder.is_none());
     }
 
     #[test]

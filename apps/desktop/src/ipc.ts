@@ -76,6 +76,9 @@ export const exitApplication = () => invoke<void>("exit_application");
 export const getPythonStatus = () => invoke<PythonStatus>("python_status");
 export const setPythonInterpreter = (path: string) =>
   invoke<PythonStatus>("python_set_interpreter", { path });
+export const getPythonMacroFolder = () => invoke<string | null>("python_macro_folder");
+export const setPythonMacroFolder = (path: string) =>
+  invoke<string>("python_set_macro_folder", { path });
 export const readMacroScript = (path: string) => invoke<string>("macro_read_script", { path });
 export const writeMacroScript = (path: string, code: string) =>
   invoke<void>("macro_write_script", { path, code });
