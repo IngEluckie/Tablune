@@ -9,8 +9,13 @@ Tablune Sheets is a performance-first desktop CSV editor built with Rust, Tauri,
 
 The initial release targets macOS for development and validation, while preserving a cross-platform architecture for Windows 11.
 
-## Current scope (0.3)
+## Current scope (0.4)
 
+- Start from Home with recent files and multiple open workspaces
+- Create, save, and reopen self-contained `.tablune` projects
+- Keep editable tables, Python scripts, column settings, and views together
+- Reuse a Python script with another input table and create independent result tables
+- Import CSV data into a project or create a project from an edited CSV
 - Create a new CSV document
 - Open and inspect UTF-8 CSV, TSV, and semicolon-delimited files
 - Edit cell values in a virtualized canvas grid
@@ -26,7 +31,7 @@ The initial release targets macOS for development and validation, while preservi
 - Explore facets, inferred column types, and column quality profiles
 - Export the current view or explicitly apply a sort to the document
 
-The MVP deliberately excludes formulas, cell formatting, multiple worksheets, and XLSX support.
+Projects contain multiple tables; they are not Excel workbooks. Formulas, cell formatting, XLSX support, pipelines, external linked sources, and out-of-memory processing remain outside this release.
 
 ## Architecture
 
@@ -63,4 +68,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Current milestone
 
-Tablune 0.3 is a trustworthy CSV editor and non-destructive data explorer. Rust owns the document session and sends windowed grid data to React, keeping the browser layer independent of total row count. Exact byte-for-byte preservation of the original quoting layout is not guaranteed; saved files are normalized into valid CSV using the detected dialect.
+Tablune 0.4 adds persistent data projects to the CSV editor and non-destructive explorer. Rust owns document and project sessions and sends windowed grid data to React, keeping the browser layer independent of total row count. Exact byte-for-byte preservation of the original quoting layout is not guaranteed; saved files are normalized into valid CSV using the detected dialect.
+
+## Working with projects
+
+Choose **New project** on Home, import CSV tables, and create or import a Python script. In the central script editor, choose an input table, run a preview, and select **Create result table**. Each accepted execution adds an editable copy; it never overwrites the input or a previous result. Saving a project stores all its tables and scripts in one `.tablune` file. Reopen it later and select a different table to reuse the script.
+
+CSV workspaces retain their existing macro panel and save behavior. **Create project from this CSV** copies the current in-memory data and view, including unsaved edits, while leaving the original CSV open. Exporting a table produces a CSV and does not save the project.
+
+Python 3.10+ and any imported packages must already be installed in the user-selected environment. Projects contain script source, not Python installations or dependencies. Opening a project never runs its scripts. See [project format and behavior](docs/projects.md) for persistence, recovery, and limits.

@@ -95,6 +95,7 @@ struct MacroOutput {
 
 #[derive(Debug)]
 struct PendingPreview {
+    project: Option<(u64, String, u64)>,
     id: String,
     document_id: u64,
     identity: u64,
@@ -107,6 +108,7 @@ struct PendingPreview {
 #[derive(Default)]
 struct RuntimeInner {
     active: bool,
+    active_project: Option<u64>,
     cancel_requested: bool,
     child: Option<Arc<Mutex<Child>>>,
     pending: Option<PendingPreview>,
@@ -595,6 +597,7 @@ fn build_preview(
     runtime.next_preview = runtime.next_preview.wrapping_add(1);
     let id = format!("macro-preview-{}", runtime.next_preview);
     runtime.pending = Some(PendingPreview {
+        project: None,
         id: id.clone(),
         document_id: snapshot.document_id,
         identity: snapshot.identity,
@@ -655,15 +658,47 @@ pub async fn python_preview_macro(
     if snapshot.revision != expected_revision {
         return Err("the document changed; run the macro preview again".to_string());
     }
-    let interpreter = resolve_interpreter(&app)?;
-    let runner = runner_path(&app)?;
+    if session::lock_document(&handle)?
+        .summary()
+        .project_id
+        .is_some()
+    {
+        return Err("Use the project script editor for this table".into());
+    }
+    run_preview(
+        &app,
+        &workspace_state,
+        &runtime_state,
+        snapshot,
+        code,
+        source_path,
+        None,
+    )
+    .await
+}
+
+async fn run_preview(
+    app: &AppHandle,
+    workspace: &WorkspaceState,
+    runtime_state: &PythonRuntimeState,
+    snapshot: MacroDocumentSnapshot,
+    code: String,
+    source_path: Option<String>,
+    project: Option<(u64, String, u64)>,
+) -> Result<MacroPreview, String> {
+    if code.len() > CODE_LIMIT {
+        return Err("macro code cannot exceed 1 MiB".into());
+    }
+    let interpreter = resolve_interpreter(app)?;
+    let runner = runner_path(app)?;
     let inner = runtime_state.inner.clone();
     {
         let mut runtime = lock_runtime(&inner)?;
         if runtime.active {
-            return Err("another Python macro is already running".to_string());
+            return Err("another Python macro is already running".into());
         }
         runtime.active = true;
+        runtime.active_project = project.as_ref().map(|p| p.0);
         runtime.cancel_requested = false;
         runtime.child = None;
         runtime.pending = None;
@@ -681,23 +716,124 @@ pub async fn python_preview_macro(
         )
     })
     .await;
+    // Reserve the runtime through preview publication, including validation.
+    let result = (|| {
+        let output = task_result.map_err(|e| e.to_string())??;
+        let handle = session::document_handle(workspace, snapshot.document_id)?;
+        if !session::lock_document(&handle)?.matches_macro_snapshot(
+            snapshot.identity,
+            snapshot.revision,
+            snapshot.header_enabled,
+        ) {
+            return Err("the document changed while the macro was running".into());
+        }
+        if let Some((project_id, script_id, revision)) = &project {
+            let handle = session::projects::handle(workspace, *project_id)?;
+            let p = session::projects::lock_project(&handle)?;
+            let (script, input) = p.script_input(script_id)?;
+            if script.revision != *revision
+                || session::lock_document(&input)?.summary().document_id != snapshot.document_id
+            {
+                return Err("Script or input changed; run preview again".into());
+            }
+        }
+        let mut preview = build_preview(&inner, &snapshot, output)?;
+        if project.is_some() {
+            preview.can_apply = true;
+            preview.blocked_reason = None;
+            if let Some(pending) = &mut lock_runtime(&inner)?.pending {
+                pending.project = project;
+            }
+        }
+        Ok(preview)
+    })();
+    let mut runtime = lock_runtime(&inner)?;
+    runtime.active = false;
+    runtime.active_project = None;
+    runtime.cancel_requested = false;
+    runtime.child = None;
+    result
+}
+
+#[tauri::command]
+pub async fn project_python_preview(
+    app: AppHandle,
+    workspace: State<'_, WorkspaceState>,
+    runtime: State<'_, PythonRuntimeState>,
+    project_id: u64,
+    script_id: String,
+) -> Result<MacroPreview, String> {
+    let (script, snapshot) = {
+        let handle = session::projects::handle(&workspace, project_id)?;
+        let p = session::projects::lock_project(&handle)?;
+        let (script, input) = p.script_input(&script_id)?;
+        let snapshot = session::lock_document(&input)?.macro_snapshot();
+        (script, snapshot)
+    };
+    run_preview(
+        &app,
+        &workspace,
+        &runtime,
+        snapshot,
+        script.code,
+        None,
+        Some((project_id, script_id, script.revision)),
+    )
+    .await
+}
+
+pub(crate) fn project_running(
+    runtime: &PythonRuntimeState,
+    project_id: u64,
+) -> Result<bool, String> {
+    Ok(lock_runtime(&runtime.inner)?.active_project == Some(project_id))
+}
+
+fn validate_project_preview(
+    pending: &PendingPreview,
+    project_id: u64,
+    script: &session::projects::ScriptSummary,
+    snapshot: &MacroDocumentSnapshot,
+    preview_id: &str,
+) -> Result<(), String> {
+    if pending.id != preview_id
+        || pending.project != Some((project_id, script.id.clone(), script.revision))
+        || pending.document_id != snapshot.document_id
+        || pending.identity != snapshot.identity
+        || pending.revision != snapshot.revision
+        || pending.header_enabled != snapshot.header_enabled
     {
-        let mut runtime = lock_runtime(&inner)?;
-        runtime.active = false;
-        runtime.cancel_requested = false;
-        runtime.child = None;
+        return Err("Script or input changed; run preview again".into());
     }
-    let result = task_result.map_err(|error| error.to_string())?;
-    let output = result?;
-    let handle = session::document_handle(&workspace_state, document_id)?;
-    if !session::lock_document(&handle)?.matches_macro_snapshot(
-        snapshot.identity,
-        snapshot.revision,
-        snapshot.header_enabled,
-    ) {
-        return Err("the document changed while the macro was running".to_string());
-    }
-    build_preview(&inner, &snapshot, output)
+    Ok(())
+}
+
+#[tauri::command]
+pub fn project_python_result(
+    workspace: State<'_, WorkspaceState>,
+    runtime: State<'_, PythonRuntimeState>,
+    project_id: u64,
+    script_id: String,
+    preview_id: String,
+) -> Result<session::projects::ProjectSummary, String> {
+    let handle = session::projects::handle(&workspace, project_id)?;
+    let mut p = session::projects::lock_project(&handle)?;
+    let (script, input) = p.script_input(&script_id)?;
+    let input = session::lock_document(&input)?;
+    let snapshot = input.macro_snapshot();
+    let pending = {
+        let mut rt = lock_runtime(&runtime.inner)?;
+        let pending = rt
+            .pending
+            .as_ref()
+            .ok_or("Preview is no longer available")?;
+        validate_project_preview(pending, project_id, &script, &snapshot, &preview_id)?;
+        rt.pending.take().ok_or("Preview is no longer available")?
+    };
+    p.add_result(pending.rows, &snapshot, &script.name)?;
+    drop(input);
+    session::projects::update_directory(&handle, &p)?;
+    p.summary()
 }
 
 #[tauri::command]
@@ -736,6 +872,9 @@ pub fn python_apply_preview(
         }
         pending
     };
+    if pending.project.is_some() {
+        return Err("Use create result table for project previews".into());
+    }
     if pending.estimated_bytes > MAX_HISTORY_BYTES {
         return Err("this macro result is too large to keep an undo entry".to_string());
     }
@@ -752,6 +891,53 @@ pub fn python_apply_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn project_preview_rejects_changed_code_input_revision_and_project() {
+        let script = session::projects::ScriptSummary {
+            id: "s".into(),
+            name: "Code.py".into(),
+            code: "pass".into(),
+            revision: 3,
+            input_table_id: Some("t".into()),
+        };
+        let snapshot = MacroDocumentSnapshot {
+            document_id: 9,
+            identity: 9,
+            revision: 4,
+            rows: vec![],
+            header_enabled: true,
+            display_name: "Table".into(),
+            delimiter: ",".into(),
+            line_ending: tablune_csv::LineEnding::Lf,
+        };
+        let pending = PendingPreview {
+            project: Some((1, "s".into(), 3)),
+            id: "preview".into(),
+            document_id: 9,
+            identity: 9,
+            revision: 4,
+            header_enabled: true,
+            rows: vec![],
+            estimated_bytes: MAX_HISTORY_BYTES + 1,
+        };
+        assert!(validate_project_preview(&pending, 1, &script, &snapshot, "preview").is_ok());
+        assert!(validate_project_preview(&pending, 2, &script, &snapshot, "preview").is_err());
+        assert!(
+            validate_project_preview(&pending, 1, &script, &snapshot, "other-preview").is_err()
+        );
+        let mut changed = script.clone();
+        changed.revision += 1;
+        assert!(validate_project_preview(&pending, 1, &changed, &snapshot, "preview").is_err());
+        let mut changed = snapshot.clone();
+        changed.document_id += 1;
+        assert!(validate_project_preview(&pending, 1, &script, &changed, "preview").is_err());
+        let mut changed = snapshot.clone();
+        changed.revision += 1;
+        assert!(validate_project_preview(&pending, 1, &script, &changed, "preview").is_err());
+        let mut changed = snapshot.clone();
+        changed.header_enabled = false;
+        assert!(validate_project_preview(&pending, 1, &script, &changed, "preview").is_err());
+    }
 
     #[test]
     fn validates_supported_python_versions() {

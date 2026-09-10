@@ -831,3 +831,75 @@ button { cursor: default; }
   .top-region,
   .ribbon-panel { transition: none; }
 }
+
+/* Product shell: Home and independent CSV/project spaces share the same surfaces. */
+.product-shell { display:flex; flex-direction:column; border:0; }
+[hidden] { display:none !important; }
+.space-bar { display:flex; align-items:center; gap:12px; padding:10px 16px; background:var(--surface); border-bottom:1px solid var(--border); min-height:52px; }
+.space-bar button,.home-screen button,.project-space button,.csv-project-action button,.empty-workspace button { border:1px solid var(--border-control); background:var(--control-background); border-radius:6px; padding:7px 10px; }
+.space-bar button:hover,.home-screen button:hover,.project-space button:hover { background:var(--accent-hover); }
+.space-bar .home-button { color:var(--accent); font-weight:650; }
+.space-selector { display:flex; align-items:center; gap:8px; font-size:12px; color:var(--text-muted); }
+.space-selector select,.script-toolbar select { background:var(--control-background); border:1px solid var(--border-control); border-radius:6px; padding:6px; max-width:240px; }
+.space-title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; }
+.theme-switch { margin-left:auto; }
+.space-content { flex:1; min-height:0; position:relative; }
+.space-pane { height:100%; min-height:0; }
+.csv-space { display:flex; flex-direction:column; }
+.csv-project-action { padding:4px 12px; background:var(--surface-subtle); border-bottom:1px solid var(--border); }
+.csv-project-action button { padding:4px 8px; font-size:12px; }
+.grid-host { flex:1; min-width:0; min-height:0; height:100%; }
+.grid-host > .app-shell { border:0; }
+.home-screen { height:100%; overflow:auto; padding:52px max(32px,calc((100% - 1020px)/2)); }
+.home-heading { display:flex; gap:24px; align-items:center; margin-bottom:36px; }
+.home-heading img { width:92px; height:92px; object-fit:contain; }
+.home-heading h1 { font-size:32px; letter-spacing:-1px; margin:6px 0 10px; }
+.home-heading p { color:var(--text-muted); margin:0; }
+.home-heading .eyebrow { font-size:10px; font-weight:700; letter-spacing:2px; color:var(--accent); }
+.home-start { display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; margin-bottom:36px; }
+.home-start button { padding:24px; min-height:110px; text-align:left; display:flex; flex-direction:column; gap:12px; }
+.home-start strong { font-size:18px; }
+.home-start span,.empty-hint,.home-version { color:var(--text-muted); font-size:13px; line-height:1.5; }
+.home-screen h2 { font-size:14px; margin:24px 0 14px; }
+.open-spaces { display:flex; gap:10px; flex-wrap:wrap; }
+.recent-list { margin:0; padding:0; list-style:none; border-top:1px solid var(--border); }
+.recent-list li { display:flex; border-bottom:1px solid var(--border); }
+.recent-list li > button { border:0; border-radius:0; background:transparent; }
+.recent-list li > button:first-child { flex:1; display:flex; min-width:0; gap:16px; padding:14px 8px; text-align:left; align-items:center; }
+.recent-list strong { display:block; font-size:13px; font-weight:550; }
+.recent-list small { display:block; color:var(--text-muted); margin-top:4px; overflow-wrap:anywhere; font-size:11px; }
+.recent-kind { color:var(--accent); font-size:22px; }
+.home-version { margin-top:32px; font-size:11px; }
+.project-space { display:grid; grid-template-columns:230px minmax(0,1fr); }
+.project-navigator { background:var(--surface-subtle); border-right:1px solid var(--border); padding:16px 12px; overflow:auto; }
+.project-navigator h2 { font-size:12px; text-transform:uppercase; letter-spacing:1px; color:var(--text-muted); margin:10px 0; }
+.navigator-actions { display:flex; gap:6px; margin-bottom:10px; }
+.navigator-actions button { font-size:11px; }
+.project-navigator .navigator-item { display:block; width:100%; text-align:left; border:0; background:transparent; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin:3px 0; font-size:12px; }
+.project-navigator .navigator-item[aria-pressed="true"] { background:var(--accent-soft); color:var(--accent); }
+.item-actions { margin-top:24px; padding-top:16px; border-top:1px solid var(--border); display:flex; flex-direction:column; gap:6px; }
+.project-main { display:flex; flex-direction:column; min-width:0; min-height:0; }
+.project-tabs { display:flex; overflow-x:auto; flex-shrink:0; background:var(--surface); border-bottom:1px solid var(--border); min-height:37px; }
+.project-tabs > div { display:flex; flex-shrink:0; border-right:1px solid var(--border); }
+.project-tabs > div.selected { box-shadow:inset 0 -2px var(--accent); background:var(--accent-soft); }
+.project-tabs button { background:transparent; border:0; border-radius:0; font-size:12px; }
+.project-main .document-tabs { display:none; }
+.empty-workspace { display:flex; align-items:center; justify-content:center; flex-direction:column; flex:1; color:var(--text-muted); gap:12px; min-height:240px; }
+.empty-workspace h1,.empty-workspace h2 { font-size:24px; color:var(--text); margin:0; }
+.empty-workspace button { margin:4px; }
+.script-host { flex:1; min-height:0; }
+.project-script { height:100%; display:flex; flex-direction:column; min-height:0; background:var(--surface); }
+.script-toolbar { display:flex; align-items:center; flex-wrap:wrap; gap:10px; padding:12px; border-bottom:1px solid var(--border); font-size:12px; }
+.script-toolbar label { display:flex; align-items:center; gap:8px; }
+.script-toolbar span { color:var(--text-muted); }
+.project-code { flex:1; min-height:120px; overflow:auto; }
+.project-code .python-macro-editor { height:100%; }
+.project-output { height:32%; min-height:160px; max-height:55%; overflow:auto; resize:vertical; border-top:1px solid var(--border); }
+.project-output pre { white-space:pre-wrap; }
+.shell-error { background:var(--surface); color:var(--error); border-bottom:1px solid var(--border); padding:8px 16px; margin:0; white-space:pre-wrap; font-size:13px; }
+.shell-error button { float:right; border:0; background:transparent; }
+.unsaved-dialog input { width:100%; padding:10px; background:var(--control-background); border:1px solid var(--border-control); border-radius:6px; }
+.project-space .primary { background:var(--accent); color:var(--surface); border-color:var(--accent); }
+.project-space .danger { color:var(--error); }
+@media(max-width:1050px) { .space-title { display:none; } .project-space { grid-template-columns:190px minmax(0,1fr); } .home-screen { padding:32px; } }
+.project-main .app-shell { grid-template-rows:auto minmax(0,1fr) 30px; }

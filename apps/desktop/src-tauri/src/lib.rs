@@ -1,10 +1,13 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     fs,
     path::{Path, PathBuf},
 };
+use tauri::{Emitter, Manager};
 
 mod python_macros;
 mod session;
+use session::projects;
 
 fn rename_document_path(path: &Path, new_name: &str) -> Result<PathBuf, String> {
     if new_name.is_empty()
@@ -29,8 +32,14 @@ fn rename_document_path(path: &Path, new_name: &str) -> Result<PathBuf, String> 
     Ok(destination)
 }
 
+#[derive(Default)]
+struct ExitPermission(AtomicBool);
+
 #[tauri::command]
 fn exit_application(app: tauri::AppHandle) {
+    app.state::<ExitPermission>()
+        .0
+        .store(true, Ordering::Release);
     app.exit(0);
 }
 
@@ -38,10 +47,45 @@ fn exit_application(app: tauri::AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(ExitPermission::default())
         .manage(session::WorkspaceState::default())
         .manage(python_macros::PythonRuntimeState::default())
+        .menu(|app| {
+            let menu = tauri::menu::Menu::default(app)?;
+            // macOS's predefined Quit sends terminate: directly. Route our own
+            // Quit item through the same save/discard flow as window closing.
+            #[cfg(target_os = "macos")]
+            if let Some(tauri::menu::MenuItemKind::Submenu(application)) = menu.items()?.first() {
+                if let Some(index) = application.items()?.len().checked_sub(1) {
+                    application.remove_at(index)?;
+                }
+                application.append(&tauri::menu::MenuItem::with_id(
+                    app,
+                    "tablune-quit",
+                    "Quit Tablune Sheets",
+                    true,
+                    Some("CmdOrCtrl+Q"),
+                )?)?;
+            }
+            Ok(menu)
+        })
+        .on_menu_event(|app, event| {
+            if event.id().as_ref() == "tablune-quit" {
+                let _ = app.emit("tablune-request-exit", ());
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             exit_application,
+            projects::project_new,
+            projects::project_open,
+            projects::project_save,
+            projects::project_action,
+            projects::project_close,
+            projects::project_export_table,
+            projects::recent_files,
+            projects::recent_remove,
+            python_macros::project_python_preview,
+            python_macros::project_python_result,
             session::workspace_summary,
             session::workspace_reorder,
             session::session_summary,
@@ -77,8 +121,16 @@ pub fn run() {
             python_macros::python_cancel_macro,
             python_macros::python_apply_preview
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Tablune Sheets");
+        .build(tauri::generate_context!())
+        .expect("error while building Tablune Sheets")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event
+                && !app.state::<ExitPermission>().0.load(Ordering::Acquire)
+            {
+                api.prevent_exit();
+                let _ = app.emit("tablune-request-exit", ());
+            }
+        });
 }
 
 #[cfg(test)]

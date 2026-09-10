@@ -7,6 +7,8 @@ export interface Selection {
 }
 
 export interface DocumentSummary {
+  projectId?: number | null;
+  view?: ViewState;
   documentId: DocumentId;
   path: string | null;
   displayName: string;
@@ -29,6 +31,7 @@ export interface DocumentSummary {
 }
 
 export interface WorkspaceSummary {
+  projects?: ProjectSummary[];
   documents: DocumentSummary[];
 }
 
@@ -192,3 +195,16 @@ export interface MacroPreview {
   stderr: string;
   samples: MacroChangeSample[];
 }
+
+export interface ScriptSummary { id: string; name: string; code: string; revision: number; inputTableId: string | null }
+export interface ProjectTableSummary { id: string; document: DocumentSummary }
+export interface ProjectSummary { projectId: number; persistentId: string; name: string; path: string | null; dirty: boolean; revision: string; tables: ProjectTableSummary[]; scripts: ScriptSummary[] }
+export interface RecentFile { path: string; kind: "csv" | "project" }
+export type ProjectAction =
+  | { kind: "newTable" | "newScript" }
+  | { kind: "importTable"; path: string }
+  | { kind: "renameTable"; tableId: string; name: string }
+  | { kind: "duplicateTable" | "deleteTable"; tableId: string }
+  | { kind: "importScript"; name: string; code: string }
+  | { kind: "updateScript"; scriptId: string; name: string; code: string; inputTableId: string | null; expectedRevision: number }
+  | { kind: "deleteScript"; scriptId: string };

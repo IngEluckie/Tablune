@@ -1,3 +1,5 @@
+#[path = "projects.rs"]
+pub mod projects;
 use std::{
     borrow::Cow,
     cmp::Ordering,
@@ -22,6 +24,7 @@ const HISTORY_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_HISTORY_BYTES: usize = HISTORY_BYTES;
 static NEXT_SESSION_IDENTITY: AtomicU64 = AtomicU64::new(1);
 static NEXT_ATOMIC_WRITE: AtomicU64 = AtomicU64::new(1);
+static WORKSPACE_RECOVERY_IO: Mutex<()> = Mutex::new(());
 
 fn next_session_identity() -> u64 {
     NEXT_SESSION_IDENTITY.fetch_add(1, AtomicOrdering::Relaxed)
@@ -30,6 +33,8 @@ fn next_session_identity() -> u64 {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentSummary {
+    pub project_id: Option<u64>,
+    pub view: ViewState,
     pub document_id: u64,
     pub path: Option<String>,
     pub display_name: String,
@@ -318,6 +323,7 @@ enum StoredRecoveryPayload {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceSummary {
+    pub projects: Vec<projects::ProjectSummary>,
     pub documents: Vec<DocumentSummary>,
 }
 
@@ -378,6 +384,8 @@ struct ColumnStateChange {
 }
 
 pub struct DocumentSession {
+    project_id: Option<u64>,
+    title: Option<String>,
     document: TableDocument,
     path: Option<PathBuf>,
     dialect: CsvDialect,
@@ -417,6 +425,8 @@ impl Default for DocumentSession {
             view: ViewState::default(),
             visible_rows: Vec::new(),
             identity: next_session_identity(),
+            project_id: None,
+            title: None,
         };
         session.rebuild_view();
         session
@@ -519,6 +529,8 @@ impl DocumentSession {
             view: ViewState::default(),
             visible_rows: Vec::new(),
             identity: next_session_identity(),
+            project_id: None,
+            title: None,
         };
         session.rebuild_view();
         session
@@ -544,6 +556,8 @@ impl DocumentSession {
             view: ViewState::default(),
             visible_rows: Vec::new(),
             identity: next_session_identity(),
+            project_id: None,
+            title: None,
         };
         session.rebuild_view();
         session
@@ -553,16 +567,19 @@ impl DocumentSession {
         let header_names = self.header_names();
         DocumentSummary {
             document_id: self.identity,
+            project_id: self.project_id,
+            view: self.view.clone(),
             path: self
                 .path
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
-            display_name: self
-                .path
-                .as_ref()
-                .and_then(|path| path.file_name())
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Untitled.csv".to_string()),
+            display_name: self.title.clone().unwrap_or_else(|| {
+                self.path
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Untitled.csv".to_string())
+            }),
             delimiter: char::from(self.dialect.delimiter).to_string(),
             line_ending: self.dialect.line_ending,
             revision: self.revision,
@@ -1386,6 +1403,7 @@ impl DocumentSession {
 pub(crate) type DocumentHandle = Arc<Mutex<DocumentSession>>;
 
 pub struct WorkspaceState {
+    projects: Mutex<Vec<Arc<projects::ProjectHandle>>>,
     documents: Mutex<Vec<DocumentHandle>>,
     last_recovery: Mutex<Option<RecoveryFingerprint>>,
 }
@@ -1393,7 +1411,8 @@ pub struct WorkspaceState {
 impl Default for WorkspaceState {
     fn default() -> Self {
         Self {
-            documents: Mutex::new(vec![Arc::new(Mutex::new(DocumentSession::default()))]),
+            documents: Mutex::new(Vec::new()),
+            projects: Mutex::new(Vec::new()),
             last_recovery: Mutex::new(None),
         }
     }
@@ -1420,15 +1439,13 @@ pub(crate) fn document_handle(
     state: &WorkspaceState,
     document_id: u64,
 ) -> Result<DocumentHandle, String> {
-    lock_workspace(state)?
-        .iter()
-        .find(|handle| {
-            lock_document(handle)
-                .map(|session| session.identity == document_id)
-                .unwrap_or(false)
-        })
-        .cloned()
-        .ok_or_else(|| format!("document {document_id} is not open"))
+    let handles = lock_workspace(state)?.clone();
+    for handle in handles {
+        if lock_document(&handle)?.identity == document_id {
+            return Ok(handle);
+        }
+    }
+    projects::find_document(state, document_id)
 }
 
 fn workspace_summary_value(state: &WorkspaceState) -> Result<WorkspaceSummary, String> {
@@ -1437,7 +1454,10 @@ fn workspace_summary_value(state: &WorkspaceState) -> Result<WorkspaceSummary, S
         .iter()
         .map(|handle| Ok(lock_document(handle)?.summary()))
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(WorkspaceSummary { documents })
+    Ok(WorkspaceSummary {
+        documents,
+        projects: projects::summaries(state)?,
+    })
 }
 
 fn reorder_documents_internal(
@@ -1646,6 +1666,8 @@ fn session_from_recovery(payload: RecoveryPayload) -> DocumentSession {
         view: ViewState::default(),
         visible_rows: Vec::new(),
         identity: next_session_identity(),
+        project_id: None,
+        title: None,
     };
     session.rebuild_view();
     session
@@ -1656,6 +1678,9 @@ fn write_workspace_recovery_internal(
     state: &WorkspaceState,
     excluded_document_id: Option<u64>,
 ) -> Result<(), String> {
+    let _io = WORKSPACE_RECOVERY_IO
+        .lock()
+        .map_err(|_| "Recovery writer unavailable")?;
     let path = recovery_path(app)?;
     let candidate = workspace_recovery_fingerprint(state, excluded_document_id)?;
     if recovery_is_current(state, &candidate)? {
@@ -1704,6 +1729,7 @@ fn ensure_path_available(
     path: &Path,
     document_id: u64,
 ) -> Result<(), String> {
+    projects::ensure_not_project_path(state, path)?;
     if find_document_by_path(state, path, Some(document_id))?.is_some() {
         Err("another open document already uses that path".to_string())
     } else {
@@ -1772,8 +1798,12 @@ fn close_document_internal(
 }
 
 #[tauri::command]
-pub fn workspace_summary(state: State<'_, WorkspaceState>) -> Result<WorkspaceSummary, String> {
-    workspace_summary_value(&state)
+pub async fn workspace_summary(app: AppHandle) -> Result<WorkspaceSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace_summary_value(&app.state::<WorkspaceState>())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1807,7 +1837,9 @@ pub fn session_open(
     path: String,
 ) -> Result<DocumentSummary, String> {
     let path_buf = PathBuf::from(&path);
+    projects::ensure_not_project_path(&state, &path_buf)?;
     if let Some(handle) = find_document_by_path(&state, &path_buf, None)? {
+        projects::remember(&app, &path, "csv");
         return Ok(lock_document(&handle)?.summary());
     }
     let file = tablune_csv::read_path(&path_buf).map_err(|error| error.to_string())?;
@@ -1817,6 +1849,7 @@ pub fn session_open(
         .cloned()
         .unwrap_or_default();
     if let Some(handle) = find_document_by_path(&state, &path_buf, None)? {
+        projects::remember(&app, &path, "csv");
         return Ok(lock_document(&handle)?.summary());
     }
     let handle = Arc::new(Mutex::new(DocumentSession::from_file(
@@ -1826,6 +1859,7 @@ pub fn session_open(
     )));
     let summary = lock_document(&handle)?.summary();
     lock_workspace(&state)?.push(handle);
+    projects::remember(&app, &path, "csv");
     Ok(summary)
 }
 
@@ -1837,6 +1871,9 @@ pub fn session_close(
     discard_unsaved: bool,
 ) -> Result<WorkspaceSummary, String> {
     let handle = document_handle(&state, document_id)?;
+    if lock_document(&handle)?.project_id.is_some() {
+        return Err("Use the project commands for this table".into());
+    }
     if lock_document(&handle)?.summary().dirty && !discard_unsaved {
         return Err("save or explicitly discard this document before closing it".to_string());
     }
@@ -1853,6 +1890,9 @@ pub fn session_save(
     path: Option<String>,
 ) -> Result<DocumentSummary, String> {
     let handle = document_handle(&state, document_id)?;
+    if lock_document(&handle)?.project_id.is_some() {
+        return Err("Use the project commands for this table".into());
+    }
     let destination = {
         let session = lock_document(&handle)?;
         path.map(PathBuf::from)
@@ -1871,6 +1911,9 @@ pub fn session_save(
     if let Err(error) = write_workspace_recovery_internal(&app, &state, None) {
         report_nonfatal("refreshing recovery after save", &error);
     }
+    if let Some(path) = &summary.path {
+        projects::remember(&app, path, "csv");
+    }
     Ok(summary)
 }
 
@@ -1881,6 +1924,9 @@ pub fn session_duplicate(
     document_id: u64,
 ) -> Result<WorkspaceSummary, String> {
     let source_handle = document_handle(&state, document_id)?;
+    if lock_document(&source_handle)?.project_id.is_some() {
+        return Err("Use the project commands for this table".into());
+    }
     let source_path = lock_document(&source_handle)?
         .path
         .clone()
@@ -1926,6 +1972,9 @@ pub fn session_rename(
     new_name: String,
 ) -> Result<DocumentSummary, String> {
     let handle = document_handle(&state, document_id)?;
+    if lock_document(&handle)?.project_id.is_some() {
+        return Err("Use the project commands for this table".into());
+    }
     let source = lock_document(&handle)?
         .path
         .clone()
@@ -2019,6 +2068,9 @@ pub fn session_set_view(
     let handle = document_handle(&state, document_id)?;
     let mut session = lock_document(&handle)?;
     session.view = view;
+    if session.project_id.is_some() {
+        session.revision += 1;
+    }
     session.rebuild_view();
     Ok(session.summary())
 }
@@ -2040,6 +2092,9 @@ pub fn session_set_header(
             &session.column_types,
         )?;
         session.header_enabled = enabled;
+        if session.project_id.is_some() {
+            session.revision += 1;
+        }
         session.header_suggested = false;
         session.view = ViewState::default();
         session.rebuild_view();
@@ -2073,6 +2128,9 @@ pub fn session_set_column_type(
             &column_types,
         )?;
         session.column_types = column_types;
+        if session.project_id.is_some() {
+            session.revision += 1;
+        }
         session.rebuild_view();
         session.summary()
     };
@@ -2135,6 +2193,7 @@ pub fn session_export_view(
     document_id: u64,
     path: String,
 ) -> Result<(), String> {
+    ensure_path_available(&state, Path::new(&path), 0)?;
     let handle = document_handle(&state, document_id)?;
     let session = lock_document(&handle)?;
     let mut rows =
@@ -2153,16 +2212,19 @@ pub fn session_export_view(
 }
 
 #[tauri::command]
-pub fn workspace_write_recovery(
-    app: AppHandle,
-    state: State<'_, WorkspaceState>,
-) -> Result<(), String> {
-    write_workspace_recovery_internal(&app, &state, None)
+pub async fn workspace_write_recovery(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<WorkspaceState>();
+        write_workspace_recovery_internal(&app, &state, None)?;
+        projects::write_recovery(&app, &state)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub fn workspace_recovery_available(app: AppHandle) -> Result<bool, String> {
-    Ok(recovery_path(&app)?.exists())
+    Ok(recovery_path(&app)?.exists() || projects::recovery_path(&app)?.exists())
 }
 
 #[tauri::command]
@@ -2170,6 +2232,11 @@ pub fn workspace_restore_recovery(
     app: AppHandle,
     state: State<'_, WorkspaceState>,
 ) -> Result<WorkspaceSummary, String> {
+    let restored_projects = projects::read_recovery(&app)?;
+    if !recovery_path(&app)?.exists() {
+        projects::restore_projects(&state, restored_projects)?;
+        return workspace_summary_value(&state);
+    }
     let stored: StoredRecoveryPayload = read_json(&recovery_path(&app)?)?;
     let payloads = match stored {
         StoredRecoveryPayload::Workspace(payload) => {
@@ -2184,6 +2251,7 @@ pub fn workspace_restore_recovery(
         .into_iter()
         .map(|payload| Arc::new(Mutex::new(session_from_recovery(payload))))
         .collect();
+    projects::restore_projects(&state, restored_projects)?;
     *lock_workspace(&state)? = documents;
     reset_recovery_fingerprint(&state)?;
     workspace_summary_value(&state)
@@ -2194,6 +2262,10 @@ pub fn workspace_discard_recovery(
     app: AppHandle,
     state: State<'_, WorkspaceState>,
 ) -> Result<(), String> {
+    let _io = WORKSPACE_RECOVERY_IO
+        .lock()
+        .map_err(|_| "Recovery writer unavailable")?;
+    projects::discard_recovery(&app)?;
     remove_if_exists(&recovery_path(&app)?).map_err(|error| error.to_string())?;
     reset_recovery_fingerprint(&state)
 }
@@ -2666,6 +2738,7 @@ mod tests {
     fn workspace_documents_keep_independent_history_and_views() {
         let workspace = WorkspaceState {
             documents: Mutex::new(Vec::new()),
+            projects: Mutex::new(Vec::new()),
             last_recovery: Mutex::new(None),
         };
         let first_id = add_session(&workspace, DocumentSession::default());
@@ -2714,7 +2787,7 @@ mod tests {
     #[test]
     fn workspace_close_requires_explicit_discard_and_rejects_unknown_ids() {
         let workspace = WorkspaceState::default();
-        let document_id = workspace_summary_value(&workspace).unwrap().documents[0].document_id;
+        let document_id = add_session(&workspace, DocumentSession::default());
         let handle = document_handle(&workspace, document_id).unwrap();
         lock_document(&handle)
             .unwrap()
@@ -2745,6 +2818,7 @@ mod tests {
     fn workspace_reorder_requires_the_exact_open_document_set() {
         let workspace = WorkspaceState {
             documents: Mutex::new(Vec::new()),
+            projects: Mutex::new(Vec::new()),
             last_recovery: Mutex::new(None),
         };
         let first_id = add_session(&workspace, DocumentSession::default());
@@ -2795,6 +2869,7 @@ mod tests {
         let document_id = session.identity;
         let workspace = WorkspaceState {
             documents: Mutex::new(vec![Arc::new(Mutex::new(session))]),
+            projects: Mutex::new(Vec::new()),
             last_recovery: Mutex::new(None),
         };
 
@@ -2850,6 +2925,7 @@ mod tests {
                 Arc::new(Mutex::new(dirty)),
                 Arc::new(Mutex::new(second_dirty)),
             ]),
+            projects: Mutex::new(Vec::new()),
             last_recovery: Mutex::new(None),
         };
         let workspace = workspace_recovery_payload(&state, None).unwrap().unwrap();
@@ -2885,6 +2961,7 @@ mod tests {
         let handle = Arc::new(Mutex::new(dirty));
         let state = WorkspaceState {
             documents: Mutex::new(vec![handle.clone()]),
+            projects: Mutex::new(Vec::new()),
             last_recovery: Mutex::new(None),
         };
 

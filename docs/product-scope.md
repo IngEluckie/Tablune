@@ -1,10 +1,17 @@
-# CSV editor and explorer product scope
+# Tablune 0.4 product scope
 
 ## Product statement
 
-Tablune Sheets 0.3 is a desktop editor and non-destructive explorer for delimited text files. It is not a general spreadsheet application.
+Tablune Sheets 0.4 is a desktop CSV editor and a persistent local workspace for data projects. It is not a general spreadsheet application.
 
 ## Included
+
+- Home, recent files, and multiple simultaneously open project/CSV spaces
+- Self-contained, versioned `.tablune` project files with atomic saving
+- Project tables and Python scripts with independent central editor tabs
+- Script input selection and reusable preview-to-result-table workflow
+- Project-wide dirty protection and recovery, including script-only changes
+- CSV-to-project copying and table/script import and export
 
 - New document
 - Duplicate the current document beside its source without changing the active tab
@@ -34,7 +41,8 @@ Tablune Sheets 0.3 is a desktop editor and non-destructive explorer for delimite
 
 - Formulas and calculation engine
 - Styling and number formats
-- Multiple worksheets
+- Excel workbook/worksheet compatibility
+- Formula engines, transformation pipelines, and linked external sources
 - XLSX import or export
 - Charts and pivot tables
 - Sandboxed macros, package installation, and managed Python environments

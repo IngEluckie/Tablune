@@ -3,7 +3,7 @@
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import App from "./App";
+import App from "./CsvWorkspace";
 import {
   applySessionEdit,
   closeSession,
@@ -414,18 +414,16 @@ describe("App multidocument tabs", () => {
     expect(screen.getByTestId("grid").getAttribute("data-document-id")).toBe("2");
   });
 
-  it("creates a replacement before closing the last clean tab", async () => {
-    const replacement = summary(2, "Untitled.csv", false, null);
-    vi.mocked(newSession).mockResolvedValue(replacement);
-    vi.mocked(closeSession).mockResolvedValue({ documents: [replacement] });
+  it("closes the last clean tab without creating another document", async () => {
+    vi.mocked(closeSession).mockResolvedValue({ documents: [] });
     render(<App />);
     await screen.findByRole("tab", { name: "first.csv" });
 
     fireEvent.click(screen.getByRole("button", { name: "Close first.csv" }));
 
     await waitFor(() => expect(closeSession).toHaveBeenCalledWith(1, false));
-    expect(newSession).toHaveBeenCalledOnce();
-    expect(screen.getByTestId("grid").getAttribute("data-document-id")).toBe("2");
+    expect(newSession).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("grid")).toBeNull();
   });
 
   it("offers one application-close dialog for every dirty document", async () => {

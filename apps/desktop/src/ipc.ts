@@ -75,3 +75,14 @@ export const previewPythonMacro = (documentId: DocumentId, code: string, sourceP
 export const cancelPythonMacro = () => invoke<boolean>("python_cancel_macro");
 export const applyPythonPreview = (documentId: DocumentId, previewId: string, expectedRevision: number) =>
   invoke<DocumentSummary>("python_apply_preview", { documentId, previewId, expectedRevision });
+
+export const newProject = (name: string, sourceDocumentId: number | null = null) => invoke<import("./types").ProjectSummary>("project_new", { name, sourceDocumentId });
+export const openProject = (path: string) => invoke<import("./types").ProjectSummary>("project_open", { path });
+export const saveProject = (projectId: number, path: string) => invoke<import("./types").ProjectSummary>("project_save", { projectId, path });
+export const projectAction = (projectId: number, action: import("./types").ProjectAction) => invoke<import("./types").ProjectSummary>("project_action", { projectId, action });
+export const closeProject = (projectId: number, discardUnsaved: boolean) => invoke<void>("project_close", { projectId, discardUnsaved });
+export const exportProjectTable = (documentId: number, path: string) => invoke<void>("project_export_table", { documentId, path });
+export const getRecentFiles = () => invoke<import("./types").RecentFile[]>("recent_files");
+export const removeRecentFile = (path: string) => invoke<void>("recent_remove", { path });
+export const previewProjectScript = (projectId: number, scriptId: string) => invoke<MacroPreview>("project_python_preview", { projectId, scriptId });
+export const createProjectResult = (projectId: number, scriptId: string, previewId: string) => invoke<import("./types").ProjectSummary>("project_python_result", { projectId, scriptId, previewId });

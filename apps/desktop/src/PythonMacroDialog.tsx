@@ -1,3 +1,4 @@
+import MacroPreviewResults from "./MacroPreviewResults";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import { join } from "@tauri-apps/api/path";
 import { Suspense, lazy, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -57,11 +58,6 @@ function fileName(path: string | null): string {
   return path.split(/[\\/]/).pop() || path;
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
-}
 
 export default function PythonMacroPanel({
   summary,
@@ -566,34 +562,7 @@ export default function PythonMacroPanel({
             {running && <p>Running Python macro…</p>}
             {!running && !preview && <p>Run the macro to preview changes. The document will not be modified.</p>}
             {preview && (
-              <>
-                <div className="macro-metrics">
-                  <span>Rows <strong>{preview.rowsBefore.toLocaleString()} → {preview.rowsAfter.toLocaleString()}</strong></span>
-                  <span>Columns <strong>{preview.columnsBefore} → {preview.columnsAfter}</strong></span>
-                  <span>Changed cells <strong>{preview.changedCells.toLocaleString()}</strong></span>
-                  <span>Undo <strong>{formatBytes(preview.estimatedUndoBytes)}</strong></span>
-                  {preview.headerChanged && <span>Header changed</span>}
-                </div>
-                {(preview.blockedReason || previewStale) && (
-                  <p className="macro-warning">{previewStale ? "The document changed; run Preview again." : preview.blockedReason}</p>
-                )}
-                {preview.samples.length > 0 && (
-                  <div className="macro-samples-scroll">
-                    <table className="macro-samples">
-                      <thead><tr><th>Cell</th><th>Before</th><th>After</th></tr></thead>
-                      <tbody>
-                        {preview.samples.map((sample) => (
-                          <tr key={`${sample.row}:${sample.column}`}>
-                            <th>R{sample.row + 1} C{sample.column + 1}</th>
-                            <td>{sample.before ?? "∅"}</td>
-                            <td>{sample.after ?? "∅"}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </>
+              <MacroPreviewResults preview={preview} stale={previewStale} />
             )}
           </div>
         ) : (

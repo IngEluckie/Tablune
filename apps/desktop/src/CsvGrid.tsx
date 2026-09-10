@@ -671,7 +671,9 @@ export default function CsvGrid({
 
   useEffect(() => {
     const handleCommand = (event: Event) => {
-      const command = (event as CustomEvent<string>).detail;
+      const detail = (event as CustomEvent<string | { command: string; documentId: number }>).detail;
+      if (typeof detail !== "string" && detail.documentId !== summary.documentId) return;
+      const command = typeof detail === "string" ? detail : detail.command;
       if (readOnly && command !== "copy") return;
       const operation = command === "copy" ? copySelection : command === "cut" ? cutSelection : pasteSelection;
       void operation().catch((reason) => onError(String(reason)));

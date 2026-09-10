@@ -1,824 +1,783 @@
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { useEffect, useState } from "react";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import CsvGrid, { normalizeSelection } from "./CsvGrid";
-import DocumentTabs from "./DocumentTabs";
-import ExplorerPanel from "./ExplorerPanel";
-import PythonMacroPanel from "./PythonMacroDialog";
-import SearchBar from "./SearchBar";
-import RibbonHeader from "./RibbonHeader";
-import UnsavedChangesDialog from "./UnsavedChangesDialog";
-import { readThemePreference, writeThemePreference, type ThemeMode } from "./theme";
-import {
-  applySessionEdit,
-  closeSession,
-  discardRecovery,
-  duplicateSession,
-  exitApplication,
-  exportSessionView,
-  getSessionSummary,
-  getWorkspaceSummary,
-  newSession,
-  openSession,
-  recoveryAvailable,
-  redoSession,
-  renameSession,
-  reorderWorkspace,
-  restoreRecovery,
-  saveSession,
-  setSessionColumnType,
-  setSessionHeader,
-  setSessionView,
-  undoSession,
-  writeWorkspaceRecovery,
-} from "./ipc";
-import type {
-  ColumnType,
-  DocumentId,
-  DocumentSummary,
-  EditCommand,
-  GridSizingState,
-  GridViewportState,
-  SearchMatch,
-  SelectionRange,
-  ViewState,
-} from "./types";
-
-const EMPTY_SUMMARY: DocumentSummary = {
-  documentId: 0,
-  path: null,
-  displayName: "Untitled.csv",
-  delimiter: ",",
-  lineEnding: "lf",
-  revision: 0,
-  viewRevision: 0,
-  dirty: false,
-  rowCount: 0,
-  columnCount: 0,
-  visibleRowCount: 0,
-  headerEnabled: false,
-  headerSuggested: false,
-  headerNames: [],
-  headerValues: [],
-  canUndo: false,
-  canRedo: false,
-  filtersActive: false,
-  sortCount: 0,
-};
-
-const EMPTY_VIEW: ViewState = { sorts: [], filters: [] };
-const EMPTY_SELECTION: SelectionRange = {
-  anchor: { row: 0, column: 0 },
-  focus: { row: 0, column: 0 },
-  mode: "cells",
-};
-const EMPTY_VIEWPORT: GridViewportState = { scrollTop: 0, scrollLeft: 0 };
-
-interface TabUiState {
-  view: ViewState;
-  selection: SelectionRange;
-  viewport: GridViewportState;
-  sizing: GridSizingState;
-}
-
-type UnsavedRequest =
-  | { kind: "document"; documentId: DocumentId }
-  | { kind: "application" };
-
-function emptyTabUiState(): TabUiState {
-  return {
-    view: { sorts: [], filters: [] },
-    selection: {
-      anchor: { ...EMPTY_SELECTION.anchor },
-      focus: { ...EMPTY_SELECTION.focus },
-      mode: "cells",
-    },
-    viewport: { ...EMPTY_VIEWPORT },
-    sizing: { columnWidths: {}, rowHeights: {} },
-  };
-}
-
-function selectedPaths(value: string | string[] | null): string[] {
-  if (typeof value === "string") return [value];
-  return value ?? [];
-}
-
-function shortPath(path: string): string {
-  return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
-}
+import CsvWorkspace from "./CsvWorkspace";
+import ProjectScriptEditor from "./ProjectScriptEditor";
+import { useWorkspace, type ProjectTab } from "./useWorkspace";
+import { readThemePreference, writeThemePreference } from "./theme";
+import * as ipc from "./ipc";
+import type { DocumentSummary, ProjectSummary } from "./types";
 
 export default function App() {
-  const [documents, setDocuments] = useState<DocumentSummary[]>([]);
-  const [activeDocumentId, setActiveDocumentId] = useState<DocumentId>(0);
-  const [tabUiStates, setTabUiStates] = useState<Record<DocumentId, TabUiState>>({});
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [searchOpen, setSearchOpen] = useState(false);
-  const [explorerOpen, setExplorerOpen] = useState(false);
-  const [macroOpen, setMacroOpen] = useState(false);
-  const [macroTrustAcknowledged, setMacroTrustAcknowledged] = useState(false);
-  const [theme, setTheme] = useState<ThemeMode>(readThemePreference);
-  const [reveal, setReveal] = useState<{ viewRow: number; column: number; nonce: number } | null>(null);
-  const [unsavedRequest, setUnsavedRequest] = useState<UnsavedRequest | null>(null);
-  const [unsavedWorking, setUnsavedWorking] = useState(false);
-  const [unsavedError, setUnsavedError] = useState<string | null>(null);
-  const documentsRef = useRef<DocumentSummary[]>([]);
-  const activeDocumentIdRef = useRef<DocumentId>(0);
-  const closingInProgress = useRef(false);
-  const lastRecovery = useRef(0);
-  const restoreExplorerAfterMacro = useRef(false);
-
-  const summary = documents.find((document) => document.documentId === activeDocumentId) ?? EMPTY_SUMMARY;
-  const tabUi = tabUiStates[activeDocumentId] ?? emptyTabUiState();
-  const hasCustomSizing = Object.keys(tabUi.sizing.columnWidths).length > 0
-    || Object.keys(tabUi.sizing.rowHeights).length > 0;
-  const interactionsLocked = busy || macroOpen || unsavedRequest !== null;
-
-  const commitDocuments = useCallback((next: DocumentSummary[]) => {
-    documentsRef.current = next;
-    setDocuments(next);
-    setTabUiStates((current) => {
-      const updated = { ...current };
-      for (const document of next) updated[document.documentId] ??= emptyTabUiState();
-      return updated;
-    });
-  }, []);
-
-  const updateDocument = useCallback((next: DocumentSummary) => {
-    const current = documentsRef.current;
-    const index = current.findIndex((document) => document.documentId === next.documentId);
-    if (index < 0) return;
-    const updated = [...current];
-    updated[index] = next;
-    commitDocuments(updated);
-  }, [commitDocuments]);
-
-  const registerDocument = useCallback((next: DocumentSummary) => {
-    const current = documentsRef.current;
-    const index = current.findIndex((document) => document.documentId === next.documentId);
-    if (index < 0) commitDocuments([...current, next]);
-    else {
-      const updated = [...current];
-      updated[index] = next;
-      commitDocuments(updated);
-    }
-  }, [commitDocuments]);
-
-  const updateTabUi = useCallback((documentId: DocumentId, update: (current: TabUiState) => TabUiState) => {
-    setTabUiStates((current) => ({
-      ...current,
-      [documentId]: update(current[documentId] ?? emptyTabUiState()),
-    }));
-  }, []);
-
-  const clearSizing = useCallback((documentId: DocumentId, axis: "rows" | "columns" | "both") => {
-    updateTabUi(documentId, (current) => ({
-      ...current,
-      sizing: {
-        columnWidths: axis === "columns" || axis === "both" ? {} : current.sizing.columnWidths,
-        rowHeights: axis === "rows" || axis === "both" ? {} : current.sizing.rowHeights,
-      },
-    }));
-  }, [updateTabUi]);
-
-  const runHistoryCommand = useCallback(async (
-    documentId: DocumentId,
-    command: typeof undoSession | typeof redoSession,
-  ) => {
-    try {
-      updateDocument(await command(documentId));
-      clearSizing(documentId, "both");
-    } catch (reason) {
-      if (activeDocumentIdRef.current === documentId) setError(String(reason));
-    }
-  }, [clearSizing, updateDocument]);
-
-  const activateDocument = useCallback((documentId: DocumentId) => {
-    if (!documentsRef.current.some((document) => document.documentId === documentId)) return;
-    activeDocumentIdRef.current = documentId;
-    setActiveDocumentId(documentId);
-    setSearchOpen(false);
-    setExplorerOpen(false);
-    setMacroOpen(false);
-    setReveal(null);
-  }, []);
-
-  const handleActiveDocumentError = useCallback((documentId: DocumentId, message: string) => {
-    if (activeDocumentIdRef.current === documentId) setError(message);
-  }, []);
-
-  const changeTheme = useCallback((nextTheme: ThemeMode) => {
-    setTheme(nextTheme);
-    writeThemePreference(nextTheme);
-  }, []);
-
+  const w = useWorkspace();
+  const [theme, setTheme] = useState(readThemePreference);
+  const [nameRequest, setNameRequest] = useState<{
+    title: string;
+    value: string;
+    resolve: (value: string | null) => void;
+  } | null>(null);
+  const requestName = (title: string, value: string) =>
+    new Promise<string | null>((resolve) =>
+      setNameRequest({ title, value, resolve }),
+    );
+  const project = w.workspace.projects?.find((p) => p.projectId === w.space);
+  const changeTheme = (next: typeof theme) => {
+    setTheme(next);
+    writeThemePreference(next);
+  };
   useEffect(() => {
     document.documentElement.style.colorScheme = theme;
-    void getCurrentWindow().setTheme(theme).catch(() => {
-      // CSS theming remains available if native window theming is unsupported.
-    });
   }, [theme]);
-
-  const saveDocumentById = useCallback(async (
-    documentId: DocumentId,
-    saveAs = false,
-    suggestedName?: string,
+  const createProject = () =>
+    w.guard(async () => {
+      const name = await requestName("New project", "Untitled project");
+      if (name) await w.createProject(name);
+    });
+  const updateDocuments = (documents: DocumentSummary[]) => {
+    w.commit({ ...w.workspaceRef.current, documents });
+    if (!documents.length && w.space === "csv") w.setSpace("home");
+    void w.refreshRecents().catch(w.report);
+  };
+  const projectDocuments = (
+    p: ProjectSummary,
+    documents: DocumentSummary[],
+  ) => {
+    const current = w.workspaceRef.current.projects?.find(
+      (c) => c.projectId === p.projectId,
+    );
+    if (!current) return;
+    w.updateProject({
+      ...current,
+      dirty: true,
+      revision: `local-${Date.now()}`,
+      tables: current.tables.map((t) => ({
+        ...t,
+        document:
+          documents.find((d) => d.documentId === t.document.documentId) ??
+          t.document,
+      })),
+    });
+  };
+  const newTable = (p: ProjectSummary) =>
+    w.guard(async () => {
+      const next = await w.perform(p.projectId, { kind: "newTable" });
+      w.openTab(p.projectId, { kind: "table", id: next.tables.at(-1)!.id });
+    });
+  const newScript = (p: ProjectSummary) =>
+    w.guard(async () => {
+      const next = await w.perform(p.projectId, { kind: "newScript" });
+      w.openTab(p.projectId, { kind: "script", id: next.scripts.at(-1)!.id });
+    });
+  const importTables = (p: ProjectSummary) =>
+    w.guard(async () => {
+      const paths = await open({
+        multiple: true,
+        filters: [
+          { name: "Delimited text", extensions: ["csv", "tsv", "txt"] },
+        ],
+      });
+      const failures: string[] = [];
+      for (const path of typeof paths === "string" ? [paths] : (paths ?? [])) {
+        try {
+          const next = await w.perform(p.projectId, {
+            kind: "importTable",
+            path,
+          });
+          w.openTab(p.projectId, { kind: "table", id: next.tables.at(-1)!.id });
+        } catch (e) {
+          failures.push(`${path}: ${String(e)}`);
+        }
+      }
+      if (failures.length) throw new Error(failures.join("\n"));
+    });
+  const importScript = (p: ProjectSummary) =>
+    w.guard(async () => {
+      const path = await open({
+        multiple: false,
+        filters: [{ name: "Python script", extensions: ["py"] }],
+      });
+      if (typeof path !== "string") return;
+      const next = await w.perform(p.projectId, {
+        kind: "importScript",
+        name: path.split(/[\\/]/).at(-1) ?? "Script.py",
+        code: await ipc.readMacroScript(path),
+      });
+      w.openTab(p.projectId, { kind: "script", id: next.scripts.at(-1)!.id });
+    });
+  const renameTable = async (
+    p: ProjectSummary,
+    documentId: number,
+    name: string,
   ): Promise<boolean> => {
-    const document = documentsRef.current.find((candidate) => candidate.documentId === documentId);
-    if (!document) return false;
     try {
-      let destination = saveAs ? null : document.path;
-      if (!destination) {
-        destination = await save({
-          defaultPath: suggestedName ?? document.displayName,
-          filters: [{ name: "CSV", extensions: ["csv", "tsv", "txt"] }],
+      const table = p.tables.find((t) => t.document.documentId === documentId);
+      if (!table) return false;
+      await w.perform(p.projectId, {
+        kind: "renameTable",
+        tableId: table.id,
+        name,
+      });
+      return true;
+    } catch (e) {
+      w.report(e);
+      return false;
+    }
+  };
+  const saveProject = async (p: ProjectSummary, saveAs = false) => {
+    try {
+      return await w.saveProjectById(p.projectId, saveAs);
+    } catch (e) {
+      w.report(e);
+      return false;
+    }
+  };
+  const renameItem = (p: ProjectSummary, tab: ProjectTab) =>
+    w.guard(async () => {
+      const table = p.tables.find((t) => t.id === tab.id);
+      const script = p.scripts.find((s) => s.id === tab.id);
+      const name = await requestName(
+        tab.kind === "table" ? "Rename table" : "Rename script",
+        table?.document.displayName ?? script?.name ?? "",
+      );
+      if (!name) return;
+      if (table)
+        await w.perform(p.projectId, {
+          kind: "renameTable",
+          tableId: table.id,
+          name,
         });
+      else if (script) {
+        w.editScript(p.projectId, script.id, {
+          ...(w.drafts[`${p.projectId}:${script.id}`] ?? script),
+          name,
+        });
+        await w.flushDrafts();
       }
-      if (!destination) return false;
-      setBusy(true);
-      setError(null);
-      updateDocument(await saveSession(documentId, destination));
-      return true;
-    } catch (reason) {
-      const message = String(reason);
-      setError(message);
-      setUnsavedError(message);
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  }, [updateDocument]);
-
-  const createNew = useCallback(async () => {
-    if (busy || macroOpen || unsavedRequest) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const created = await newSession();
-      registerDocument(created);
-      activateDocument(created.documentId);
-    } catch (reason) {
-      setError(String(reason));
-    } finally {
-      setBusy(false);
-    }
-  }, [activateDocument, busy, macroOpen, registerDocument, unsavedRequest]);
-
-  const openDocuments = useCallback(async () => {
-    if (busy || macroOpen || unsavedRequest) return;
-    const paths = selectedPaths(await open({
-      multiple: true,
-      directory: false,
-      filters: [{ name: "Delimited text", extensions: ["csv", "tsv", "txt"] }],
-    }));
-    if (!paths.length) return;
-
-    setBusy(true);
-    setError(null);
-    const failures: string[] = [];
-    let firstOpenedId: DocumentId | null = null;
-    for (const path of paths) {
-      try {
-        const alreadyOpenIds = new Set(documentsRef.current.map((document) => document.documentId));
-        let opened = await openSession(path);
-        const wasAlreadyOpen = alreadyOpenIds.has(opened.documentId);
-        registerDocument(opened);
-        if (!wasAlreadyOpen && opened.headerSuggested) {
-          const enabled = await ask(`The first row in ${shortPath(path)} looks like column headers. Use it as the header?`, {
-            title: "Column headers",
-            kind: "info",
-          });
-          if (enabled) {
-            opened = await setSessionHeader(opened.documentId, true);
-            updateDocument(opened);
-          }
-        }
-        firstOpenedId ??= opened.documentId;
-      } catch (reason) {
-        failures.push(`${shortPath(path)}: ${String(reason)}`);
-      }
-    }
-    if (firstOpenedId !== null) activateDocument(firstOpenedId);
-    if (failures.length) setError(`Some files could not be opened:\n${failures.join("\n")}`);
-    setBusy(false);
-  }, [activateDocument, busy, macroOpen, registerDocument, unsavedRequest, updateDocument]);
-
-  const closeDocumentNow = useCallback(async (documentId: DocumentId, discardUnsaved: boolean) => {
-    const current = documentsRef.current;
-    const index = current.findIndex((document) => document.documentId === documentId);
-    if (index < 0) return;
-    const wasActive = activeDocumentIdRef.current === documentId;
-    let nextActiveId = wasActive
-      ? current[index + 1]?.documentId ?? current[index - 1]?.documentId ?? 0
-      : activeDocumentIdRef.current;
-
-    if (current.length === 1) {
-      const replacement = await newSession();
-      registerDocument(replacement);
-      nextActiveId = replacement.documentId;
-    }
-    const workspace = await closeSession(documentId, discardUnsaved);
-    commitDocuments(workspace.documents);
-    setTabUiStates((states) => {
-      const updated = { ...states };
-      delete updated[documentId];
-      return updated;
     });
-    if (wasActive) activateDocument(nextActiveId);
-  }, [activateDocument, commitDocuments, registerDocument]);
-
-  const requestCloseDocument = useCallback((documentId: DocumentId) => {
-    if (busy || macroOpen || unsavedRequest) return;
-    const document = documentsRef.current.find((candidate) => candidate.documentId === documentId);
-    if (!document) return;
-    if (document.dirty) {
-      setUnsavedError(null);
-      setUnsavedRequest({ kind: "document", documentId });
-      return;
-    }
-    setBusy(true);
-    void closeDocumentNow(documentId, false)
-      .catch((reason) => setError(String(reason)))
-      .finally(() => setBusy(false));
-  }, [busy, closeDocumentNow, macroOpen, unsavedRequest]);
-
-  const reorderDocuments = useCallback((documentIds: DocumentId[]) => {
-    if (busy || macroOpen || unsavedRequest) return;
-    setBusy(true);
-    void reorderWorkspace(documentIds)
-      .then((workspace) => {
-        commitDocuments(workspace.documents);
-        setError(null);
-      })
-      .catch((reason) => setError(String(reason)))
-      .finally(() => setBusy(false));
-  }, [busy, commitDocuments, macroOpen, unsavedRequest]);
-
-  const cancelUnsaved = useCallback(() => {
-    if (unsavedWorking) return;
-    setUnsavedRequest(null);
-    setUnsavedError(null);
-    closingInProgress.current = false;
-  }, [unsavedWorking]);
-
-  const saveUnsaved = useCallback(async () => {
-    const request = unsavedRequest;
-    if (!request) return;
-    setUnsavedWorking(true);
-    setUnsavedError(null);
-    if (request.kind === "document") {
-      const saved = await saveDocumentById(request.documentId);
-      if (saved) {
-        try {
-          await closeDocumentNow(request.documentId, false);
-          setUnsavedRequest(null);
-        } catch (reason) {
-          setUnsavedError(String(reason));
-        }
-      }
-      setUnsavedWorking(false);
-      return;
-    }
-
-    for (const document of documentsRef.current) {
-      const latest = documentsRef.current.find((candidate) => candidate.documentId === document.documentId);
-      if (latest?.dirty && !await saveDocumentById(document.documentId)) {
-        setUnsavedWorking(false);
+  const deleteItem = (p: ProjectSummary, tab: ProjectTab) =>
+    w.guard(async () => {
+      if (
+        !(await ask(
+          `Delete this ${tab.kind} from the project? This takes effect in the file when you save.`,
+          { title: `Delete ${tab.kind}`, kind: "warning" },
+        ))
+      )
         return;
-      }
-    }
-    try {
-      await exitApplication();
-    } catch (reason) {
-      closingInProgress.current = false;
-      setUnsavedError(String(reason));
-      setUnsavedWorking(false);
-    }
-  }, [closeDocumentNow, saveDocumentById, unsavedRequest]);
-
-  const discardUnsaved = useCallback(async () => {
-    const request = unsavedRequest;
-    if (!request) return;
-    setUnsavedWorking(true);
-    setUnsavedError(null);
-    try {
-      if (request.kind === "document") {
-        await closeDocumentNow(request.documentId, true);
-        setUnsavedRequest(null);
-        closingInProgress.current = false;
-      } else {
-        await discardRecovery();
-        await exitApplication();
-      }
-    } catch (reason) {
-      closingInProgress.current = false;
-      setUnsavedError(String(reason));
-    } finally {
-      setUnsavedWorking(false);
-    }
-  }, [closeDocumentNow, unsavedRequest]);
-
-  useEffect(() => {
-    let active = true;
-    void (async () => {
-      try {
-        let workspace = await getWorkspaceSummary();
-        if (await recoveryAvailable()) {
-          const restore = await ask("Tablune Sheets found unsaved work from the previous session. Restore it?", {
-            title: "Recover documents",
-            kind: "info",
-          });
-          if (!active) return;
-          if (restore) workspace = await restoreRecovery();
-          else await discardRecovery();
-        }
-        if (!active) return;
-        commitDocuments(workspace.documents);
-        const firstId = workspace.documents[0]?.documentId ?? 0;
-        activeDocumentIdRef.current = firstId;
-        setActiveDocumentId(firstId);
-      } catch (reason) {
-        if (active) setError(String(reason));
-      }
-    })();
-    return () => { active = false; };
-  }, [commitDocuments]);
-
-  const recoveryKey = useMemo(() => documents
-    .filter((document) => document.dirty)
-    .map((document) => `${document.documentId}:${document.revision}`)
-    .join("|"), [documents]);
-
-  useEffect(() => {
-    if (!recoveryKey) return;
-    const elapsed = Date.now() - lastRecovery.current;
-    const delay = Math.max(2_000, 10_000 - elapsed);
-    const timer = window.setTimeout(() => {
-      void writeWorkspaceRecovery()
-        .then(() => { lastRecovery.current = Date.now(); })
-        .catch((reason) => setError(String(reason)));
-    }, delay);
-    return () => window.clearTimeout(timer);
-  }, [recoveryKey]);
-
-  useEffect(() => {
-    const appWindow = getCurrentWindow();
-    let unlisten: (() => void) | undefined;
-    void appWindow.onCloseRequested(async (event) => {
-      event.preventDefault();
-      if (closingInProgress.current) return;
-      const dirtyDocuments = documentsRef.current.filter((document) => document.dirty);
-      if (!dirtyDocuments.length) {
-        closingInProgress.current = true;
-        try {
-          await exitApplication();
-        } catch (reason) {
-          closingInProgress.current = false;
-          setError(String(reason));
-        }
-        return;
-      }
-      closingInProgress.current = true;
-      setUnsavedError(null);
-      setUnsavedRequest({ kind: "application" });
-    }).then((dispose) => { unlisten = dispose; });
-    return () => unlisten?.();
-  }, []);
-
-  useEffect(() => {
-    const handleShortcuts = (event: globalThis.KeyboardEvent) => {
-      if (macroOpen || unsavedRequest || busy) return;
-      if (event.ctrlKey && event.key === "Tab") {
-        event.preventDefault();
-        const current = documentsRef.current;
-        if (!current.length) return;
-        const index = current.findIndex((document) => document.documentId === activeDocumentIdRef.current);
-        const offset = event.shiftKey ? -1 : 1;
-        activateDocument(current[(index + offset + current.length) % current.length].documentId);
-        return;
-      }
-      const modifier = event.metaKey || event.ctrlKey;
-      if (!modifier) return;
-      const key = event.key.toLowerCase();
-      if (key === "t") {
-        event.preventDefault();
-        void createNew();
-      } else if (key === "w") {
-        event.preventDefault();
-        if (activeDocumentIdRef.current) requestCloseDocument(activeDocumentIdRef.current);
-      } else if (key === "f") {
-        event.preventDefault();
-        setSearchOpen(true);
-      } else if (key === "z" || key === "y") {
-        event.preventDefault();
-        const documentId = activeDocumentIdRef.current;
-        if (!documentId) return;
-        const command = key === "y" || event.shiftKey ? redoSession : undoSession;
-        void runHistoryCommand(documentId, command);
-      }
-    };
-    window.addEventListener("keydown", handleShortcuts);
-    return () => window.removeEventListener("keydown", handleShortcuts);
-  }, [activateDocument, busy, createNew, macroOpen, requestCloseDocument, runHistoryCommand, unsavedRequest]);
-
-  const renameDocument = async (nextName: string): Promise<boolean> => {
-    if (macroOpen) return false;
-    const normalizedName = nextName.trim();
-    if (!normalizedName || normalizedName === "." || normalizedName === ".." || /[\\/\0]/.test(normalizedName)) {
-      setError("Enter a valid file name without folders.");
-      return false;
-    }
-    if (!summary.path) return saveDocumentById(summary.documentId, true, normalizedName);
-    if (normalizedName === summary.displayName) return true;
-    setBusy(true);
-    try {
-      updateDocument(await renameSession(summary.documentId, normalizedName));
-      setError(null);
-      return true;
-    } catch (reason) {
-      setError(String(reason));
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const duplicateDocument = async () => {
-    const documentId = summary.documentId;
-    if (!documentId || !summary.path || busy || macroOpen || unsavedRequest) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const workspace = await duplicateSession(documentId);
-      commitDocuments(workspace.documents);
-    } catch (reason) {
-      if (activeDocumentIdRef.current === documentId) setError(String(reason));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const applyEdit = useCallback(async (command: EditCommand) => {
-    if (macroOpen) return;
-    const documentId = activeDocumentIdRef.current;
-    const document = documentsRef.current.find((candidate) => candidate.documentId === documentId);
-    if (!document) return;
-    try {
-      setError(null);
-      updateDocument(await applySessionEdit(documentId, command, document.revision));
-      if (command.kind === "insertRows" || command.kind === "deleteRows" || command.kind === "applySort") {
-        clearSizing(documentId, "rows");
-      } else if (command.kind === "insertColumns" || command.kind === "deleteColumns") {
-        clearSizing(documentId, "columns");
-      } else if (command.kind === "setCells" && (document.filtersActive || document.sortCount > 0)) {
-        clearSizing(documentId, "rows");
-      }
-    } catch (reason) {
-      if (activeDocumentIdRef.current === documentId) setError(String(reason));
-      const current = await getSessionSummary(documentId);
-      updateDocument(current);
-      throw reason;
-    }
-  }, [clearSizing, macroOpen, updateDocument]);
-
-  const changeView = async (nextView: ViewState) => {
-    if (macroOpen) return;
-    const documentId = summary.documentId;
-    if (!documentId) return;
-    setBusy(true);
-    try {
-      updateDocument(await setSessionView(documentId, nextView));
-      updateTabUi(documentId, (current) => ({
-        ...current,
-        view: nextView,
-        sizing: { ...current.sizing, rowHeights: {} },
-      }));
-      if (activeDocumentIdRef.current === documentId) setError(null);
-    } catch (reason) {
-      if (activeDocumentIdRef.current === documentId) setError(String(reason));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const runGridCommand = (command: "copy" | "cut" | "paste") => {
-    if (macroOpen && command !== "copy") return;
-    document.dispatchEvent(new CustomEvent("tablune-grid-command", { detail: command }));
-  };
-
-  const runDimensionOperation = (kind: "insertRows" | "deleteRows" | "insertColumns" | "deleteColumns") => {
-    if (macroOpen) return;
-    const range = normalizeSelection(tabUi.selection);
-    const rows = kind.endsWith("Rows");
-    if (rows && (summary.filtersActive || summary.sortCount > 0)) {
-      setError("Clear sorting and filters before changing whole rows.");
-      return;
-    }
-    const index = rows ? range.startRow + Number(summary.headerEnabled) : range.startColumn;
-    const count = rows ? range.endRow - range.startRow + 1 : range.endColumn - range.startColumn + 1;
-    void applyEdit({ kind, index, count } as EditCommand);
-  };
-
-  const exportView = async () => {
-    if (macroOpen) return;
-    const documentId = summary.documentId;
-    const destination = await save({
-      defaultPath: `filtered-${summary.displayName}`,
-      filters: [{ name: "CSV", extensions: ["csv", "tsv", "txt"] }],
+      await w.perform(
+        p.projectId,
+        tab.kind === "table"
+          ? { kind: "deleteTable", tableId: tab.id }
+          : { kind: "deleteScript", scriptId: tab.id },
+      );
+      w.closeTab(p.projectId, tab);
     });
-    if (!destination) return;
-    setBusy(true);
-    try {
-      await exportSessionView(documentId, destination);
-      if (activeDocumentIdRef.current === documentId) setError(null);
-    } catch (reason) {
-      if (activeDocumentIdRef.current === documentId) setError(String(reason));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const dialogDocuments = unsavedRequest?.kind === "document"
-    ? documents.filter((document) => document.documentId === unsavedRequest.documentId)
-    : documents.filter((document) => document.dirty);
-
-  const openPythonMacro = () => {
-    if (busy || macroOpen || unsavedRequest || summary.documentId === 0) return;
-    restoreExplorerAfterMacro.current = explorerOpen;
-    setExplorerOpen(false);
-    setMacroOpen(true);
-  };
-
-  const closePythonMacro = () => {
-    setMacroOpen(false);
-    if (restoreExplorerAfterMacro.current) setExplorerOpen(true);
-    restoreExplorerAfterMacro.current = false;
-  };
-
+  const exportItem = (p: ProjectSummary, tab: ProjectTab) =>
+    w.guard(async () => {
+      await w.flushDrafts();
+      const current = w.workspaceRef.current.projects?.find(
+        (c) => c.projectId === p.projectId,
+      );
+      if (!current) return;
+      const table = current.tables.find((t) => t.id === tab.id);
+      const script = current.scripts.find((s) => s.id === tab.id);
+      const path = await save({
+        defaultPath: table
+          ? `${table.document.displayName.replace(/\.(csv|tsv|txt)$/i, "")}.csv`
+          : script?.name,
+        filters: [
+          {
+            name: table ? "CSV" : "Python script",
+            extensions: [table ? "csv" : "py"],
+          },
+        ],
+      });
+      if (!path) return;
+      if (table) await ipc.exportProjectTable(table.document.documentId, path);
+      else if (script) await ipc.writeMacroScript(path, script.code);
+    });
+  const tabName = (p: ProjectSummary, t: ProjectTab) =>
+    t.kind === "table"
+      ? p.tables.find((x) => x.id === t.id)?.document.displayName
+      : p.scripts.find((x) => x.id === t.id)?.name;
+  const hasDrafts = (id: number) =>
+    Object.keys(w.drafts).some((key) => key.startsWith(`${id}:`));
+  const dirtyItems = [
+    ...w.workspace.documents
+      .filter((d) => d.dirty)
+      .map((d) => ({ key: `csv-${d.documentId}`, name: d.displayName })),
+    ...(w.workspace.projects ?? [])
+      .filter((p) => p.dirty || hasDrafts(p.projectId))
+      .map((p) => ({ key: `project-${p.projectId}`, name: p.name })),
+  ];
   return (
-    <main className="app-shell" data-theme={theme}>
-      <RibbonHeader
-        documentName={summary.displayName}
-        dirty={summary.dirty}
-        busy={busy}
-        mutationsLocked={macroOpen}
-        error={error}
-        delimiter={summary.delimiter}
-        headerEnabled={summary.headerEnabled}
-        canUndo={summary.canUndo}
-        canRedo={summary.canRedo}
-        canChangeRows={!summary.filtersActive && summary.sortCount === 0}
-        canDuplicate={summary.path !== null}
-        hasView={summary.filtersActive || summary.sortCount > 0}
-        hasCustomSizing={hasCustomSizing}
-        theme={theme}
-        onNew={() => void createNew()}
-        onOpen={() => void openDocuments()}
-        onSave={() => void saveDocumentById(summary.documentId)}
-        onSaveAs={() => void saveDocumentById(summary.documentId, true)}
-        onDuplicate={() => void duplicateDocument()}
-        onExportView={() => void exportView()}
-        onUndo={() => void runHistoryCommand(summary.documentId, undoSession)}
-        onRedo={() => void runHistoryCommand(summary.documentId, redoSession)}
-        onCut={() => runGridCommand("cut")}
-        onCopy={() => runGridCommand("copy")}
-        onPaste={() => runGridCommand("paste")}
-        onInsertRow={() => runDimensionOperation("insertRows")}
-        onDeleteRow={() => runDimensionOperation("deleteRows")}
-        onInsertColumn={() => runDimensionOperation("insertColumns")}
-        onDeleteColumn={() => runDimensionOperation("deleteColumns")}
-        onFind={() => setSearchOpen(true)}
-        onHeaderChange={(enabled) => {
-          if (macroOpen) return;
-          void setSessionHeader(summary.documentId, enabled).then((next) => {
-            updateDocument(next);
-            clearSizing(next.documentId, "both");
-          }).catch((reason) => setError(String(reason)));
-        }}
-        onToggleExplorer={() => { if (!macroOpen) setExplorerOpen((open) => !open); }}
-        onClearView={() => void changeView(EMPTY_VIEW)}
-        onResetCellSizing={() => clearSizing(summary.documentId, "both")}
-        onPythonMacro={openPythonMacro}
-        onThemeChange={changeTheme}
-        onDelimiterChange={(delimiter) => void applyEdit({ kind: "setDelimiter", delimiter })}
-        onDocumentNameCommit={renameDocument}
-      />
-
-      <section className="content-region">
-        {searchOpen && summary.documentId !== 0 && (
-          <SearchBar
-            key={summary.documentId}
-            summary={summary}
-            selection={tabUi.selection}
-            readOnly={macroOpen}
-            onSummary={updateDocument}
-            onNavigate={(match: SearchMatch) => {
-              if (activeDocumentIdRef.current !== summary.documentId) return;
-              if (match.viewRow === null) {
-                setError("This match is hidden by the current filters.");
-                return;
+    <main className="app-shell product-shell" data-theme={theme}>
+      <header className="space-bar">
+        <button
+          className="home-button"
+          aria-current={w.space === "home" ? "page" : undefined}
+          disabled={w.busy}
+          onClick={() => w.setSpace("home")}
+        >
+          ⌂ Home
+        </button>
+        <label className="space-selector">
+          Workspace{" "}
+          <select
+            aria-label="Workspace"
+            disabled={w.busy}
+            value={String(w.space)}
+            onChange={(e) =>
+              w.setSpace(
+                e.target.value === "home" || e.target.value === "csv"
+                  ? e.target.value
+                  : Number(e.target.value),
+              )
+            }
+          >
+            <option value="home">Home</option>
+            <option value="csv">
+              CSV files ({w.workspace.documents.length})
+            </option>
+            {w.workspace.projects?.map((p) => (
+              <option key={p.projectId} value={p.projectId}>
+                {p.name}
+                {p.dirty || hasDrafts(p.projectId) ? " •" : ""}
+              </option>
+            ))}
+          </select>
+        </label>
+        {project && (
+          <>
+            <span className="space-title">
+              {project.name}
+              {project.dirty || hasDrafts(project.projectId) ? " •" : ""}
+            </span>
+            <button
+              disabled={w.busy || w.savingProjects.includes(project.projectId)}
+              onClick={() => void saveProject(project)}
+            >
+              Save project
+            </button>
+            <button
+              disabled={w.busy || w.savingProjects.includes(project.projectId)}
+              onClick={() => void saveProject(project, true)}
+            >
+              Save as…
+            </button>
+            <button
+              disabled={w.busy || w.savingProjects.includes(project.projectId)}
+              onClick={() =>
+                void w.guard(() => w.requestClose(project.projectId))
               }
-              setReveal({ viewRow: match.viewRow, column: match.column, nonce: Date.now() });
-            }}
-            onClose={() => setSearchOpen(false)}
-            onError={(message) => handleActiveDocumentError(summary.documentId, message)}
-          />
+            >
+              Close project
+            </button>
+          </>
         )}
-        <div className={`workspace${explorerOpen && !macroOpen ? " explorer-open" : ""}${macroOpen ? " macro-open" : ""}`}>
-          {summary.documentId !== 0 && (
-            <CsvGrid
-              key={`grid-${summary.documentId}`}
-              summary={summary}
-              theme={theme}
-              readOnly={macroOpen}
-              initialSelection={tabUi.selection}
-              initialViewport={tabUi.viewport}
-              initialSizing={tabUi.sizing}
-              onApplyEdit={applyEdit}
-              onSelectionChange={(selection) => updateTabUi(summary.documentId, (current) => ({ ...current, selection }))}
-              onViewportChange={(viewport) => updateTabUi(summary.documentId, (current) => ({ ...current, viewport }))}
-              onSizingChange={(sizing) => updateTabUi(summary.documentId, (current) => ({ ...current, sizing }))}
-              onError={(message) => handleActiveDocumentError(summary.documentId, message)}
-              reveal={reveal}
-              onHeaderSort={(column) => {
-                const existing = tabUi.view.sorts.find((sort) => sort.column === column);
-                const sorts = tabUi.view.sorts.filter((sort) => sort.column !== column);
-                if (!existing) sorts.push({ column, direction: "ascending", columnType: "text" });
-                else if (existing.direction === "ascending") sorts.push({ ...existing, direction: "descending" });
-                void changeView({ ...tabUi.view, sorts });
-              }}
-            />
-          )}
-          {explorerOpen && !macroOpen && summary.documentId !== 0 && (
-            <ExplorerPanel
-              key={`explorer-${summary.documentId}`}
-              summary={summary}
-              column={tabUi.selection.focus.column}
-              view={tabUi.view}
-              onViewChange={changeView}
-              onColumnTypeChange={async (columnType: ColumnType) => {
-                updateDocument(await setSessionColumnType(summary.documentId, tabUi.selection.focus.column, columnType));
-              }}
-              onApplySort={async () => {
-                await applyEdit({ kind: "applySort" });
-                updateTabUi(summary.documentId, (current) => ({ ...current, view: { ...current.view, sorts: [] } }));
-              }}
-              onExport={exportView}
-              onClose={() => setExplorerOpen(false)}
-              onError={(message) => handleActiveDocumentError(summary.documentId, message)}
-            />
-          )}
-          {macroOpen && summary.documentId !== 0 && (
-            <PythonMacroPanel
-              key={`macro-${summary.documentId}`}
-              summary={summary}
-              trustAcknowledged={macroTrustAcknowledged}
-              onTrustAcknowledged={() => setMacroTrustAcknowledged(true)}
-              onApplied={(nextSummary) => {
-                updateDocument(nextSummary);
-                updateTabUi(nextSummary.documentId, (current) => ({
-                  ...current,
-                  view: EMPTY_VIEW,
-                  sizing: { columnWidths: {}, rowHeights: {} },
-                }));
-              }}
-              onClose={closePythonMacro}
-            />
-          )}
+        {w.runningProject !== null && (
+          <button onClick={() => void ipc.cancelPythonMacro().catch(w.report)}>
+            Python running · Cancel
+          </button>
+        )}
+        <button
+          className="theme-switch"
+          aria-label="Toggle theme"
+          onClick={() => changeTheme(theme === "dark" ? "light" : "dark")}
+        >
+          {theme === "dark" ? "Light" : "Dark"}
+        </button>
+      </header>
+      {w.error && (
+        <div className="shell-error" role="alert">
+          {w.error}
+          <button aria-label="Dismiss error" onClick={() => w.setError(null)}>
+            ×
+          </button>
         </div>
-      </section>
-
-      <DocumentTabs
-        documents={documents}
-        activeDocumentId={activeDocumentId}
-        disabled={interactionsLocked}
-        onActivate={(documentId) => { if (!interactionsLocked) activateDocument(documentId); }}
-        onClose={requestCloseDocument}
-        onNew={() => void createNew()}
-        onReorder={reorderDocuments}
-      />
-
-      <footer className="statusbar">
-        <span>{summary.dirty ? "Unsaved changes" : "Saved"}</span>
-        <span>{summary.visibleRowCount.toLocaleString()}{summary.filtersActive ? ` of ${Math.max(0, summary.rowCount - Number(summary.headerEnabled)).toLocaleString()}` : ""} rows</span>
-        <span>{summary.columnCount.toLocaleString()} columns</span>
-        {summary.sortCount > 0 && <span>{summary.sortCount} sort{summary.sortCount === 1 ? "" : "s"}</span>}
-        {summary.filtersActive && <span>Filtered</span>}
-        <span>{summary.lineEnding === "crlf" ? "CRLF" : "LF"}</span>
-        <span>UTF-8</span>
-      </footer>
-
-      {unsavedRequest && dialogDocuments.length > 0 && (
-        <UnsavedChangesDialog
-          documents={dialogDocuments}
-          allDocuments={documents}
-          closingApplication={unsavedRequest.kind === "application"}
-          working={unsavedWorking}
-          error={unsavedError}
-          onSave={() => void saveUnsaved()}
-          onDiscard={() => void discardUnsaved()}
-          onCancel={cancelUnsaved}
-        />
+      )}
+      <div className="space-content" aria-busy={w.busy}>
+        {w.space === "home" && (
+          <section className="home-screen">
+            <div className="home-heading">
+              <img src="/brand/tablune-icon.png" alt="" />
+              <div>
+                <p className="eyebrow">YOUR LOCAL DATA WORKSPACE</p>
+                <h1>Tablune Sheets</h1>
+                <p>Start with a file. Build a project you can return to.</p>
+              </div>
+            </div>
+            <div className="home-start">
+              <button
+                disabled={!w.ready || w.busy}
+                onClick={() => void w.guard(w.newCsv)}
+              >
+                <strong>New CSV</strong>
+                <span>A blank table, ready to edit</span>
+              </button>
+              <button
+                disabled={!w.ready || w.busy}
+                onClick={() => void createProject()}
+              >
+                <strong>New project</strong>
+                <span>Keep your tables and Python scripts together</span>
+              </button>
+              <button
+                disabled={!w.ready || w.busy}
+                onClick={() => void w.guard(w.openFiles)}
+              >
+                <strong>Open…</strong>
+                <span>CSV, TSV or a .tablune project</span>
+              </button>
+            </div>
+            {(w.workspace.documents.length > 0 ||
+              Boolean(w.workspace.projects?.length)) && (
+              <section>
+                <h2>Open workspaces</h2>
+                <div className="open-spaces">
+                  {w.workspace.documents.length > 0 && (
+                    <button onClick={() => w.setSpace("csv")}>
+                      CSV files · {w.workspace.documents.length} open
+                    </button>
+                  )}
+                  {w.workspace.projects?.map((p) => (
+                    <button
+                      key={p.projectId}
+                      onClick={() => w.setSpace(p.projectId)}
+                    >
+                      {p.name} · {p.tables.length} tables
+                      {p.dirty || hasDrafts(p.projectId) ? " · Unsaved" : ""}
+                    </button>
+                  ))}
+                </div>
+              </section>
+            )}
+            <section className="recent-section">
+              <h2>Recent files</h2>
+              {w.recents.length === 0 ? (
+                <p className="empty-hint">
+                  Files and projects you open or save will appear here.
+                </p>
+              ) : (
+                <ul className="recent-list">
+                  {w.recents.map((r) => (
+                    <li key={r.path}>
+                      <button
+                        disabled={w.busy}
+                        onClick={() => void w.guard(() => w.openPath(r.path))}
+                      >
+                        <span className="recent-kind">
+                          {r.kind === "project" ? "◆" : "▤"}
+                        </span>
+                        <span>
+                          <strong>{r.path.split(/[\\/]/).at(-1)}</strong>
+                          <small>
+                            {r.kind === "project"
+                              ? "Tablune project"
+                              : "CSV file"}{" "}
+                            · {r.path}
+                          </small>
+                        </span>
+                      </button>
+                      <button
+                        aria-label={`Remove ${r.path} from recent files`}
+                        onClick={() =>
+                          void w.guard(async () => {
+                            await ipc.removeRecentFile(r.path);
+                            await w.refreshRecents();
+                          })
+                        }
+                      >
+                        ×
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+            <p className="home-version">
+              Tablune 0.4 · Stored on your computer
+            </p>
+          </section>
+        )}
+        <div className="csv-space space-pane" hidden={w.space !== "csv"}>
+          {w.workspace.documents.length > 0 ? (
+            <>
+              <div className="csv-project-action">
+                <button
+                  disabled={w.busy}
+                  onClick={() =>
+                    void w.guard(async () => {
+                      const d = w.workspace.documents.find(
+                        (d) => d.documentId === w.selectedCsv,
+                      );
+                      if (!d) return;
+                      const name = await requestName(
+                        "Create project from CSV",
+                        d.displayName.replace(/\.[^.]+$/, ""),
+                      );
+                      if (name) await w.createProject(name, d.documentId);
+                    })
+                  }
+                >
+                  Create project from this CSV…
+                </button>
+              </div>
+            </>
+          ) : (
+            <div className="empty-workspace">
+              <h2>No CSV files open</h2>
+              <button onClick={() => void w.guard(w.newCsv)}>New CSV</button>
+              <button onClick={() => void w.guard(w.openFiles)}>Open…</button>
+            </div>
+          )}
+          <div className="grid-host" hidden={!w.workspace.documents.length}>
+            <CsvWorkspace
+              managed
+              theme={theme}
+              active={w.space === "csv" && !w.busy && w.closeRequest === null}
+              documents={w.workspace.documents}
+              selectedId={w.selectedCsv}
+              onDocuments={updateDocuments}
+              onActivate={w.setSelectedCsv}
+              onOpen={() => void w.guard(w.openFiles)}
+              onTheme={changeTheme}
+            />
+          </div>
+        </div>
+        {w.workspace.projects?.map((p) => {
+          const locked = w.busy || w.savingProjects.includes(p.projectId);
+          const active = w.selected[p.projectId];
+          const table = p.tables.find(
+            (t) => t.id === active?.id && active.kind === "table",
+          );
+          const visibleTabs = (w.tabs[p.projectId] ?? []).filter((t) =>
+            tabName(p, t),
+          );
+          return (
+            <section
+              key={p.projectId}
+              className="project-space space-pane"
+              hidden={w.space !== p.projectId}
+            >
+              <aside
+                className="project-navigator"
+                aria-label={`${p.name} items`}
+              >
+                <h2>Tables</h2>
+                <div className="navigator-actions">
+                  <button disabled={locked} onClick={() => void newTable(p)}>
+                    + Table
+                  </button>
+                  <button
+                    disabled={locked}
+                    onClick={() => void importTables(p)}
+                  >
+                    Import CSV…
+                  </button>
+                </div>
+                {p.tables.map((t) => (
+                  <button
+                    key={t.id}
+                    className="navigator-item"
+                    aria-pressed={active?.id === t.id}
+                    onClick={() =>
+                      w.openTab(p.projectId, { kind: "table", id: t.id })
+                    }
+                  >
+                    ▤ {t.document.displayName}
+                  </button>
+                ))}
+                <h2>Scripts</h2>
+                <div className="navigator-actions">
+                  <button disabled={locked} onClick={() => void newScript(p)}>
+                    + Script
+                  </button>
+                  <button
+                    disabled={locked}
+                    onClick={() => void importScript(p)}
+                  >
+                    Import .py…
+                  </button>
+                </div>
+                {p.scripts.map((s) => (
+                  <button
+                    key={s.id}
+                    className="navigator-item"
+                    aria-pressed={active?.id === s.id}
+                    onClick={() =>
+                      w.openTab(p.projectId, { kind: "script", id: s.id })
+                    }
+                  >
+                    ⌘ {s.name}
+                  </button>
+                ))}
+                {active && (
+                  <div className="item-actions">
+                    <button
+                      disabled={locked}
+                      onClick={() => void renameItem(p, active)}
+                    >
+                      Rename…
+                    </button>
+                    <button
+                      disabled={locked}
+                      onClick={() => void exportItem(p, active)}
+                    >
+                      Export {active.kind === "table" ? "CSV" : ".py"}…
+                    </button>
+                    {table && (
+                      <button
+                        disabled={locked}
+                        onClick={() =>
+                          void w.guard(async () => {
+                            const next = await w.perform(p.projectId, {
+                              kind: "duplicateTable",
+                              tableId: table.id,
+                            });
+                            w.openTab(p.projectId, {
+                              kind: "table",
+                              id: next.tables.at(-1)!.id,
+                            });
+                          })
+                        }
+                      >
+                        Duplicate table
+                      </button>
+                    )}
+                    <button
+                      disabled={locked || w.runningProject === p.projectId}
+                      className="danger"
+                      onClick={() => void deleteItem(p, active)}
+                    >
+                      Delete {active.kind}…
+                    </button>
+                  </div>
+                )}
+              </aside>
+              <div className="project-main">
+                <div
+                  className="project-tabs"
+                  role="tablist"
+                  aria-label="Project editors"
+                >
+                  {visibleTabs.map((t) => (
+                    <div
+                      key={`${t.kind}:${t.id}`}
+                      className={active?.id === t.id ? "selected" : ""}
+                    >
+                      <button
+                        role="tab"
+                        aria-selected={active?.id === t.id}
+                        onClick={() => w.openTab(p.projectId, t)}
+                      >
+                        {tabName(p, t)}
+                      </button>
+                      <button
+                        aria-label={`Close ${tabName(p, t)} editor`}
+                        onClick={() => w.closeTab(p.projectId, t)}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                {!active && (
+                  <div className="empty-workspace">
+                    <h1>{p.name}</h1>
+                    <p>
+                      {p.tables.length || p.scripts.length
+                        ? "Choose a table or script to continue."
+                        : "Add your first table to get started."}
+                    </p>
+                    <div>
+                      <button
+                        disabled={locked}
+                        onClick={() => void newTable(p)}
+                      >
+                        Create a table
+                      </button>
+                      <button
+                        disabled={locked}
+                        onClick={() => void importTables(p)}
+                      >
+                        Import CSV…
+                      </button>
+                    </div>
+                  </div>
+                )}
+                <div className="grid-host" hidden={!table}>
+                  <CsvWorkspace
+                    managed
+                    theme={theme}
+                    active={
+                      w.space === p.projectId &&
+                      Boolean(table) &&
+                      !locked &&
+                      w.closeRequest === null
+                    }
+                    documents={p.tables.map((t) => t.document)}
+                    selectedId={table?.document.documentId ?? 0}
+                    onDocuments={(docs) => projectDocuments(p, docs)}
+                    onTheme={changeTheme}
+                    onActivate={(id) => {
+                      const t = p.tables.find(
+                        (t) => t.document.documentId === id,
+                      );
+                      if (t)
+                        w.openTab(p.projectId, { kind: "table", id: t.id });
+                    }}
+                    project={{
+                      onNew: () => void newTable(p),
+                      onImport: () => void importTables(p),
+                      onSave: (saveAs) => saveProject(p, saveAs),
+                      onRename: (id, name) => renameTable(p, id, name),
+                      onDuplicate: (id) => {
+                        const t = p.tables.find(
+                          (t) => t.document.documentId === id,
+                        );
+                        if (t)
+                          void w.guard(() =>
+                            w.perform(p.projectId, {
+                              kind: "duplicateTable",
+                              tableId: t.id,
+                            }),
+                          );
+                      },
+                      onCloseTab: (id) => {
+                        const t = p.tables.find(
+                          (t) => t.document.documentId === id,
+                        );
+                        if (t)
+                          w.closeTab(p.projectId, { kind: "table", id: t.id });
+                      },
+                      onScript: () => void newScript(p),
+                    }}
+                  />
+                </div>
+                {p.scripts.map((s) => (
+                  <div
+                    key={s.id}
+                    className="script-host"
+                    hidden={active?.kind !== "script" || active.id !== s.id}
+                  >
+                    <ProjectScriptEditor
+                      project={p}
+                      script={s}
+                      draft={w.drafts[`${p.projectId}:${s.id}`]}
+                      disabled={locked || w.closeRequest !== null}
+                      runningProject={w.runningProject}
+                      onEdit={(draft) => w.editScript(p.projectId, s.id, draft)}
+                      onFlush={w.flushDrafts}
+                      onRunning={w.setRunningProject}
+                      onError={w.report}
+                      onResult={(next) => {
+                        w.updateProject(next);
+                        w.openTab(p.projectId, {
+                          kind: "table",
+                          id: next.tables.at(-1)!.id,
+                        });
+                      }}
+                    />
+                  </div>
+                ))}
+              </div>
+            </section>
+          );
+        })}
+      </div>
+      {nameRequest && (
+        <div className="unsaved-backdrop">
+          <form
+            className="unsaved-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="name-title"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const name = nameRequest.value.trim();
+              if (name) {
+                nameRequest.resolve(name);
+                setNameRequest(null);
+              }
+            }}
+          >
+            <h1 id="name-title">{nameRequest.title}</h1>
+            <input
+              aria-label="Name"
+              autoFocus
+              required
+              maxLength={240}
+              value={nameRequest.value}
+              onChange={(e) =>
+                setNameRequest({ ...nameRequest, value: e.target.value })
+              }
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  nameRequest.resolve(null);
+                  setNameRequest(null);
+                }
+              }}
+            />
+            <div className="unsaved-actions">
+              <button
+                type="button"
+                onClick={() => {
+                  nameRequest.resolve(null);
+                  setNameRequest(null);
+                }}
+              >
+                Cancel
+              </button>
+              <button type="submit" className="primary">
+                Continue
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+      {w.closeRequest !== null && (
+        <div className="unsaved-backdrop">
+          <section
+            className="unsaved-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="close-title"
+          >
+            <h1 id="close-title">Save changes before closing?</h1>
+            <ul>
+              {(w.closeRequest === "app"
+                ? dirtyItems
+                : dirtyItems.filter(
+                    (i) => i.key === `project-${w.closeRequest}`,
+                  )
+              ).map((i) => (
+                <li key={i.key}>{i.name}</li>
+              ))}
+            </ul>
+            {w.error && <p role="alert">{w.error}</p>}
+            <div className="unsaved-actions">
+              <button disabled={w.busy} onClick={w.cancelClose}>
+                Cancel
+              </button>
+              <button
+                disabled={w.busy}
+                className="danger"
+                onClick={() =>
+                  void w.guard(() => w.finishClose(w.closeRequest!, true))
+                }
+              >
+                Discard
+              </button>
+              <button
+                disabled={w.busy}
+                className="primary"
+                autoFocus
+                onClick={() => void w.guard(w.saveAndClose)}
+              >
+                Save
+              </button>
+            </div>
+          </section>
+        </div>
       )}
     </main>
   );

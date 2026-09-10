@@ -27,7 +27,7 @@ crates/tablune-history
 
 ## Python macros
 
-The desktop backend may launch a user-selected Python 3.10+ interpreter as a child process. A bundled standard-library runner exchanges versioned JSON files through a temporary directory, invokes `transform(rows, context)`, and writes a validated result. Python never writes the open CSV or mutates the Rust document directly.
+The desktop backend may launch a user-selected Python 3.10+ interpreter as a child process. A bundled standard-library runner exchanges versioned JSON files through a temporary directory, invokes `run(rows, context)` or `transform(rows, context)`, and writes a validated result. Python never writes the open CSV or mutates the Rust document directly.
 
 Macro execution produces a revision-bound preview. Rust retains the transformed rows, sends only summary metrics and bounded samples to React, and applies an accepted result as one undoable transaction. Cell-only transformations use compact cell edits; structural transformations replace the document atomically. Results requiring more than the 64 MiB history budget cannot be applied.
 
@@ -57,6 +57,16 @@ Each open document has a frontend `TabUiState` keyed by `documentId`. It preserv
 
 Search ranges are expressed either in source coordinates or in current-view coordinates. A selection search in a sorted or filtered grid follows the visible rows, while document-wide search follows source order. Replace-one targets the active result explicitly; replace-all is exhaustive rather than inheriting the interactive result-display limit.
 
-Creating or opening a document never closes another tab. Multi-file open is sequential so header suggestions can be resolved per file; successful documents remain open when another selected path fails. Only dirty sessions participate in restart recovery, and closing the final tab creates a new empty session before removing it so the desktop UI always has a visible document.
+Creating or opening a document never closes another tab. Multi-file open is sequential so header suggestions can be resolved per file; successful documents remain open when another selected path fails. Only dirty sessions participate in restart recovery, and closing the final CSV tab returns to Home without creating another document.
 
 Duplicating a saved document snapshots its current in-memory rows and dialect, writes the first available incremented sibling path, and inserts a clean session immediately after the source. The frontend commits the returned workspace without changing `activeDocumentId`, so the new tab opens in the background while unsaved changes remain on the original.
+
+## Project spaces (0.4)
+
+`useWorkspace` owns Home navigation, open spaces, recent files, script drafts, and project lifecycle. `CsvWorkspace` supplies the shared table editing experience. Its targeted grid commands include a document ID so a command cannot reach another mounted workspace. Script editors remain mounted while navigating; drafts are flushed through a serialized queue before saving or running.
+
+Rust stores project ownership above `DocumentSession`. Persistent IDs identify projects, tables, and scripts in the archive; runtime IDs identify open sessions, allowing separate copies of one project to remain independent. A table directory resolves project grid queries without acquiring another project's long-lived save lock. Project save locks its scripts and tables for a coherent snapshot. Parsing, compression, large project actions, and recovery writes run on blocking workers; the frontend disables only the project being saved.
+
+The archive codec lives separately from the CSV parser. Project saves replace one ZIP atomically. Project previews bind the project, script revision, selected table, and document revision. Accepting a preview creates a new table and uses no input-table undo entry. CSV macros continue to use the existing undoable apply operation.
+
+Project crash recovery has its own versioned manifest (`projects-recovery.json`) alongside the compatible CSV recovery manifest. It includes dirty projects and script drafts acknowledged by Rust; it excludes running processes, previews, Python environments, and undo history. Clean projects appear in recent files instead of reopening automatically.

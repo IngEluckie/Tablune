@@ -45,3 +45,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 pnpm check
 pnpm frontend:build
 ```
+
+## Project workspace validation (0.4)
+
+Use the pnpm version declared in `package.json` (`corepack pnpm --version` should report 10.14.0). The desktop checks can also be run directly as `corepack pnpm --dir apps/desktop check` and `corepack pnpm --dir apps/desktop test` if another pnpm shadows Corepack in PATH.
+
+Project archive behavior is documented in `docs/projects.md`. The opt-in large-table checks are:
+
+```sh
+cargo test -p tablune-desktop project_100k_by_50_round_trip -- --ignored --nocapture
+cargo test -p tablune-desktop handles_the_100k_by_50_validation_dataset -- --ignored --nocapture
+```
+
+Recorded observations and the native validation scenario are in `docs/validation-0.4.md`.
