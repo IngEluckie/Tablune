@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import * as ipc from "./ipc";
+import { flushCellEdits } from "./CsvGrid";
 import type {
   DocumentSummary,
   ProjectAction,
@@ -13,7 +14,7 @@ import type {
 } from "./types";
 
 export type Space = "home" | "csv" | number;
-export type ProjectTab = { kind: "table" | "script"; id: string };
+export type ProjectTab = { kind: "table" | "script" | "functions"; id: string };
 export type ScriptDraft = Pick<ScriptSummary, "name" | "code" | "inputTableId">;
 const basename = (path: string) => path.split(/[\\/]/).at(-1) ?? path;
 export function useWorkspace() {
@@ -42,6 +43,16 @@ export function useWorkspace() {
   runningRef.current = runningProject;
   const [closeRequest, setCloseRequest] = useState<"app" | number | null>(null);
   const [drafts, setDrafts] = useState<Record<string, ScriptDraft>>({});
+  const [functionDrafts, setFunctionDrafts] = useState<Record<number, string>>(
+    {},
+  );
+  const functionDraftsRef = useRef(functionDrafts);
+  functionDraftsRef.current = functionDrafts;
+  const editFunctions = useCallback((id: number, code: string) => {
+    const next = { ...functionDraftsRef.current, [id]: code };
+    functionDraftsRef.current = next;
+    setFunctionDrafts(next);
+  }, []);
   const draftsRef = useRef(drafts);
   draftsRef.current = drafts;
   const flushChain = useRef<Promise<void>>(Promise.resolve());
@@ -125,6 +136,26 @@ export function useWorkspace() {
     const run = flushChain.current
       .catch(() => {})
       .then(async () => {
+        await flushCellEdits();
+        for (const [id, code] of Object.entries(functionDraftsRef.current)) {
+          const project = workspaceRef.current.projects?.find(
+            (p) => p.projectId === Number(id),
+          );
+          if (!project) continue;
+          updateProject(
+            await ipc.projectAction(project.projectId, {
+              kind: "updateFunctions",
+              code,
+              expectedRevision: project.functions?.draftRevision ?? 0,
+            }),
+          );
+          if (functionDraftsRef.current[Number(id)] === code) {
+            const next = { ...functionDraftsRef.current };
+            delete next[Number(id)];
+            functionDraftsRef.current = next;
+            setFunctionDrafts(next);
+          }
+        }
         for (const [key, draft] of Object.entries(draftsRef.current)) {
           const separator = key.indexOf(":");
           const projectId = Number(key.slice(0, separator));
@@ -298,6 +329,14 @@ export function useWorkspace() {
     )
       throw new Error("Wait for the project save to finish before closing.");
     if (
+      workspaceRef.current.projects?.some(
+        (p) =>
+          p.calculation?.running &&
+          (request === "app" || p.projectId === request),
+      )
+    )
+      throw new Error("Cancel the calculation before closing.");
+    if (
       runningRef.current !== null &&
       (request === "app" || request === runningRef.current)
     ) {
@@ -423,7 +462,8 @@ export function useWorkspace() {
   }, [report]);
   // Debounced durable drafts, including projects with no table edits.
   useEffect(() => {
-    if (!Object.keys(drafts).length) return;
+    if (!Object.keys(drafts).length && !Object.keys(functionDrafts).length)
+      return;
     const timer = window.setTimeout(() => {
       if (closingRef.current) return;
       void flushDrafts()
@@ -431,7 +471,7 @@ export function useWorkspace() {
         .catch(report);
     }, 400);
     return () => window.clearTimeout(timer);
-  }, [drafts, flushDrafts, report]);
+  }, [drafts, functionDrafts, flushDrafts, report]);
   const recoveryKey = JSON.stringify([
     workspace.documents.map((d) => [d.documentId, d.revision, d.dirty]),
     workspace.projects?.map((p) => [p.projectId, p.revision, p.dirty]),
@@ -446,7 +486,80 @@ export function useWorkspace() {
     }, 1500);
     return () => window.clearTimeout(timer);
   }, [recoveryKey, ready, flushDrafts, report]);
+  useEffect(() => {
+    let alive = true;
+    let dispose: (() => void) | undefined;
+    void listen<ProjectSummary>("tablune-calculation", (event) => {
+      if (
+        alive &&
+        workspaceRef.current.projects?.some(
+          (p) => p.projectId === event.payload.projectId,
+        )
+      )
+        updateProject(event.payload);
+    })
+      .then((fn) => {
+        if (alive) dispose = fn;
+        else fn();
+      })
+      .catch(report);
+    return () => {
+      alive = false;
+      dispose?.();
+    };
+  }, [updateProject, report]);
+  const calculationRequests = useRef(new Set<number>());
+  const calculationKey = JSON.stringify(
+    workspace.projects?.map((p) => [
+      p.projectId,
+      p.calculation,
+      p.tables.map((t) => [t.document.revision, t.document.pendingCells]),
+    ]),
+  );
+  useEffect(() => {
+    if (!ready || closingRef.current) return;
+    const timer = window.setTimeout(() => {
+      for (const p of workspaceRef.current.projects ?? []) {
+        if (
+          !p.calculation?.enabled ||
+          p.calculation.running ||
+          p.calculation.paused ||
+          savingRef.current.has(p.projectId) ||
+          calculationRequests.current.has(p.projectId) ||
+          !p.tables.some((t) => (t.document.pendingCells ?? 0) > 0)
+        )
+          continue;
+        calculationRequests.current.add(p.projectId);
+        void ipc
+          .recalculateProject(p.projectId)
+          .then((next) => {
+            if (
+              workspaceRef.current.projects?.some(
+                (p) => p.projectId === next.projectId,
+              )
+            )
+              updateProject(next);
+          })
+          .catch(report)
+          .finally(() => calculationRequests.current.delete(p.projectId));
+      }
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [calculationKey, ready, updateProject, report]);
+  const enableProjectCalculation = async (id: number) => {
+    if (
+      !(await ask(
+        "Python functions run with your normal user permissions. The separate Python process is not a security sandbox. Enable automatic calculation for this project in this session?",
+        { title: "Enable Python calculation", kind: "warning" },
+      ))
+    )
+      return;
+    updateProject(await ipc.enableCalculation(id));
+  };
   return {
+    functionDrafts,
+    editFunctions,
+    enableProjectCalculation,
     workspace,
     workspaceRef,
     commit,

@@ -8,6 +8,7 @@ import { tags } from "@lezer/highlight";
 import { useLayoutEffect, useRef } from "react";
 
 interface PythonMacroEditorProps {
+  label?: string;
   value: string;
   disabled: boolean;
   onChange: (code: string) => void;
@@ -34,7 +35,7 @@ function editableExtensions(disabled: boolean) {
   ];
 }
 
-export default function PythonMacroEditor({ value, disabled, onChange }: PythonMacroEditorProps) {
+export default function PythonMacroEditor({ value, disabled, onChange, label = "Macro code" }: PythonMacroEditorProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
@@ -59,7 +60,7 @@ export default function PythonMacroEditor({ value, disabled, onChange }: PythonM
         EditorState.tabSize.of(4),
         EditorView.lineWrapping,
         EditorView.contentAttributes.of({
-          "aria-label": "Macro code",
+          "aria-label": label,
           "aria-multiline": "true",
           autocapitalize: "off",
           autocomplete: "off",

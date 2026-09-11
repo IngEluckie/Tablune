@@ -5,6 +5,7 @@ use std::{
 };
 use tauri::{Emitter, Manager};
 
+mod formulas;
 mod python_macros;
 mod session;
 use session::projects;
@@ -37,6 +38,7 @@ struct ExitPermission(AtomicBool);
 
 #[tauri::command]
 fn exit_application(app: tauri::AppHandle) {
+    python_macros::calculation_worker::shutdown();
     app.state::<ExitPermission>()
         .0
         .store(true, Ordering::Release);
@@ -76,6 +78,16 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             exit_application,
+            session::sheets::sheet_cell,
+            session::sheets::clipboard_generation,
+            session::sheets::clipboard_read_text,
+            session::sheets::clipboard_write_text,
+            session::sheets::sheet_shift_formula,
+            session::sheets::sheet_shift_formulas,
+            session::calculation::project_enable_calculation,
+            session::calculation::project_recalculate,
+            session::calculation::project_apply_functions,
+            session::calculation::project_cancel_calculation,
             projects::project_new,
             projects::project_open,
             projects::project_save,

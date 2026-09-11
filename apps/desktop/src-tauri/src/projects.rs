@@ -12,9 +12,27 @@ pub struct ScriptSummary {
     pub revision: u64,
     pub input_table_id: Option<String>,
 }
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FunctionsData {
+    pub draft: String,
+    pub applied: String,
+    pub revision: u64,
+    pub draft_revision: u64,
+}
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalculationSummary {
+    pub enabled: bool,
+    pub running: bool,
+    pub paused: bool,
+    pub error: Option<String>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableMetadata {
+    #[serde(default)]
+    pub sheet: SheetData,
     pub id: String,
     pub name: String,
     pub dialect: CsvDialect,
@@ -25,6 +43,8 @@ pub struct TableMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectData {
+    #[serde(default)]
+    pub functions: FunctionsData,
     pub version: u8,
     pub id: String,
     pub name: String,
@@ -42,6 +62,8 @@ pub struct ProjectTableSummary {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectSummary {
+    pub functions: FunctionsData,
+    pub calculation: CalculationSummary,
     pub project_id: u64,
     pub persistent_id: String,
     pub name: String,
@@ -89,9 +111,11 @@ pub(crate) fn update_directory(
 }
 pub struct ProjectSession {
     pub(crate) runtime_id: u64,
-    data: ProjectData,
+    pub(super) data: ProjectData,
     path: Option<PathBuf>,
-    tables: Vec<DocumentHandle>,
+    pub(super) tables: Vec<DocumentHandle>,
+    pub(super) calculation: CalculationSummary,
+    pub(super) calculation_generation: u64,
     saved_signature: String,
 }
 static PROJECT_PATH_OPERATIONS: std::sync::LazyLock<Mutex<HashSet<String>>> =
@@ -212,6 +236,9 @@ impl ProjectSession {
                 header_enabled: meta.header_enabled,
                 column_types: meta.column_types.clone(),
             });
+            session.sheet = meta.sheet.clone();
+            session.sheet.invalidate_all();
+            session.sync_sheet();
             session.project_id = Some(runtime_id);
             session.title = Some(meta.name.clone());
             session.view = meta.view.clone();
@@ -225,7 +252,10 @@ impl ProjectSession {
             path,
             tables,
             saved_signature: String::new(),
+            calculation: CalculationSummary::default(),
+            calculation_generation: 0,
         };
+        project.data.version = 2;
         project.data.rows.clear();
         if !dirty {
             project.saved_signature = project.signature()?;
@@ -254,7 +284,7 @@ impl ProjectSession {
     ) -> Result<String, String> {
         let states: Vec<_> = sessions
             .iter()
-            .map(|s| (s.identity, s.revision, s.view_revision, s.current_state))
+            .map(|s| (s.identity, s.revision, s.current_state))
             .collect();
         serde_json::to_string(&(&self.data, states)).map_err(|e| e.to_string())
     }
@@ -277,7 +307,17 @@ impl ProjectSession {
         use std::hash::{Hash, Hasher};
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         revision.hash(&mut hash);
+        for s in &sessions {
+            s.calculation_revision.hash(&mut hash);
+        }
         Ok(ProjectSummary {
+            functions: self.data.functions.clone(),
+            calculation: CalculationSummary {
+                enabled: self.calculation.enabled,
+                running: self.calculation.running,
+                paused: self.calculation.paused,
+                error: self.calculation.error.clone(),
+            },
             project_id: self.runtime_id,
             persistent_id: self.data.id.clone(),
             name: self.data.name.clone(),
@@ -303,6 +343,7 @@ impl ProjectSession {
     ) -> ProjectData {
         let mut data = self.data.clone();
         for (meta, session) in data.tables.iter_mut().zip(sessions) {
+            meta.sheet = session.sheet.clone();
             meta.dialect = session.dialect;
             meta.header_enabled = session.header_enabled;
             meta.column_types = session.column_types.clone();
@@ -322,7 +363,10 @@ impl ProjectSession {
         session.path = None;
         session.project_id = Some(self.runtime_id);
         session.title = Some(title.clone());
+        session.sync_sheet();
+        session.rebuild_view();
         self.data.tables.push(TableMetadata {
+            sheet: session.sheet.clone(),
             id: persistent_id(),
             name: title,
             dialect: session.dialect,
@@ -423,6 +467,7 @@ fn project_new_internal(
         .transpose()?;
     let mut project = ProjectSession::from_data(
         ProjectData {
+            functions: FunctionsData::default(),
             version: 1,
             id: persistent_id(),
             name: self::name(&name)?,
@@ -560,6 +605,10 @@ pub enum ProjectAction {
         table_id: String,
     },
     NewScript,
+    UpdateFunctions {
+        code: String,
+        expected_revision: u64,
+    },
     ImportScript {
         name: String,
         code: String,
@@ -596,6 +645,21 @@ fn apply_action(
     let handle = handle(state, project_id)?;
     let mut p = lock_project(&handle)?;
     match action {
+        ProjectAction::UpdateFunctions {
+            code,
+            expected_revision,
+        } => {
+            if code.len() > 1024 * 1024 {
+                return Err("Functions code exceeds 1 MiB".into());
+            }
+            if p.data.functions.draft_revision != expected_revision {
+                return Err("Functions draft changed; refresh before editing".into());
+            }
+            if p.data.functions.draft != code {
+                p.data.functions.draft = code;
+                p.data.functions.draft_revision += 1;
+            }
+        }
         ProjectAction::NewTable => {
             p.add_table(DocumentSession::default(), "Table")?;
         }
@@ -774,6 +838,9 @@ pub fn project_close(
         return Err("Save or discard this project before closing".into());
     }
     let closing = lock_project(&registry[i])?;
+    if closing.calculation.running {
+        return Err("Cancel this project’s calculation before closing".into());
+    }
     registry[i].closed.store(true, AtomicOrdering::Release);
     drop(closing);
     let removed = registry.remove(i);
@@ -796,7 +863,13 @@ pub fn project_export_table(
     ensure_path_available(&state, Path::new(&path), 0)?;
     let handle = document_handle(&state, document_id)?;
     let s = lock_document(&handle)?;
-    tablune_csv::write_path(path, &s.document, s.dialect).map_err(|e| e.to_string())
+    s.ensure_calculated()?;
+    tablune_csv::write_path(
+        path,
+        &TableDocument::from_rows(s.materialized_rows()),
+        s.dialect,
+    )
+    .map_err(|e| e.to_string())
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -913,7 +986,7 @@ pub(super) fn write_recovery(app: &AppHandle, state: &WorkspaceState) -> Result<
         write_bytes_atomic(
             &path,
             &serde_json::to_vec(&RecoveryProjects {
-                version: 1,
+                version: 2,
                 projects,
             })
             .map_err(|e| e.to_string())?,
@@ -932,7 +1005,7 @@ pub(super) fn read_recovery(app: &AppHandle) -> Result<Vec<RecoveryProject>, Str
         return Ok(Vec::new());
     }
     let mut payload: RecoveryProjects = read_json(&path)?;
-    if payload.version != 1 {
+    if !matches!(payload.version, 1 | 2) {
         return Err("Unsupported project recovery version".into());
     }
     for p in &mut payload.projects {
@@ -960,10 +1033,12 @@ mod tests {
     use super::*;
     fn fixture() -> ProjectData {
         ProjectData {
+            functions: FunctionsData::default(),
             version: 1,
             id: "project-fixture".into(),
             name: "Ventas México".into(),
             tables: vec![TableMetadata {
+                sheet: SheetData::default(),
                 id: "table-fixture".into(),
                 name: "Ventas".into(),
                 dialect: CsvDialect {
@@ -1367,5 +1442,125 @@ mod tests {
             }
         }
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn format_two_preserves_formulas_functions_drafts_and_cached_values_without_execution() {
+        let mut p = ProjectSession::from_data(fixture(), None, true).unwrap();
+        p.data.functions = FunctionsData {
+            draft: "def f(x):\n    return x*3\n".into(),
+            applied: "def f(x):\n    return x*2\n".into(),
+            revision: 4,
+            draft_revision: 5,
+        };
+        {
+            let mut s = lock_document(&p.tables[0]).unwrap();
+            let revision = s.revision;
+            s.apply_edit(
+                EditCommand::SetSheetCells {
+                    cells: vec![sheets::SheetCellInput {
+                        row: 1,
+                        column: 2,
+                        value: "=f(21)".into(),
+                        literal: false,
+                        cell_type: None,
+                    }],
+                },
+                revision,
+            )
+            .unwrap();
+            calculation::calculate_for_test(&mut s, &p.data.functions.applied);
+            assert_eq!(s.cell_value(1, 2), "42");
+        }
+        let path = temporary_path();
+        p.save_to(path.clone()).unwrap();
+        let data = archive::read(&path).unwrap();
+        assert_eq!(data.version, 2);
+        assert_eq!(data.functions.draft, p.data.functions.draft);
+        assert_eq!(data.functions.applied, p.data.functions.applied);
+        let restored = ProjectSession::from_data(data, Some(path.clone()), false).unwrap();
+        assert!(!restored.calculation.enabled);
+        let table = lock_document(&restored.tables[0]).unwrap();
+        assert_eq!(table.raw_cell(1, 2), "=f(21)");
+        assert_eq!(table.cell_value(1, 2), "42");
+        assert!(table.sheet.cells["1,2"].pending);
+        assert!(table.ensure_calculated().is_err());
+        assert!(!restored.calculation.running);
+        drop(table);
+        assert!(!restored.summary().unwrap().dirty);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn legacy_archive_import_does_not_activate_text_that_looks_like_a_formula() {
+        use std::io::Write;
+        let path = temporary_path();
+        let mut data = fixture();
+        data.rows[0][1][0] = "=danger()".into();
+        let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("manifest.json", options).unwrap();
+        zip.write_all(&serde_json::to_vec(&data).unwrap()).unwrap();
+        for (t, rows) in data.tables.iter().zip(&data.rows) {
+            zip.start_file(format!("tables/{}.json", t.id), options)
+                .unwrap();
+            zip.write_all(&serde_json::to_vec(rows).unwrap()).unwrap();
+        }
+        for s in &data.scripts {
+            zip.start_file(format!("scripts/{}.py", s.id), options)
+                .unwrap();
+            zip.write_all(s.code.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+        let p = ProjectSession::from_data(archive::read(&path).unwrap(), Some(path.clone()), false)
+            .unwrap();
+        assert_eq!(p.data.version, 2);
+        let s = lock_document(&p.tables[0]).unwrap();
+        assert!(!s.cell_info(1, 0).formula);
+        assert_eq!(s.cell_value(1, 0), "=danger()");
+        drop(s);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn recovery_keeps_unapplied_functions_and_formula_metadata() {
+        let mut p = ProjectSession::from_data(fixture(), None, true).unwrap();
+        p.data.functions.draft = "def unsaved(): return 7".into();
+        let mut table = lock_document(&p.tables[0]).unwrap();
+        table
+            .edit_sheet_cells(vec![sheets::SheetCellInput {
+                row: 1,
+                column: 2,
+                value: "=unsaved()".into(),
+                literal: false,
+                cell_type: Some(formulas::CellType::Auto),
+            }])
+            .unwrap();
+        drop(table);
+        let sessions = p
+            .tables
+            .iter()
+            .map(lock_document)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut data = p.snapshot_with(&sessions);
+        drop(sessions);
+        let rows = std::mem::take(&mut data.rows);
+        let encoded = serde_json::to_vec(&RecoveryProject {
+            data,
+            rows,
+            path: None,
+        })
+        .unwrap();
+        let mut recovered: RecoveryProject = serde_json::from_slice(&encoded).unwrap();
+        recovered.data.rows = recovered.rows;
+        let restored = ProjectSession::from_data(recovered.data, None, true).unwrap();
+        assert_eq!(restored.data.functions.draft, "def unsaved(): return 7");
+        assert!(restored.data.functions.applied.is_empty());
+        assert!(
+            lock_document(&restored.tables[0])
+                .unwrap()
+                .cell_info(1, 2)
+                .formula
+        );
+        assert!(restored.summary().unwrap().dirty);
+        assert!(!restored.calculation.enabled);
     }
 }

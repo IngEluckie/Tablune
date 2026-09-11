@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import CsvWorkspace from "./CsvWorkspace";
+import RibbonHeader from "./RibbonHeader";
+import ProjectSidebar from "./ProjectSidebar";
+import ProjectFunctionsEditor from "./ProjectFunctionsEditor";
 import ProjectScriptEditor from "./ProjectScriptEditor";
 import { useWorkspace, type ProjectTab } from "./useWorkspace";
 import { readThemePreference, writeThemePreference } from "./theme";
@@ -9,6 +12,7 @@ import type { DocumentSummary, ProjectSummary } from "./types";
 
 export default function App() {
   const w = useWorkspace();
+  const [ribbonTarget, setRibbonTarget] = useState<HTMLDivElement | null>(null);
   const [theme, setTheme] = useState(readThemePreference);
   const [nameRequest, setNameRequest] = useState<{
     title: string;
@@ -195,11 +199,14 @@ export default function App() {
       else if (script) await ipc.writeMacroScript(path, script.code);
     });
   const tabName = (p: ProjectSummary, t: ProjectTab) =>
-    t.kind === "table"
-      ? p.tables.find((x) => x.id === t.id)?.document.displayName
-      : p.scripts.find((x) => x.id === t.id)?.name;
+    t.kind === "functions"
+      ? "Functions"
+      : t.kind === "table"
+        ? p.tables.find((x) => x.id === t.id)?.document.displayName
+        : p.scripts.find((x) => x.id === t.id)?.name;
   const hasDrafts = (id: number) =>
-    Object.keys(w.drafts).some((key) => key.startsWith(`${id}:`));
+    Object.keys(w.drafts).some((key) => key.startsWith(`${id}:`)) ||
+    w.functionDrafts[id] !== undefined;
   const dirtyItems = [
     ...w.workspace.documents
       .filter((d) => d.dirty)
@@ -208,9 +215,10 @@ export default function App() {
       .filter((p) => p.dirty || hasDrafts(p.projectId))
       .map((p) => ({ key: `project-${p.projectId}`, name: p.name })),
   ];
-  return (
-    <main className="app-shell product-shell" data-theme={theme}>
-      <header className="space-bar">
+  const tableRibbonVisible = w.space === "csv"
+    ? w.workspace.documents.length > 0
+    : Boolean(project?.tables.some((t) => w.selected[project.projectId]?.kind === "table" && w.selected[project.projectId]?.id === t.id));
+  const navigation = (<>
         <button
           className="home-button"
           aria-current={w.space === "home" ? "page" : undefined}
@@ -245,13 +253,16 @@ export default function App() {
             ))}
           </select>
         </label>
+        {w.runningProject !== null && (
+          <button onClick={() => void ipc.cancelPythonMacro().catch(w.report)}>
+            Python running · Cancel
+          </button>
+        )}
+      </>);
+  const fileActions = (<>
         {project && (
           <>
-            <span className="space-title">
-              {project.name}
-              {project.dirty || hasDrafts(project.projectId) ? " •" : ""}
-            </span>
-            <button
+            {!tableRibbonVisible && <><button
               disabled={w.busy || w.savingProjects.includes(project.projectId)}
               onClick={() => void saveProject(project)}
             >
@@ -263,6 +274,7 @@ export default function App() {
             >
               Save as…
             </button>
+            </>}
             <button
               disabled={w.busy || w.savingProjects.includes(project.projectId)}
               onClick={() =>
@@ -273,19 +285,18 @@ export default function App() {
             </button>
           </>
         )}
-        {w.runningProject !== null && (
-          <button onClick={() => void ipc.cancelPythonMacro().catch(w.report)}>
-            Python running · Cancel
-          </button>
-        )}
-        <button
-          className="theme-switch"
-          aria-label="Toggle theme"
-          onClick={() => changeTheme(theme === "dark" ? "light" : "dark")}
-        >
-          {theme === "dark" ? "Light" : "Dark"}
-        </button>
-      </header>
+      </>);
+  return (
+    <main className="app-shell product-shell" data-theme={theme}>
+      <div className="application-ribbon" ref={setRibbonTarget}>
+        {!tableRibbonVisible && <RibbonHeader
+          tableAvailable={false}
+          navigation={navigation}
+          fileActions={fileActions}
+          theme={theme}
+          onThemeChange={changeTheme}
+        />}
+      </div>
       {w.error && (
         <div className="shell-error" role="alert">
           {w.error}
@@ -394,7 +405,7 @@ export default function App() {
               )}
             </section>
             <p className="home-version">
-              Tablune 0.4 · Stored on your computer
+              Tablune 0.5 · Stored on your computer
             </p>
           </section>
         )}
@@ -432,6 +443,9 @@ export default function App() {
           <div className="grid-host" hidden={!w.workspace.documents.length}>
             <CsvWorkspace
               managed
+              ribbonTarget={ribbonTarget}
+              ribbonVisible={w.space === "csv" && tableRibbonVisible}
+              ribbonControls={{ navigation, fileActions }}
               theme={theme}
               active={w.space === "csv" && !w.busy && w.closeRequest === null}
               documents={w.workspace.documents}
@@ -458,11 +472,63 @@ export default function App() {
               className="project-space space-pane"
               hidden={w.space !== p.projectId}
             >
-              <aside
-                className="project-navigator"
-                aria-label={`${p.name} items`}
-              >
-                <h2>Tables</h2>
+              <ProjectSidebar label={`${p.name} items`}>
+                <div className="calculation-toolbar">
+                  {!p.calculation?.enabled ? (
+                    <button
+                      disabled={locked}
+                      onClick={() =>
+                        void w
+                          .enableProjectCalculation(p.projectId)
+                          .catch(w.report)
+                      }
+                    >
+                      Enable Python calculation
+                    </button>
+                  ) : p.calculation.running ? (
+                    <button
+                      onClick={() =>
+                        void ipc
+                          .cancelCalculation(p.projectId)
+                          .then(w.updateProject)
+                          .catch(w.report)
+                      }
+                    >
+                      Cancel calculation
+                    </button>
+                  ) : (
+                    <button
+                      disabled={locked}
+                      onClick={() =>
+                        void ipc
+                          .recalculateProject(p.projectId, true)
+                          .then(w.updateProject)
+                          .catch(w.report)
+                      }
+                    >
+                      Recalculate
+                    </button>
+                  )}
+                  <span role="status">
+                    {p.calculation?.running
+                      ? "Calculating…"
+                      : p.calculation?.paused
+                        ? "Calculation paused"
+                        : !p.calculation?.enabled
+                          ? "Calculation disabled for this session"
+                          : p.tables.some(
+                                (t) => (t.document.pendingCells ?? 0) > 0,
+                              )
+                            ? "Calculation pending"
+                            : "Up to date"}
+                  </span>
+                  {p.calculation?.error && (
+                    <span className="calculation-error" role="alert">
+                      {p.calculation.error}
+                    </span>
+                  )}
+                </div>
+                <h2>Sheets</h2>
                 <div className="navigator-actions">
                   <button disabled={locked} onClick={() => void newTable(p)}>
                     + Table
@@ -486,6 +552,19 @@ export default function App() {
                     ▤ {t.document.displayName}
                   </button>
                 ))}
+                <h2>Python</h2>
+                <button
+                  className="navigator-item"
+                  aria-pressed={active?.kind === "functions"}
+                  onClick={() =>
+                    w.openTab(p.projectId, {
+                      kind: "functions",
+                      id: "functions",
+                    })
+                  }
+                >
+                  ƒ Functions
+                </button>
                 <h2>Scripts</h2>
                 <div className="navigator-actions">
                   <button disabled={locked} onClick={() => void newScript(p)}>
@@ -510,7 +589,7 @@ export default function App() {
                     ⌘ {s.name}
                   </button>
                 ))}
-                {active && (
+                {active && active.kind !== "functions" && (
                   <div className="item-actions">
                     <button
                       disabled={locked}
@@ -552,7 +631,7 @@ export default function App() {
                     </button>
                   </div>
                 )}
-              </aside>
+              </ProjectSidebar>
               <div className="project-main">
                 <div
                   className="project-tabs"
@@ -607,6 +686,9 @@ export default function App() {
                 <div className="grid-host" hidden={!table}>
                   <CsvWorkspace
                     managed
+                    ribbonTarget={ribbonTarget}
+                    ribbonVisible={w.space === p.projectId && Boolean(table)}
+                    ribbonControls={{ navigation, fileActions }}
                     theme={theme}
                     active={
                       w.space === p.projectId &&
@@ -651,6 +733,23 @@ export default function App() {
                       },
                       onScript: () => void newScript(p),
                     }}
+                  />
+                </div>
+                <div
+                  className="script-host"
+                  hidden={active?.kind !== "functions"}
+                >
+                  <ProjectFunctionsEditor
+                    project={p}
+                    code={
+                      w.functionDrafts[p.projectId] ?? p.functions?.draft ?? ""
+                    }
+                    disabled={locked || w.closeRequest !== null}
+                    onEdit={(code) => w.editFunctions(p.projectId, code)}
+                    onFlush={w.flushDrafts}
+                    onUpdate={w.updateProject}
+                    onEnable={() => w.enableProjectCalculation(p.projectId)}
+                    onError={w.report}
                   />
                 </div>
                 {p.scripts.map((s) => (

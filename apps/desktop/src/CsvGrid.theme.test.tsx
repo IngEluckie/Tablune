@@ -7,6 +7,8 @@ import { getGridWindow } from "./ipc";
 import type { DocumentSummary } from "./types";
 
 vi.mock("./ipc", () => ({
+  readNativeClipboard: vi.fn(async () => null),
+  writeNativeClipboard: vi.fn(async () => false),
   getGridWindow: vi.fn().mockResolvedValue({
     documentId: 1,
     revision: 0,

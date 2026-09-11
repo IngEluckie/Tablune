@@ -55,6 +55,20 @@ describe("RibbonHeader", () => {
     vi.useRealTimers();
   });
 
+  it("keeps navigation and theme available without a table", () => {
+    const onThemeChange = vi.fn();
+    render(<RibbonHeader tableAvailable={false} theme="light" onThemeChange={onThemeChange}
+      navigation={<button>Home</button>} fileActions={<button>Save project</button>} />);
+    expect(screen.getByRole("button", { name: "Home" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "File" }));
+    expect(screen.getAllByRole("button", { name: /Save/ })).toHaveLength(1);
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "View" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Dark mode" }));
+    expect(onThemeChange).toHaveBeenCalledWith("dark");
+    expect(screen.queryByRole("button", { name: "Reset Cell Size" })).toBeNull();
+  });
+
   it("shows the official Tablune Sheets icon and wordmark", () => {
     const { container } = render(<RibbonHeader {...defaultProps} />);
 

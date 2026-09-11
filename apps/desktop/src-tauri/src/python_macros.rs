@@ -1,3 +1,7 @@
+#[path = "calculation_worker.rs"]
+pub(crate) mod calculation_worker;
+pub(crate) static PYTHON_QUEUE: tauri::async_runtime::Mutex<()> =
+    tauri::async_runtime::Mutex::const_new(());
 use std::{
     collections::HashSet,
     fs,
@@ -53,6 +57,7 @@ pub struct MacroChangeSample {
 pub struct MacroPreview {
     id: String,
     base_revision: u64,
+    base_calculation_revision: u64,
     rows_before: usize,
     rows_after: usize,
     columns_before: usize,
@@ -95,6 +100,7 @@ struct MacroOutput {
 
 #[derive(Debug)]
 struct PendingPreview {
+    calculation_revision: u64,
     project: Option<(u64, String, u64)>,
     id: String,
     document_id: u64,
@@ -270,15 +276,24 @@ pub fn python_status(app: AppHandle) -> PythonStatus {
 }
 
 #[tauri::command]
-pub fn python_set_interpreter(app: AppHandle, path: String) -> Result<PythonStatus, String> {
-    let info = inspect_interpreter(path.trim())?;
-    session::save_python_interpreter(&app, info.path.clone())?;
-    Ok(PythonStatus {
-        path: Some(info.path),
-        version: Some(info.version),
-        available: true,
-        error: None,
+pub async fn python_set_interpreter(app: AppHandle, path: String) -> Result<PythonStatus, String> {
+    let _lease = PYTHON_QUEUE.lock().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let info = inspect_interpreter(path.trim())?;
+        let previous = session::load_python_interpreter(&app)?;
+        session::save_python_interpreter(&app, info.path.clone())?;
+        if previous.as_deref() != Some(&info.path) {
+            session::calculation::interpreter_changed(&app)?;
+        }
+        Ok(PythonStatus {
+            path: Some(info.path),
+            version: Some(info.version),
+            available: true,
+            error: None,
+        })
     })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn validated_macro_folder(path: &str) -> Result<String, String> {
@@ -597,6 +612,7 @@ fn build_preview(
     runtime.next_preview = runtime.next_preview.wrapping_add(1);
     let id = format!("macro-preview-{}", runtime.next_preview);
     runtime.pending = Some(PendingPreview {
+        calculation_revision: snapshot.calculation_revision,
         project: None,
         id: id.clone(),
         document_id: snapshot.document_id,
@@ -609,6 +625,7 @@ fn build_preview(
     Ok(MacroPreview {
         id,
         base_revision: snapshot.revision,
+        base_calculation_revision: snapshot.calculation_revision,
         rows_before: snapshot.rows.len(),
         rows_after: runtime
             .pending
@@ -689,6 +706,7 @@ async fn run_preview(
     if code.len() > CODE_LIMIT {
         return Err("macro code cannot exceed 1 MiB".into());
     }
+    let _execution_lease = PYTHON_QUEUE.lock().await;
     let interpreter = resolve_interpreter(app)?;
     let runner = runner_path(app)?;
     let inner = runtime_state.inner.clone();
@@ -737,6 +755,13 @@ async fn run_preview(
                 return Err("Script or input changed; run preview again".into());
             }
         }
+        {
+            let current = session::lock_document(&handle)?;
+            current.ensure_calculated()?;
+            if current.summary().calculation_revision != snapshot.calculation_revision {
+                return Err("Calculated input changed; run preview again".into());
+            }
+        }
         let mut preview = build_preview(&inner, &snapshot, output)?;
         if project.is_some() {
             preview.can_apply = true;
@@ -767,6 +792,7 @@ pub async fn project_python_preview(
         let handle = session::projects::handle(&workspace, project_id)?;
         let p = session::projects::lock_project(&handle)?;
         let (script, input) = p.script_input(&script_id)?;
+        session::lock_document(&input)?.ensure_calculated()?;
         let snapshot = session::lock_document(&input)?.macro_snapshot();
         (script, snapshot)
     };
@@ -799,6 +825,7 @@ fn validate_project_preview(
     if pending.id != preview_id
         || pending.project != Some((project_id, script.id.clone(), script.revision))
         || pending.document_id != snapshot.document_id
+        || pending.calculation_revision != snapshot.calculation_revision
         || pending.identity != snapshot.identity
         || pending.revision != snapshot.revision
         || pending.header_enabled != snapshot.header_enabled
@@ -820,6 +847,7 @@ pub fn project_python_result(
     let mut p = session::projects::lock_project(&handle)?;
     let (script, input) = p.script_input(&script_id)?;
     let input = session::lock_document(&input)?;
+    input.ensure_calculated()?;
     let snapshot = input.macro_snapshot();
     let pending = {
         let mut rt = lock_runtime(&runtime.inner)?;
@@ -888,6 +916,11 @@ pub fn python_apply_preview(
     Ok(session.summary())
 }
 
+pub(crate) fn request_calculation_cancel(runtime: &PythonRuntimeState) -> Result<(), String> {
+    lock_runtime(&runtime.inner)?.cancel_requested = true;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,6 +934,7 @@ mod tests {
             input_table_id: Some("t".into()),
         };
         let snapshot = MacroDocumentSnapshot {
+            calculation_revision: 0,
             document_id: 9,
             identity: 9,
             revision: 4,
@@ -911,6 +945,7 @@ mod tests {
             line_ending: tablune_csv::LineEnding::Lf,
         };
         let pending = PendingPreview {
+            calculation_revision: snapshot.calculation_revision,
             project: Some((1, "s".into(), 3)),
             id: "preview".into(),
             document_id: 9,
@@ -990,6 +1025,7 @@ mod tests {
     fn preview_samples_ragged_changes() {
         let inner = PythonRuntimeState::default().inner;
         let snapshot = MacroDocumentSnapshot {
+            calculation_revision: 0,
             document_id: 1,
             identity: 1,
             revision: 2,
@@ -1024,6 +1060,7 @@ mod tests {
         };
         let inner = PythonRuntimeState::default().inner;
         let snapshot = MacroDocumentSnapshot {
+            calculation_revision: 0,
             document_id: 1,
             identity: 1,
             revision: 0,
@@ -1064,6 +1101,7 @@ mod tests {
             .join("python")
             .join("tablune_runner.py");
         let snapshot = MacroDocumentSnapshot {
+            calculation_revision: 0,
             document_id: 1,
             identity: 1,
             revision: 0,
@@ -1095,6 +1133,7 @@ mod tests {
             .join("python")
             .join("tablune_runner.py");
         let snapshot = MacroDocumentSnapshot {
+            calculation_revision: 0,
             document_id: 1,
             identity: 1,
             revision: 0,
@@ -1125,6 +1164,7 @@ mod tests {
             .join("python")
             .join("tablune_runner.py");
         let snapshot = MacroDocumentSnapshot {
+            calculation_revision: 0,
             document_id: 1,
             identity: 1,
             revision: 0,
@@ -1175,6 +1215,7 @@ mod tests {
             .join("python")
             .join("tablune_runner.py");
         let snapshot = MacroDocumentSnapshot {
+            calculation_revision: 0,
             document_id: 1,
             identity: 1,
             revision: 0,

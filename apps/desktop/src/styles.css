@@ -835,14 +835,21 @@ button { cursor: default; }
 /* Product shell: Home and independent CSV/project spaces share the same surfaces. */
 .product-shell { display:flex; flex-direction:column; border:0; }
 [hidden] { display:none !important; }
-.space-bar { display:flex; align-items:center; gap:12px; padding:10px 16px; background:var(--surface); border-bottom:1px solid var(--border); min-height:52px; }
-.space-bar button,.home-screen button,.project-space button,.csv-project-action button,.empty-workspace button { border:1px solid var(--border-control); background:var(--control-background); border-radius:6px; padding:7px 10px; }
-.space-bar button:hover,.home-screen button:hover,.project-space button:hover { background:var(--accent-hover); }
-.space-bar .home-button { color:var(--accent); font-weight:650; }
-.space-selector { display:flex; align-items:center; gap:8px; font-size:12px; color:var(--text-muted); }
+.home-screen button,.project-space button,.csv-project-action button,.empty-workspace button { border:1px solid var(--border-control); background:var(--control-background); border-radius:6px; padding:7px 10px; }
+.home-screen button:hover,.project-space button:hover { background:var(--accent-hover); }
+.space-selector { display:flex; align-items:center; gap:8px; font-size:12px; }
 .space-selector select,.script-toolbar select { background:var(--control-background); border:1px solid var(--border-control); border-radius:6px; padding:6px; max-width:240px; }
-.space-title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; }
-.theme-switch { margin-left:auto; }
+.application-ribbon { flex:none; min-width:0; }
+.application-ribbon .header-menus { min-width:0; flex:1; overflow-x:auto; }
+.compact-header .home-button { color:white; background:transparent; border:0; padding:0 12px; font-weight:650; white-space:nowrap; }
+.compact-header .home-button:hover { background:rgba(255,255,255,.09); }
+.compact-header .space-selector { margin:0 12px 0 4px; color:white; flex:none; font-size:0; }
+.compact-header .space-selector select { width:clamp(110px,18vw,240px); font-size:12px; }
+.grid-host > .app-shell.managed-grid { grid-template-rows:minmax(0,1fr) 20px 30px; }
+@media (max-width: 800px) {
+  .application-ribbon .header-identity { display:none; }
+  .compact-header .header-menu { min-width:52px; }
+}
 .space-content { flex:1; min-height:0; position:relative; }
 .space-pane { height:100%; min-height:0; }
 .csv-space { display:flex; flex-direction:column; }
@@ -870,8 +877,8 @@ button { cursor: default; }
 .recent-list small { display:block; color:var(--text-muted); margin-top:4px; overflow-wrap:anywhere; font-size:11px; }
 .recent-kind { color:var(--accent); font-size:22px; }
 .home-version { margin-top:32px; font-size:11px; }
-.project-space { display:grid; grid-template-columns:230px minmax(0,1fr); }
-.project-navigator { background:var(--surface-subtle); border-right:1px solid var(--border); padding:16px 12px; overflow:auto; }
+.project-space { display:grid; grid-template-columns:auto minmax(0,1fr); }
+.project-navigator { min-height:0; padding:0 12px 16px; overflow:auto; }
 .project-navigator h2 { font-size:12px; text-transform:uppercase; letter-spacing:1px; color:var(--text-muted); margin:10px 0; }
 .navigator-actions { display:flex; gap:6px; margin-bottom:10px; }
 .navigator-actions button { font-size:11px; }
@@ -901,5 +908,36 @@ button { cursor: default; }
 .unsaved-dialog input { width:100%; padding:10px; background:var(--control-background); border:1px solid var(--border-control); border-radius:6px; }
 .project-space .primary { background:var(--accent); color:var(--surface); border-color:var(--accent); }
 .project-space .danger { color:var(--error); }
-@media(max-width:1050px) { .space-title { display:none; } .project-space { grid-template-columns:190px minmax(0,1fr); } .home-screen { padding:32px; } }
-.project-main .app-shell { grid-template-rows:auto minmax(0,1fr) 30px; }
+@media(max-width:1050px) { .space-title { display:none; }  .home-screen { padding:32px; } }
+.project-main .grid-host > .app-shell.managed-grid { grid-template-rows:minmax(0,1fr) 30px; }
+
+.sheet-grid { display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden; }
+.sheet-grid > .grid-viewport { flex:1; min-height:0; }
+.formula-toolbar { display:flex; align-items:center; gap:8px; padding:7px 10px; background:var(--surface); border-bottom:1px solid var(--border); }
+.cell-address { min-width:62px; font:12px ui-monospace,monospace; text-align:center; color:var(--text-muted); }
+.formula-symbol { color:var(--accent); font:italic 17px Georgia,serif; }
+.formula-toolbar input { flex:1; min-width:80px; border:1px solid var(--border-control); border-radius:5px; padding:6px 9px; background:var(--control-background); color:var(--text-primary); font:13px ui-monospace,monospace; }
+.formula-toolbar input:focus { outline:2px solid var(--focus-soft); border-color:var(--accent); }
+.formula-toolbar select { max-width:105px; padding:5px; background:var(--control-background); color:var(--text-primary); border:1px solid var(--border-control); border-radius:5px; }
+.formula-toolbar button { font-size:11px; white-space:nowrap; }
+.cell-error-detail,.cell-pending-detail { padding:5px 12px; font-size:12px; border-bottom:1px solid var(--border); color:var(--text-muted); background:var(--surface-subtle); overflow-wrap:anywhere; }
+.cell-error-detail { color:var(--error); }
+.calculation-toolbar { display:flex; align-items:center; flex-wrap:wrap; gap:10px; padding:7px 12px; border-bottom:1px solid var(--border); background:var(--surface-subtle); font-size:12px; color:var(--text-muted); }
+.calculation-toolbar button { font-size:12px; }
+.calculation-error { color:var(--error); flex:1; overflow-wrap:anywhere; }
+.functions-editor { height:100%; }
+.functions-description,.functions-status,.functions-example { margin:0; padding:12px 18px; color:var(--text-muted); font-size:13px; }
+.functions-description code,.functions-example pre { color:var(--text-primary); }
+.functions-example { border-top:1px solid var(--border); }
+.functions-example pre { font:13px ui-monospace,monospace; }
+.functions-editor .project-code { flex:1; min-height:120px; }
+
+/* The navigator can be resized or reduced to a narrow expansion rail. */
+.project-sidebar { position:relative; display:flex; flex-direction:column; min-height:0; background:var(--surface-subtle); border-right:1px solid var(--border); }
+.sidebar-heading { display:flex; justify-content:flex-end; padding:3px; flex:none; }
+.project-sidebar .sidebar-toggle { display:flex; align-items:center; justify-content:center; width:24px; height:24px; padding:0; border:0; background:transparent; color:var(--text-muted); font-size:22px; }
+.sidebar-resizer { position:absolute; right:-3px; top:32px; bottom:0; width:6px; cursor:col-resize; touch-action:none; z-index:5; }
+.sidebar-resizer:hover,.sidebar-resizer:focus-visible { background:var(--accent-border); outline:none; }
+.project-navigator .calculation-toolbar { align-items:stretch; flex-direction:column; gap:7px; padding:0 0 14px; margin-bottom:14px; }
+.project-navigator .calculation-toolbar button { white-space:normal; }
+.project-navigator .calculation-toolbar span { overflow-wrap:anywhere; }

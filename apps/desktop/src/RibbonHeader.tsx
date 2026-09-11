@@ -1,5 +1,6 @@
 import {
   type FocusEvent,
+  type ReactNode,
   useEffect,
   useRef,
   useState,
@@ -18,7 +19,10 @@ const MENUS: Array<{ id: MenuSection; label: string }> = [
   { id: "view", label: "View" },
 ];
 
-interface RibbonHeaderProps {
+export interface RibbonHeaderProps {
+  navigation?: ReactNode;
+  fileActions?: ReactNode;
+  tableAvailable?: boolean;
   documentName: string;
   dirty: boolean;
   busy: boolean;
@@ -76,7 +80,10 @@ function writePinnedPreference(pinned: boolean): void {
 }
 
 export default function RibbonHeader({
-  documentName,
+  navigation,
+  fileActions,
+  tableAvailable = true,
+  documentName = "",
   dirty,
   busy,
   mutationsLocked = false,
@@ -113,8 +120,8 @@ export default function RibbonHeader({
   onPythonMacro,
   onThemeChange,
   onDelimiterChange,
-  onDocumentNameCommit,
-}: RibbonHeaderProps) {
+  onDocumentNameCommit = async () => false,
+}: RibbonHeaderProps | (Partial<RibbonHeaderProps> & { tableAvailable: false; theme: ThemeMode; onThemeChange: (theme: ThemeMode) => void })) {
   const [activeMenu, setActiveMenu] = useState<MenuSection>("file");
   const [pointerOpen, setPointerOpen] = useState(false);
   const [focusOpen, setFocusOpen] = useState(false);
@@ -214,7 +221,8 @@ export default function RibbonHeader({
     >
       <header className="compact-header">
         <nav className="header-menus" aria-label="Application sections">
-          {MENUS.map((menu) => (
+          {navigation}
+          {MENUS.filter((menu) => tableAvailable || menu.id === "file" || menu.id === "view").map((menu) => (
             <button
               key={menu.id}
               className={`header-menu${activeMenu === menu.id ? " active" : ""}`}
@@ -233,7 +241,7 @@ export default function RibbonHeader({
         </nav>
 
         <div className="header-identity">
-          {editingName ? (
+          {tableAvailable && (editingName ? (
             <span className="header-document-editor">
               {dirty && <span className="dirty-dot" aria-label="Unsaved changes">●</span>}
               <input
@@ -267,7 +275,7 @@ export default function RibbonHeader({
               {dirty && <span className="dirty-dot" aria-label="Unsaved changes">●</span>}
               {documentName}
             </button>
-          )}
+          ))}
           <span className="identity-divider" aria-hidden="true" />
           <span className="compact-brand-lockup" role="img" aria-label="Tablune Sheets">
             <img
@@ -299,12 +307,15 @@ export default function RibbonHeader({
           <div className="ribbon-content">
             {activeMenu === "file" && (
               <div className="ribbon-group" aria-label="File actions">
+                {fileActions}
+                {tableAvailable && <>
                 <button onClick={onNew} disabled={busy || mutationsLocked}>New</button>
                 <button onClick={onOpen} disabled={busy || mutationsLocked}>Open</button>
                 <button onClick={onSave} disabled={busy || mutationsLocked}>Save</button>
                 <button onClick={onSaveAs} disabled={busy || mutationsLocked}>Save As</button>
                 <button onClick={onDuplicate} disabled={busy || mutationsLocked || !canDuplicate}>Duplicar</button>
                 <button onClick={onExportView} disabled={busy || mutationsLocked}>Export View</button>
+                </>}
               </div>
             )}
 
@@ -328,7 +339,7 @@ export default function RibbonHeader({
                   <select
                     value={delimiter}
                     disabled={busy || mutationsLocked}
-                    onChange={(event) => onDelimiterChange(event.target.value)}
+                    onChange={(event) => onDelimiterChange?.(event.target.value)}
                   >
                     <option value=",">Comma</option>
                     <option value=";">Semicolon</option>
@@ -351,13 +362,15 @@ export default function RibbonHeader({
 
             {activeMenu === "view" && (
               <div className="ribbon-group" aria-label="View actions">
-                <label className="ribbon-check"><input type="checkbox" checked={headerEnabled} disabled={busy || mutationsLocked} onChange={(event) => onHeaderChange(event.target.checked)} /> First row is header</label>
+                {tableAvailable && <><label className="ribbon-check"><input type="checkbox" checked={headerEnabled} disabled={busy || mutationsLocked} onChange={(event) => onHeaderChange?.(event.target.checked)} /> First row is header</label></>}
                 <span className="ribbon-divider" aria-hidden="true" />
-                <label className="ribbon-check"><input type="checkbox" checked={theme === "dark"} onChange={(event) => onThemeChange(event.target.checked ? "dark" : "light")} /> Dark mode</label>
+                <label className="ribbon-check"><input type="checkbox" checked={theme === "dark"} onChange={(event) => onThemeChange?.(event.target.checked ? "dark" : "light")} /> Dark mode</label>
                 <span className="ribbon-divider" aria-hidden="true" />
+                {tableAvailable && <>
                 <button onClick={onFind}>Find</button>
                 <button onClick={onToggleExplorer} disabled={mutationsLocked}>Data Explorer</button>
                 <button onClick={onResetCellSizing} disabled={busy || !hasCustomSizing}>Reset Cell Size</button>
+                </>}
               </div>
             )}
 

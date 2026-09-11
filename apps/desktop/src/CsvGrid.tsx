@@ -19,10 +19,20 @@ import {
   withSizeOverride,
   type AxisMetrics,
 } from "./gridSizing";
-import { getGridWindow } from "./ipc";
+import {
+  getGridWindow,
+  getSheetCell,
+  shiftSheetFormulas,
+  clipboardGeneration,
+  readNativeClipboard,
+  writeNativeClipboard,
+} from "./ipc";
 import { GRID_PALETTES, type ThemeMode } from "./theme";
 import type {
   CellCoordinate,
+  CellInfo,
+  CellType,
+  SheetCellInput,
   DocumentSummary,
   EditCommand,
   GridSizingState,
@@ -32,6 +42,20 @@ import type {
   SelectionRange,
 } from "./types";
 
+const pendingCellEdits = new Set<Promise<void>>();
+export async function flushCellEdits() {
+  const requests: Promise<void>[] = [];
+  document.dispatchEvent(
+    new CustomEvent("tablune-flush-cell-edits", { detail: requests }),
+  );
+  await Promise.all([...requests, ...pendingCellEdits]);
+}
+let internalClipboard: {
+  documentId: number;
+  text: string;
+  generation: number | null;
+  inputs: CellInfo[][];
+} | null = null;
 const ROW_HEADER_WIDTH = 52;
 const COLUMN_HEADER_HEIGHT = 32;
 const MIN_ROWS = 100;
@@ -104,10 +128,14 @@ export function normalizeSelection(selection: SelectionRange) {
 
 export function encodeClipboardMatrix(matrix: string[][]): string {
   return matrix
-    .map((row) => row.map((value) => {
-      if (!/[\t\r\n"]/.test(value)) return value;
-      return `"${value.replaceAll('"', '""')}"`;
-    }).join("\t"))
+    .map((row) =>
+      row
+        .map((value) => {
+          if (!/[\t\r\n"]/.test(value)) return value;
+          return `"${value.replaceAll('"', '""')}"`;
+        })
+        .join("\t"),
+    )
     .join("\r\n");
 }
 
@@ -137,7 +165,12 @@ export function parseClipboardMatrix(text: string): string[][] {
     }
   }
   rows.at(-1)?.push(value);
-  if (rows.length > 1 && rows.at(-1)?.length === 1 && rows.at(-1)?.[0] === "" && /[\r\n]$/.test(text)) {
+  if (
+    rows.length > 1 &&
+    rows.at(-1)?.length === 1 &&
+    rows.at(-1)?.[0] === "" &&
+    /[\r\n]$/.test(text)
+  ) {
     rows.pop();
   }
   return rows;
@@ -155,18 +188,28 @@ export async function fetchGridSelectionMatrix(
   documentId: number,
   range: ReturnType<typeof normalizeSelection>,
   loadWindow: GridWindowLoader = getGridWindow,
-): Promise<{ matrix: string[][]; sourceRows: number[] }> {
+): Promise<{ matrix: string[][]; sourceRows: number[]; inputs: CellInfo[][] }> {
   const rowAmount = range.endRow - range.startRow + 1;
   const columnAmount = range.endColumn - range.startColumn + 1;
   const matrix: string[][] = [];
+  const inputs: CellInfo[][] = [];
   const sourceRows: number[] = [];
   let expectedRevision: number | null = null;
   let expectedViewRevision: number | null = null;
 
-  for (let rowOffset = 0; rowOffset < rowAmount; rowOffset += SELECTION_ROW_CHUNK) {
+  for (
+    let rowOffset = 0;
+    rowOffset < rowAmount;
+    rowOffset += SELECTION_ROW_CHUNK
+  ) {
     const chunkMatrix: string[][] = [];
+    const chunkInputs: CellInfo[][] = [];
     const chunkSourceRows: number[] = [];
-    for (let columnOffset = 0; columnOffset < columnAmount; columnOffset += GRID_WINDOW_COLUMN_LIMIT) {
+    for (
+      let columnOffset = 0;
+      columnOffset < columnAmount;
+      columnOffset += GRID_WINDOW_COLUMN_LIMIT
+    ) {
       const data = await loadWindow(
         documentId,
         range.startRow + rowOffset,
@@ -180,31 +223,46 @@ export async function fetchGridSelectionMatrix(
       if (expectedRevision === null) {
         expectedRevision = data.revision;
         expectedViewRevision = data.viewRevision;
-      } else if (data.revision !== expectedRevision || data.viewRevision !== expectedViewRevision) {
-        throw new Error("The document view changed while reading the selection.");
+      } else if (
+        data.revision !== expectedRevision ||
+        data.viewRevision !== expectedViewRevision
+      ) {
+        throw new Error(
+          "The document view changed while reading the selection.",
+        );
       }
       if (columnOffset === 0) {
         for (const row of data.rows) {
           chunkMatrix.push([...row.cells]);
+          chunkInputs.push([...(row.inputs ?? [])]);
           chunkSourceRows.push(row.sourceRow);
         }
       } else {
-        if (data.rows.length !== chunkMatrix.length
-          || data.rows.some((row, index) => row.sourceRow !== chunkSourceRows[index])) {
-          throw new Error("The document view changed while reading the selection.");
+        if (
+          data.rows.length !== chunkMatrix.length ||
+          data.rows.some(
+            (row, index) => row.sourceRow !== chunkSourceRows[index],
+          )
+        ) {
+          throw new Error(
+            "The document view changed while reading the selection.",
+          );
         }
         for (let index = 0; index < data.rows.length; index += 1) {
           chunkMatrix[index].push(...data.rows[index].cells);
+          chunkInputs[index].push(...(data.rows[index].inputs ?? []));
         }
       }
     }
     matrix.push(...chunkMatrix);
+    inputs.push(...chunkInputs);
     sourceRows.push(...chunkSourceRows);
   }
-  return { matrix, sourceRows };
+  return { matrix, sourceRows, inputs };
 }
 
 async function writeClipboard(text: string): Promise<void> {
+  if (await writeNativeClipboard(text)) return;
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(text);
     return;
@@ -251,9 +309,26 @@ export default function CsvGrid({
   const [selection, setSelection] = useState<SelectionRange>(initialSelection);
   const [editing, setEditing] = useState<EditingCell | null>(null);
   const [draft, setDraft] = useState("");
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const isSheet = summary.projectId != null;
+  const [activeInfo, setActiveInfo] = useState<CellInfo | null>(null);
+  const [barEditing, setBarEditing] = useState(false);
+  const formulaBarRef = useRef<HTMLInputElement>(null);
+  const cellEditorRef = useRef<HTMLInputElement>(null);
+  const referenceDrag = useRef<{
+    anchor: CellCoordinate;
+    base: string;
+    start: number;
+    end: number;
+  } | null>(null);
+  const pendingEdit = useRef<Promise<void> | null>(null);
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
   const [resizeState, setResizeState] = useState<ResizeState | null>(null);
-  const [resizeHover, setResizeHover] = useState<ResizeTarget["axis"] | null>(null);
+  const [resizeHover, setResizeHover] = useState<ResizeTarget["axis"] | null>(
+    null,
+  );
 
   const columnCount = Math.max(MIN_COLUMNS, summary.columnCount);
   const rowCount = Math.max(MIN_ROWS, summary.visibleRowCount || 1);
@@ -281,40 +356,81 @@ export default function CsvGrid({
     };
   }, [initialSizing, resizeState]);
   const columnMetrics = useMemo(
-    () => createAxisMetrics(columnCount, DEFAULT_COLUMN_WIDTH, activeSizing.columnWidths),
+    () =>
+      createAxisMetrics(
+        columnCount,
+        DEFAULT_COLUMN_WIDTH,
+        activeSizing.columnWidths,
+      ),
     [activeSizing.columnWidths, columnCount],
   );
   const rowMetrics = useMemo(
-    () => createAxisMetrics(rowCount, DEFAULT_ROW_HEIGHT, activeSizing.rowHeights),
+    () =>
+      createAxisMetrics(rowCount, DEFAULT_ROW_HEIGHT, activeSizing.rowHeights),
     [activeSizing.rowHeights, rowCount],
   );
   const totalWidth = ROW_HEADER_WIDTH + columnMetrics.totalSize;
   const totalHeight = COLUMN_HEADER_HEIGHT + rowMetrics.totalSize;
 
-  const publishSelection = useCallback((next: SelectionRange) => {
-    setSelection(next);
-    onSelectionChange(next);
-  }, [onSelectionChange]);
+  const publishSelection = useCallback(
+    (next: SelectionRange) => {
+      setSelection(next);
+      onSelectionChange(next);
+    },
+    [onSelectionChange],
+  );
 
   const loadVisibleWindow = useCallback(async () => {
     const viewport = viewportRef.current;
     if (!viewport || resizeState) return;
-    const visibleFirstRow = rowMetrics.indexAt(viewport.scrollTop - COLUMN_HEADER_HEIGHT);
-    const visibleLastRow = rowMetrics.indexAt(viewport.scrollTop + viewport.clientHeight - COLUMN_HEADER_HEIGHT);
+    const visibleFirstRow = rowMetrics.indexAt(
+      viewport.scrollTop - COLUMN_HEADER_HEIGHT,
+    );
+    const visibleLastRow = rowMetrics.indexAt(
+      viewport.scrollTop + viewport.clientHeight - COLUMN_HEADER_HEIGHT,
+    );
     const firstRow = Math.max(0, visibleFirstRow - WINDOW_OVERSCAN);
-    const rowAmount = Math.min(rowCount - firstRow, visibleLastRow - firstRow + 1 + WINDOW_OVERSCAN);
-    const visibleFirstColumn = columnMetrics.indexAt(viewport.scrollLeft - ROW_HEADER_WIDTH);
-    const visibleLastColumn = columnMetrics.indexAt(viewport.scrollLeft + viewport.clientWidth - ROW_HEADER_WIDTH);
+    const rowAmount = Math.min(
+      rowCount - firstRow,
+      visibleLastRow - firstRow + 1 + WINDOW_OVERSCAN,
+    );
+    const visibleFirstColumn = columnMetrics.indexAt(
+      viewport.scrollLeft - ROW_HEADER_WIDTH,
+    );
+    const visibleLastColumn = columnMetrics.indexAt(
+      viewport.scrollLeft + viewport.clientWidth - ROW_HEADER_WIDTH,
+    );
     const firstColumn = Math.max(0, visibleFirstColumn - 2);
-    const columnAmount = Math.min(columnCount - firstColumn, visibleLastColumn - firstColumn + 4);
+    const columnAmount = Math.min(
+      columnCount - firstColumn,
+      visibleLastColumn - firstColumn + 4,
+    );
     const currentRequest = ++requestId.current;
     try {
-      const data = await getGridWindow(summary.documentId, firstRow, rowAmount, firstColumn, columnAmount);
-      if (currentRequest === requestId.current && data.documentId === summary.documentId) setWindowData(data);
+      const data = await getGridWindow(
+        summary.documentId,
+        firstRow,
+        rowAmount,
+        firstColumn,
+        columnAmount,
+      );
+      if (
+        currentRequest === requestId.current &&
+        data.documentId === summary.documentId
+      )
+        setWindowData(data);
     } catch (reason) {
       onError(String(reason));
     }
-  }, [columnCount, columnMetrics, onError, resizeState, rowCount, rowMetrics, summary.documentId]);
+  }, [
+    columnCount,
+    columnMetrics,
+    onError,
+    resizeState,
+    rowCount,
+    rowMetrics,
+    summary.documentId,
+  ]);
 
   useEffect(() => {
     requestId.current += 1;
@@ -338,27 +454,42 @@ export default function CsvGrid({
     viewport.scrollLeft = initialViewport.scrollLeft;
     draw();
     void loadVisibleWindow();
-  // Initial values belong to the mounted document. Subsequent scroll updates are reported upward.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // Initial values belong to the mounted document. Subsequent scroll updates are reported upward.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [summary.documentId]);
 
-  useEffect(() => () => {
-    if (viewportFrame.current !== null) window.cancelAnimationFrame(viewportFrame.current);
-  }, []);
+  useEffect(
+    () => () => {
+      if (viewportFrame.current !== null)
+        window.cancelAnimationFrame(viewportFrame.current);
+    },
+    [],
+  );
 
   useEffect(() => {
     void loadVisibleWindow();
-  }, [loadVisibleWindow, summary.revision, summary.viewRevision]);
+  }, [
+    loadVisibleWindow,
+    summary.revision,
+    summary.viewRevision,
+    summary.calculationRevision,
+  ]);
 
-  const cachedRow = useCallback((viewRow: number) => {
-    return windowData?.rows.find((row) => row.viewIndex === viewRow);
-  }, [windowData]);
+  const cachedRow = useCallback(
+    (viewRow: number) => {
+      return windowData?.rows.find((row) => row.viewIndex === viewRow);
+    },
+    [windowData],
+  );
 
-  const getCell = useCallback((viewRow: number, column: number): string => {
-    const row = cachedRow(viewRow);
-    if (!row || !windowData) return "";
-    return row.cells[column - windowData.columnStart] ?? "";
-  }, [cachedRow, windowData]);
+  const getCell = useCallback(
+    (viewRow: number, column: number): string => {
+      const row = cachedRow(viewRow);
+      if (!row || !windowData) return "";
+      return row.cells[column - windowData.columnStart] ?? "";
+    },
+    [cachedRow, windowData],
+  );
 
   const draw = useCallback(() => {
     const viewport = viewportRef.current;
@@ -376,12 +507,21 @@ export default function CsvGrid({
     if (!context) return;
     context.setTransform(scale, 0, 0, scale, 0, 0);
     context.clearRect(0, 0, width, height);
-    context.font = "13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+    context.font =
+      "13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
     context.textBaseline = "middle";
-    const firstColumn = columnMetrics.indexAt(viewport.scrollLeft - ROW_HEADER_WIDTH);
-    const lastColumn = columnMetrics.indexAt(viewport.scrollLeft + width - ROW_HEADER_WIDTH);
-    const firstRow = rowMetrics.indexAt(viewport.scrollTop - COLUMN_HEADER_HEIGHT);
-    const lastRow = rowMetrics.indexAt(viewport.scrollTop + height - COLUMN_HEADER_HEIGHT);
+    const firstColumn = columnMetrics.indexAt(
+      viewport.scrollLeft - ROW_HEADER_WIDTH,
+    );
+    const lastColumn = columnMetrics.indexAt(
+      viewport.scrollLeft + width - ROW_HEADER_WIDTH,
+    );
+    const firstRow = rowMetrics.indexAt(
+      viewport.scrollTop - COLUMN_HEADER_HEIGHT,
+    );
+    const lastRow = rowMetrics.indexAt(
+      viewport.scrollTop + height - COLUMN_HEADER_HEIGHT,
+    );
     const range = normalizeSelection(selection);
     const palette = GRID_PALETTES[theme];
     context.fillStyle = palette.background;
@@ -389,16 +529,30 @@ export default function CsvGrid({
 
     for (let column = firstColumn; column <= lastColumn; column += 1) {
       const columnWidth = columnMetrics.sizeAt(column);
-      const x = ROW_HEADER_WIDTH + columnMetrics.offsetAt(column) - viewport.scrollLeft;
-      const selected = selection.mode === "columns" && column >= range.startColumn && column <= range.endColumn;
-      context.fillStyle = selected || column === selection.focus.column ? palette.activeHeader : palette.header;
+      const x =
+        ROW_HEADER_WIDTH + columnMetrics.offsetAt(column) - viewport.scrollLeft;
+      const selected =
+        selection.mode === "columns" &&
+        column >= range.startColumn &&
+        column <= range.endColumn;
+      context.fillStyle =
+        selected || column === selection.focus.column
+          ? palette.activeHeader
+          : palette.header;
       context.fillRect(x, 0, columnWidth, COLUMN_HEADER_HEIGHT);
       context.fillStyle = palette.headerText;
       context.textAlign = "center";
-      const label = summary.headerEnabled ? summary.headerNames[column] ?? columnName(column) : columnName(column);
+      const label = summary.headerEnabled
+        ? (summary.headerNames[column] ?? columnName(column))
+        : columnName(column);
       context.save();
       context.beginPath();
-      context.rect(x + 4, 0, Math.max(0, columnWidth - 8), COLUMN_HEADER_HEIGHT);
+      context.rect(
+        x + 4,
+        0,
+        Math.max(0, columnWidth - 8),
+        COLUMN_HEADER_HEIGHT,
+      );
       context.clip();
       context.fillText(label, x + columnWidth / 2, COLUMN_HEADER_HEIGHT / 2);
       if (column < summary.headerNames.length) {
@@ -411,24 +565,45 @@ export default function CsvGrid({
 
     for (let row = firstRow; row <= lastRow; row += 1) {
       const rowHeight = rowMetrics.sizeAt(row);
-      const y = COLUMN_HEADER_HEIGHT + rowMetrics.offsetAt(row) - viewport.scrollTop;
-      const rowSelected = selection.mode === "rows" && row >= range.startRow && row <= range.endRow;
-      context.fillStyle = rowSelected || row === selection.focus.row ? palette.activeHeader : palette.header;
+      const y =
+        COLUMN_HEADER_HEIGHT + rowMetrics.offsetAt(row) - viewport.scrollTop;
+      const rowSelected =
+        selection.mode === "rows" &&
+        row >= range.startRow &&
+        row <= range.endRow;
+      context.fillStyle =
+        rowSelected || row === selection.focus.row
+          ? palette.activeHeader
+          : palette.header;
       context.fillRect(0, y, ROW_HEADER_WIDTH, rowHeight);
       context.fillStyle = palette.rowHeaderText;
       context.textAlign = "center";
       const sourceRow = cachedRow(row)?.sourceRow;
-      context.fillText(String((sourceRow ?? row) + 1), ROW_HEADER_WIDTH / 2, y + rowHeight / 2);
+      context.fillText(
+        String((sourceRow ?? row) + 1),
+        ROW_HEADER_WIDTH / 2,
+        y + rowHeight / 2,
+      );
       for (let column = firstColumn; column <= lastColumn; column += 1) {
         const columnWidth = columnMetrics.sizeAt(column);
-        const x = ROW_HEADER_WIDTH + columnMetrics.offsetAt(column) - viewport.scrollLeft;
-        const selected = row >= range.startRow && row <= range.endRow
-          && column >= range.startColumn && column <= range.endColumn;
+        const x =
+          ROW_HEADER_WIDTH +
+          columnMetrics.offsetAt(column) -
+          viewport.scrollLeft;
+        const selected =
+          row >= range.startRow &&
+          row <= range.endRow &&
+          column >= range.startColumn &&
+          column <= range.endColumn;
         if (selected) {
           context.fillStyle = palette.selectionFill;
           context.fillRect(x, y, columnWidth, rowHeight);
         }
-        context.fillStyle = palette.cellText;
+        context.fillStyle = cachedRow(row)?.inputs?.[
+          column - (windowData?.columnStart ?? 0)
+        ]?.error
+          ? "#b94141"
+          : palette.cellText;
         context.textAlign = "left";
         context.save();
         context.beginPath();
@@ -443,12 +618,20 @@ export default function CsvGrid({
     context.lineWidth = 1;
     context.beginPath();
     for (let column = firstColumn; column <= lastColumn + 1; column += 1) {
-      const x = ROW_HEADER_WIDTH + columnMetrics.offsetAt(column) - viewport.scrollLeft + 0.5;
+      const x =
+        ROW_HEADER_WIDTH +
+        columnMetrics.offsetAt(column) -
+        viewport.scrollLeft +
+        0.5;
       context.moveTo(x, 0);
       context.lineTo(x, height);
     }
     for (let row = firstRow; row <= lastRow + 1; row += 1) {
-      const y = COLUMN_HEADER_HEIGHT + rowMetrics.offsetAt(row) - viewport.scrollTop + 0.5;
+      const y =
+        COLUMN_HEADER_HEIGHT +
+        rowMetrics.offsetAt(row) -
+        viewport.scrollTop +
+        0.5;
       context.moveTo(0, y);
       context.lineTo(width, y);
     }
@@ -458,8 +641,14 @@ export default function CsvGrid({
     context.lineTo(width, COLUMN_HEADER_HEIGHT + 0.5);
     context.stroke();
 
-    const selectedX = ROW_HEADER_WIDTH + columnMetrics.offsetAt(range.startColumn) - viewport.scrollLeft;
-    const selectedY = COLUMN_HEADER_HEIGHT + rowMetrics.offsetAt(range.startRow) - viewport.scrollTop;
+    const selectedX =
+      ROW_HEADER_WIDTH +
+      columnMetrics.offsetAt(range.startColumn) -
+      viewport.scrollLeft;
+    const selectedY =
+      COLUMN_HEADER_HEIGHT +
+      rowMetrics.offsetAt(range.startRow) -
+      viewport.scrollTop;
     context.strokeStyle = palette.selectionStroke;
     context.lineWidth = 2;
     context.strokeRect(
@@ -468,7 +657,16 @@ export default function CsvGrid({
       columnMetrics.rangeSize(range.startColumn, range.endColumn + 1) - 2,
       rowMetrics.rangeSize(range.startRow, range.endRow + 1) - 2,
     );
-  }, [cachedRow, columnMetrics, getCell, rowMetrics, selection, summary.headerEnabled, summary.headerNames, theme]);
+  }, [
+    cachedRow,
+    columnMetrics,
+    getCell,
+    rowMetrics,
+    selection,
+    summary.headerEnabled,
+    summary.headerNames,
+    theme,
+  ]);
 
   useLayoutEffect(() => {
     draw();
@@ -485,12 +683,20 @@ export default function CsvGrid({
   const boundaryAt = (metrics: AxisMetrics, offset: number): number | null => {
     if (offset < 0 || offset > metrics.totalSize) return null;
     const index = metrics.indexAt(offset);
-    if (index > 0 && Math.abs(offset - metrics.offsetAt(index)) <= RESIZE_HIT_RADIUS) return index - 1;
-    if (Math.abs(offset - metrics.offsetAt(index + 1)) <= RESIZE_HIT_RADIUS) return index;
+    if (
+      index > 0 &&
+      Math.abs(offset - metrics.offsetAt(index)) <= RESIZE_HIT_RADIUS
+    )
+      return index - 1;
+    if (Math.abs(offset - metrics.offsetAt(index + 1)) <= RESIZE_HIT_RADIUS)
+      return index;
     return null;
   };
 
-  const resizeTargetFromPointer = (event: { clientX: number; clientY: number }): ResizeTarget | null => {
+  const resizeTargetFromPointer = (event: {
+    clientX: number;
+    clientY: number;
+  }): ResizeTarget | null => {
     const viewport = viewportRef.current;
     if (!viewport) return null;
     const rect = viewport.getBoundingClientRect();
@@ -507,7 +713,10 @@ export default function CsvGrid({
     return null;
   };
 
-  const targetFromPointer = (event: { clientX: number; clientY: number }): GridTarget | null => {
+  const targetFromPointer = (event: {
+    clientX: number;
+    clientY: number;
+  }): GridTarget | null => {
     const viewport = viewportRef.current;
     if (!viewport) return null;
     const rect = viewport.getBoundingClientRect();
@@ -545,40 +754,88 @@ export default function CsvGrid({
     if (target.axis === "row") {
       publishSizing({
         ...initialSizing,
-        rowHeights: withSizeOverride(initialSizing.rowHeights, target.index, DEFAULT_ROW_HEIGHT, DEFAULT_ROW_HEIGHT),
+        rowHeights: withSizeOverride(
+          initialSizing.rowHeights,
+          target.index,
+          DEFAULT_ROW_HEIGHT,
+          DEFAULT_ROW_HEIGHT,
+        ),
       });
       return;
     }
     const canvas = canvasRef.current;
     const context = canvas?.getContext("2d");
-    if (context) context.font = "13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+    if (context)
+      context.font =
+        "13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
     const label = summary.headerEnabled
-      ? summary.headerNames[target.index] ?? columnName(target.index)
+      ? (summary.headerNames[target.index] ?? columnName(target.index))
       : columnName(target.index);
     const values = [label];
-    if (windowData
-      && target.index >= windowData.columnStart
-      && windowData.rows.some((row) => target.index - windowData.columnStart < row.cells.length)) {
-      for (const row of windowData.rows) values.push(row.cells[target.index - windowData.columnStart] ?? "");
+    if (
+      windowData &&
+      target.index >= windowData.columnStart &&
+      windowData.rows.some(
+        (row) => target.index - windowData.columnStart < row.cells.length,
+      )
+    ) {
+      for (const row of windowData.rows)
+        values.push(row.cells[target.index - windowData.columnStart] ?? "");
     }
-    const measured = Math.max(...values.map((value) => context?.measureText?.(value).width ?? value.length * 7));
+    const measured = Math.max(
+      ...values.map(
+        (value) => context?.measureText?.(value).width ?? value.length * 7,
+      ),
+    );
     const iconAllowance = target.index < summary.headerNames.length ? 28 : 0;
-    const width = clampGridSize(measured + 16 + iconAllowance, MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH);
+    const width = clampGridSize(
+      measured + 16 + iconAllowance,
+      MIN_COLUMN_WIDTH,
+      MAX_COLUMN_WIDTH,
+    );
     publishSizing({
       ...initialSizing,
-      columnWidths: withSizeOverride(initialSizing.columnWidths, target.index, width, DEFAULT_COLUMN_WIDTH),
+      columnWidths: withSizeOverride(
+        initialSizing.columnWidths,
+        target.index,
+        width,
+        DEFAULT_COLUMN_WIDTH,
+      ),
     });
   };
 
-  const rangeForTarget = (target: GridTarget, extend: boolean): SelectionRange => {
-    const anchor = extend ? selection.anchor : { row: target.row, column: target.column };
+  const rangeForTarget = (
+    target: GridTarget,
+    extend: boolean,
+  ): SelectionRange => {
+    const anchor = extend
+      ? selection.anchor
+      : { row: target.row, column: target.column };
     if (target.mode === "rows") {
-      return { anchor: { row: anchor.row, column: 0 }, focus: { row: target.row, column: Math.max(0, summary.columnCount - 1) }, mode: "rows" };
+      return {
+        anchor: { row: anchor.row, column: 0 },
+        focus: {
+          row: target.row,
+          column: Math.max(0, summary.columnCount - 1),
+        },
+        mode: "rows",
+      };
     }
     if (target.mode === "columns") {
-      return { anchor: { row: 0, column: anchor.column }, focus: { row: Math.max(0, summary.visibleRowCount - 1), column: target.column }, mode: "columns" };
+      return {
+        anchor: { row: 0, column: anchor.column },
+        focus: {
+          row: Math.max(0, summary.visibleRowCount - 1),
+          column: target.column,
+        },
+        mode: "columns",
+      };
     }
-    return { anchor, focus: { row: target.row, column: target.column }, mode: "cells" };
+    return {
+      anchor,
+      focus: { row: target.row, column: target.column },
+      mode: "cells",
+    };
   };
 
   const sourceRowForView = async (viewRow: number): Promise<number | null> => {
@@ -588,55 +845,114 @@ export default function CsvGrid({
     if (data.documentId !== summary.documentId) return null;
     if (data.rows[0]) return data.rows[0].sourceRow;
     if (!summary.filtersActive && summary.sortCount === 0) {
-      return viewRow + Number(summary.headerEnabled);
+      return viewRow + Number(summary.headerEnabled && !isSheet);
     }
     return null;
   };
 
   const beginEditing = async (target: GridTarget) => {
     if (readOnly) return;
-    if (target.mode === "columns" && summary.headerEnabled) {
+    if (target.mode === "columns" && summary.headerEnabled && !isSheet) {
       setDraft(summary.headerValues[target.column] ?? "");
-      setEditing({ viewRow: -1, sourceRow: 0, column: target.column, header: true });
+      setEditing({
+        viewRow: -1,
+        sourceRow: 0,
+        column: target.column,
+        header: true,
+      });
       return;
     }
     if (target.mode !== "cells") return;
     const sourceRow = await sourceRowForView(target.row);
     if (sourceRow === null) return;
     publishSelection(rangeForTarget(target, false));
-    setDraft(getCell(target.row, target.column));
-    setEditing({ viewRow: target.row, sourceRow, column: target.column, header: false });
+    setBarEditing(false);
+    setDraft(
+      isSheet
+        ? (await getSheetCell(summary.documentId, sourceRow, target.column))
+            .source
+        : getCell(target.row, target.column),
+    );
+    setEditing({
+      viewRow: target.row,
+      sourceRow,
+      column: target.column,
+      header: false,
+    });
   };
 
-  const commitEdit = async () => {
+  const commitEdit = (): Promise<void> => {
+    if (pendingEdit.current) return pendingEdit.current;
     const target = editing;
-    if (!target) return;
+    if (!target) return Promise.resolve();
     setEditing(null);
-    if (readOnly) return;
-    await onApplyEdit({ kind: "setCells", cells: [{ row: target.sourceRow, column: target.column, value: draft }] });
-    viewportRef.current?.focus();
+    setBarEditing(false);
+    if (readOnly) return Promise.resolve();
+    const operation = onApplyEdit({
+      kind: isSheet ? "setSheetCells" : "setCells",
+      cells: [{ row: target.sourceRow, column: target.column, value: draft }],
+    });
+    pendingEdit.current = operation;
+    pendingCellEdits.add(operation);
+    void operation.then(
+      () => {
+        pendingEdit.current = null;
+        pendingCellEdits.delete(operation);
+        viewportRef.current?.focus();
+      },
+      () => {
+        pendingEdit.current = null;
+        pendingCellEdits.delete(operation);
+      },
+    );
+    return operation;
   };
+  useEffect(() => {
+    const flush = (event: Event) => {
+      if (editing || pendingEdit.current)
+        (event as CustomEvent<Promise<void>[]>).detail.push(commitEdit());
+    };
+    document.addEventListener("tablune-flush-cell-edits", flush);
+    return () =>
+      document.removeEventListener("tablune-flush-cell-edits", flush);
+  });
 
-  const fetchSelectionMatrix = async (): Promise<{ matrix: string[][]; sourceRows: number[] }> => {
+  const fetchSelectionMatrix = async (): Promise<{
+    matrix: string[][];
+    sourceRows: number[];
+    inputs: CellInfo[][];
+  }> => {
     const range = normalizeSelection(selection);
     return fetchGridSelectionMatrix(summary.documentId, range);
   };
 
   const copySelection = async () => {
-    const { matrix } = await fetchSelectionMatrix();
-    await writeClipboard(encodeClipboardMatrix(matrix));
+    const { matrix, inputs } = await fetchSelectionMatrix();
+    const text = encodeClipboardMatrix(matrix);
+    await writeClipboard(text);
+    internalClipboard = isSheet
+      ? {
+          documentId: summary.documentId,
+          text,
+          generation: await clipboardGeneration().catch(() => null),
+          inputs,
+        }
+      : null;
   };
 
   const clearSelection = async () => {
     const range = normalizeSelection(selection);
     const { sourceRows } = await fetchSelectionMatrix();
-    const cells = sourceRows.flatMap((row) => (
-      Array.from({ length: range.endColumn - range.startColumn + 1 }, (_, offset) => ({
-        row,
-        column: range.startColumn + offset,
-        value: "",
-      }))
-    ));
+    const cells = sourceRows.flatMap((row) =>
+      Array.from(
+        { length: range.endColumn - range.startColumn + 1 },
+        (_, offset) => ({
+          row,
+          column: range.startColumn + offset,
+          value: "",
+        }),
+      ),
+    );
     if (cells.length) await onApplyEdit({ kind: "setCells", cells });
   };
 
@@ -645,41 +961,107 @@ export default function CsvGrid({
     await clearSelection();
   };
 
-  const pasteSelection = async () => {
-    if (!navigator.clipboard?.readText) throw new Error("Clipboard reading is unavailable.");
-    const text = await navigator.clipboard.readText();
+  const pasteSelection = async (valuesOnly = false) => {
+    await pendingEdit.current;
+    const nativeText = await readNativeClipboard();
+    if (nativeText == null && !navigator.clipboard?.readText)
+      throw new Error("Clipboard reading is unavailable.");
+    const text = nativeText ?? (await navigator.clipboard.readText());
+    const generation = isSheet
+      ? await clipboardGeneration().catch(() => null)
+      : null;
+    const copied =
+      !valuesOnly &&
+      isSheet &&
+      internalClipboard?.documentId === summary.documentId &&
+      internalClipboard.text === text &&
+      generation !== null &&
+      generation === internalClipboard.generation
+        ? internalClipboard
+        : null;
     const matrix = parseClipboardMatrix(text);
     if (!matrix.length) return;
     const range = normalizeSelection(selection);
     const scalarFill = matrix.length === 1 && matrix[0].length === 1;
-    const rowAmount = scalarFill ? range.endRow - range.startRow + 1 : matrix.length;
-    const columnAmount = scalarFill ? range.endColumn - range.startColumn + 1 : Math.max(...matrix.map((row) => row.length));
-    const cells = [];
+    const rowAmount = scalarFill
+      ? range.endRow - range.startRow + 1
+      : matrix.length;
+    const columnAmount = scalarFill
+      ? range.endColumn - range.startColumn + 1
+      : Math.max(...matrix.map((row) => row.length));
+    const cells: SheetCellInput[] = [];
+    const shifts: { source: string; rowDelta: number; columnDelta: number }[] =
+      [];
+    const shiftIndexes: number[] = [];
     for (let rowOffset = 0; rowOffset < rowAmount; rowOffset += 1) {
       const sourceRow = await sourceRowForView(range.startRow + rowOffset);
       if (sourceRow === null) continue;
-      for (let columnOffset = 0; columnOffset < columnAmount; columnOffset += 1) {
+      for (
+        let columnOffset = 0;
+        columnOffset < columnAmount;
+        columnOffset += 1
+      ) {
+        const original =
+          copied?.inputs[scalarFill ? 0 : rowOffset]?.[
+            scalarFill ? 0 : columnOffset
+          ];
+        if (original?.formula) {
+          shiftIndexes.push(cells.length);
+          shifts.push({
+            source: original.source,
+            rowDelta: sourceRow - original.row,
+            columnDelta: range.startColumn + columnOffset - original.column,
+          });
+        }
         cells.push({
+          literal: isSheet && !original?.formula && !original?.escaped,
+          cellType: original?.cellType,
           row: sourceRow,
           column: range.startColumn + columnOffset,
-          value: scalarFill ? matrix[0][0] : matrix[rowOffset]?.[columnOffset] ?? "",
+          value:
+            original?.source ??
+            (scalarFill
+              ? matrix[0][0]
+              : (matrix[rowOffset]?.[columnOffset] ?? "")),
         });
       }
     }
-    if (cells.length) await onApplyEdit({ kind: "setCells", cells });
+    if (shifts.length) {
+      const translated = await shiftSheetFormulas(shifts);
+      shiftIndexes.forEach((index, i) => {
+        cells[index].value = translated[i];
+      });
+    }
+    if (cells.length)
+      await onApplyEdit({
+        kind: isSheet ? "setSheetCells" : "setCells",
+        cells,
+      });
   };
 
   useEffect(() => {
     const handleCommand = (event: Event) => {
-      const detail = (event as CustomEvent<string | { command: string; documentId: number }>).detail;
-      if (typeof detail !== "string" && detail.documentId !== summary.documentId) return;
+      const detail = (
+        event as CustomEvent<string | { command: string; documentId: number }>
+      ).detail;
+      if (
+        typeof detail !== "string" &&
+        detail.documentId !== summary.documentId
+      )
+        return;
       const command = typeof detail === "string" ? detail : detail.command;
       if (readOnly && command !== "copy") return;
-      const operation = command === "copy" ? copySelection : command === "cut" ? cutSelection : pasteSelection;
+      const operation =
+        command === "copy"
+          ? copySelection
+          : command === "cut"
+            ? cutSelection
+            : () => pasteSelection(command === "pasteValues");
       void operation().catch((reason) => onError(String(reason)));
     };
     document.addEventListener("tablune-grid-command", handleCommand);
-    return () => document.removeEventListener("tablune-grid-command", handleCommand);
+    return () =>
+      document.removeEventListener("tablune-grid-command", handleCommand);
   });
 
   useEffect(() => {
@@ -689,8 +1071,18 @@ export default function CsvGrid({
     const viewport = viewportRef.current;
     if (viewport) {
       viewport.scrollTo({
-        top: Math.max(0, COLUMN_HEADER_HEIGHT + rowMetrics.offsetAt(next.row) - viewport.clientHeight / 2),
-        left: Math.max(0, ROW_HEADER_WIDTH + columnMetrics.offsetAt(next.column) - viewport.clientWidth / 2),
+        top: Math.max(
+          0,
+          COLUMN_HEADER_HEIGHT +
+            rowMetrics.offsetAt(next.row) -
+            viewport.clientHeight / 2,
+        ),
+        left: Math.max(
+          0,
+          ROW_HEADER_WIDTH +
+            columnMetrics.offsetAt(next.column) -
+            viewport.clientWidth / 2,
+        ),
         behavior: "smooth",
       });
       window.setTimeout(() => void loadVisibleWindow(), 180);
@@ -705,11 +1097,12 @@ export default function CsvGrid({
       void copySelection().catch((reason) => onError(String(reason)));
       return;
     }
-    if (readOnly && (
-      (modifier && ["x", "v"].includes(event.key.toLowerCase()))
-      || ["Enter", "F2", "Delete", "Backspace"].includes(event.key)
-      || (event.key.length === 1 && !modifier && !event.altKey)
-    )) {
+    if (
+      readOnly &&
+      ((modifier && ["x", "v"].includes(event.key.toLowerCase())) ||
+        ["Enter", "F2", "Delete", "Backspace"].includes(event.key) ||
+        (event.key.length === 1 && !modifier && !event.altKey))
+    ) {
       event.preventDefault();
       return;
     }
@@ -720,7 +1113,9 @@ export default function CsvGrid({
     }
     if (modifier && event.key.toLowerCase() === "v") {
       event.preventDefault();
-      void pasteSelection().catch((reason) => onError(String(reason)));
+      void pasteSelection(event.shiftKey).catch((reason) =>
+        onError(String(reason)),
+      );
       return;
     }
     if (modifier && event.key.toLowerCase() === "a") {
@@ -729,8 +1124,14 @@ export default function CsvGrid({
       publishSelection({
         anchor: { row: 0, column: 0 },
         focus: {
-          row: Math.max(0, (selectAllStage.current ? summary.visibleRowCount : rowCount) - 1),
-          column: Math.max(0, (selectAllStage.current ? summary.columnCount : columnCount) - 1),
+          row: Math.max(
+            0,
+            (selectAllStage.current ? summary.visibleRowCount : rowCount) - 1,
+          ),
+          column: Math.max(
+            0,
+            (selectAllStage.current ? summary.columnCount : columnCount) - 1,
+          ),
         },
         mode: "cells",
       });
@@ -738,9 +1139,12 @@ export default function CsvGrid({
     }
     const next = { ...selection.focus };
     if (event.key === "ArrowUp") next.row = Math.max(0, next.row - 1);
-    else if (event.key === "ArrowDown") next.row = Math.min(rowCount - 1, next.row + 1);
-    else if (event.key === "ArrowLeft") next.column = Math.max(0, next.column - 1);
-    else if (event.key === "ArrowRight" || event.key === "Tab") next.column = Math.min(columnCount - 1, next.column + 1);
+    else if (event.key === "ArrowDown")
+      next.row = Math.min(rowCount - 1, next.row + 1);
+    else if (event.key === "ArrowLeft")
+      next.column = Math.max(0, next.column - 1);
+    else if (event.key === "ArrowRight" || event.key === "Tab")
+      next.column = Math.min(columnCount - 1, next.column + 1);
     else if (event.key === "Enter" || event.key === "F2") {
       event.preventDefault();
       void beginEditing({ ...selection.focus, mode: "cells" });
@@ -754,7 +1158,12 @@ export default function CsvGrid({
       void sourceRowForView(selection.focus.row).then((sourceRow) => {
         if (sourceRow === null) return;
         setDraft(event.key);
-        setEditing({ viewRow: selection.focus.row, sourceRow, column: selection.focus.column, header: false });
+        setEditing({
+          viewRow: selection.focus.row,
+          sourceRow,
+          column: selection.focus.column,
+          header: false,
+        });
       });
       return;
     } else return;
@@ -766,196 +1175,446 @@ export default function CsvGrid({
     });
   };
 
-  const runContextOperation = async (operation: "insertRow" | "deleteRow" | "insertColumn" | "deleteColumn") => {
+  const runContextOperation = async (
+    operation: "insertRow" | "deleteRow" | "insertColumn" | "deleteColumn",
+  ) => {
     if (readOnly) return;
     const range = normalizeSelection(selection);
     setContextMenu(null);
-    if ((summary.filtersActive || summary.sortCount > 0) && operation.includes("Row")) {
+    if (
+      (summary.filtersActive || summary.sortCount > 0) &&
+      operation.includes("Row")
+    ) {
       onError("Clear sorting and filters before changing whole rows.");
       return;
     }
     const headerOffset = Number(summary.headerEnabled);
-    if (operation === "insertRow") await onApplyEdit({ kind: "insertRows", index: range.startRow + headerOffset, count: range.endRow - range.startRow + 1 });
-    if (operation === "deleteRow") await onApplyEdit({ kind: "deleteRows", index: range.startRow + headerOffset, count: range.endRow - range.startRow + 1 });
-    if (operation === "insertColumn") await onApplyEdit({ kind: "insertColumns", index: range.startColumn, count: range.endColumn - range.startColumn + 1 });
-    if (operation === "deleteColumn") await onApplyEdit({ kind: "deleteColumns", index: range.startColumn, count: range.endColumn - range.startColumn + 1 });
+    if (operation === "insertRow")
+      await onApplyEdit({
+        kind: "insertRows",
+        index: range.startRow + headerOffset,
+        count: range.endRow - range.startRow + 1,
+      });
+    if (operation === "deleteRow")
+      await onApplyEdit({
+        kind: "deleteRows",
+        index: range.startRow + headerOffset,
+        count: range.endRow - range.startRow + 1,
+      });
+    if (operation === "insertColumn")
+      await onApplyEdit({
+        kind: "insertColumns",
+        index: range.startColumn,
+        count: range.endColumn - range.startColumn + 1,
+      });
+    if (operation === "deleteColumn")
+      await onApplyEdit({
+        kind: "deleteColumns",
+        index: range.startColumn,
+        count: range.endColumn - range.startColumn + 1,
+      });
   };
 
+  useEffect(() => {
+    if (!isSheet || editing) return;
+    let alive = true;
+    void sourceRowForView(selection.focus.row)
+      .then((row) =>
+        row === null
+          ? null
+          : getSheetCell(summary.documentId, row, selection.focus.column),
+      )
+      .then((info) => {
+        if (alive) setActiveInfo(info);
+      })
+      .catch((reason) => onError(String(reason)));
+    return () => {
+      alive = false;
+    };
+  }, [
+    isSheet,
+    editing,
+    summary.documentId,
+    summary.revision,
+    summary.calculationRevision,
+    selection.focus.row,
+    selection.focus.column,
+    windowData,
+  ]);
+  const changeType = async (cellType: CellType) => {
+    await pendingEdit.current;
+    const range = normalizeSelection(selection);
+    const cells: CellCoordinate[] = [];
+    for (let row = range.startRow; row <= range.endRow; row++) {
+      const sourceRow = await sourceRowForView(row);
+      if (sourceRow === null) continue;
+      for (let column = range.startColumn; column <= range.endColumn; column++)
+        cells.push({ row: sourceRow, column });
+    }
+    await onApplyEdit({ kind: "setCellTypes", cells, cellType });
+  };
+  const insertReference = (target: GridTarget) => {
+    const drag = referenceDrag.current;
+    if (!drag || target.mode !== "cells") return;
+    const sourceRow = cachedRow(target.row)?.sourceRow ?? target.row;
+    const a = `${columnName(drag.anchor.column)}${drag.anchor.row + 1}`;
+    const b = `${columnName(target.column)}${sourceRow + 1}`;
+    const reference = a === b ? a : `cells("${a}:${b}")`;
+    setDraft(
+      drag.base.slice(0, drag.start) + reference + drag.base.slice(drag.end),
+    );
+  };
   return (
-    <div
-      ref={viewportRef}
-      className="grid-viewport"
-      aria-readonly={readOnly}
-      tabIndex={0}
-      onScroll={() => {
-        draw();
-        void loadVisibleWindow();
-        setContextMenu(null);
-        if (onViewportChange && viewportFrame.current === null) {
-          viewportFrame.current = window.requestAnimationFrame(() => {
-            viewportFrame.current = null;
-            const viewport = viewportRef.current;
-            if (viewport) onViewportChange({ scrollTop: viewport.scrollTop, scrollLeft: viewport.scrollLeft });
-          });
-        }
-      }}
-      onKeyDown={handleKeyDown}
-      style={{ cursor: resizeState?.axis === "column" || resizeHover === "column" ? "col-resize" : resizeState?.axis === "row" || resizeHover === "row" ? "row-resize" : undefined }}
-      onPointerDown={(event) => {
-        if (event.button !== 0) return;
-        setContextMenu(null);
-        const resizeTarget = resizeTargetFromPointer(event);
-        if (resizeTarget) {
-          event.preventDefault();
-          event.currentTarget.setPointerCapture?.(event.pointerId);
-          const metrics = resizeTarget.axis === "column" ? columnMetrics : rowMetrics;
-          const startClientPosition = resizeTarget.axis === "column" ? event.clientX : event.clientY;
-          setResizeState({
-            ...resizeTarget,
-            pointerId: event.pointerId,
-            startClientPosition,
-            startSize: metrics.sizeAt(resizeTarget.index),
-            currentSize: metrics.sizeAt(resizeTarget.index),
-          });
-          setResizeHover(resizeTarget.axis);
-          return;
-        }
-        const viewport = viewportRef.current;
-        if (viewport) {
-          const rect = viewport.getBoundingClientRect();
-          const absoluteX = event.clientX - rect.left + viewport.scrollLeft;
-          const absoluteY = event.clientY - rect.top + viewport.scrollTop;
-          const columnOffset = absoluteX - ROW_HEADER_WIDTH;
-          const column = columnMetrics.indexAt(columnOffset);
-          const withinColumn = columnOffset - columnMetrics.offsetAt(column);
-          if (absoluteY < COLUMN_HEADER_HEIGHT
-            && absoluteX >= ROW_HEADER_WIDTH
-            && withinColumn >= columnMetrics.sizeAt(column) - 24) {
-            if (!readOnly) onHeaderSort(column);
-            return;
-          }
-        }
-        const target = targetFromPointer(event);
-        if (!target) return;
-        dragAnchor.current = target;
-        publishSelection(rangeForTarget(target, event.shiftKey));
-      }}
-      onPointerMove={(event) => {
-        if (resizeState) {
-          const clientPosition = resizeState.axis === "column" ? event.clientX : event.clientY;
-          const minimum = resizeState.axis === "column" ? MIN_COLUMN_WIDTH : MIN_ROW_HEIGHT;
-          const maximum = resizeState.axis === "column" ? MAX_COLUMN_WIDTH : MAX_ROW_HEIGHT;
-          setResizeState({
-            ...resizeState,
-            currentSize: clampGridSize(
-              resizeState.startSize + clientPosition - resizeState.startClientPosition,
-              minimum,
-              maximum,
-            ),
-          });
-          return;
-        }
-        if (event.buttons !== 1) {
-          setResizeHover(resizeTargetFromPointer(event)?.axis ?? null);
-          return;
-        }
-        if (!dragAnchor.current || event.buttons !== 1) return;
-        const target = targetFromPointer(event);
-        if (!target) return;
-        const anchor = dragAnchor.current;
-        publishSelection(rangeForTarget({ ...target, mode: anchor.mode }, true));
-      }}
-      onPointerUp={(event) => {
-        dragAnchor.current = null;
-        if (!resizeState) return;
-        if (event.currentTarget.hasPointerCapture?.(resizeState.pointerId)) {
-          event.currentTarget.releasePointerCapture(resizeState.pointerId);
-        }
-        const next = resizeState.axis === "column"
-          ? {
-            ...initialSizing,
-            columnWidths: withSizeOverride(
-              initialSizing.columnWidths,
-              resizeState.index,
-              resizeState.currentSize,
-              DEFAULT_COLUMN_WIDTH,
-            ),
-          }
-          : {
-            ...initialSizing,
-            rowHeights: withSizeOverride(
-              initialSizing.rowHeights,
-              resizeState.index,
-              resizeState.currentSize,
-              DEFAULT_ROW_HEIGHT,
-            ),
-          };
-        publishSizing(next);
-        setResizeState(null);
-        setResizeHover(resizeTargetFromPointer(event)?.axis ?? null);
-      }}
-      onPointerCancel={() => {
-        dragAnchor.current = null;
-        setResizeState(null);
-        setResizeHover(null);
-      }}
-      onPointerLeave={() => { if (!resizeState) setResizeHover(null); }}
-      onDoubleClick={(event) => {
-        const resizeTarget = resizeTargetFromPointer(event);
-        if (resizeTarget) {
-          event.preventDefault();
-          autoFit(resizeTarget);
-          return;
-        }
-        const target = targetFromPointer(event);
-        if (target && !readOnly) void beginEditing(target);
-      }}
-      onContextMenu={(event) => {
-        event.preventDefault();
-        const target = targetFromPointer(event);
-        if (target) publishSelection(rangeForTarget(target, false));
-        if (readOnly) {
-          setContextMenu(null);
-          return;
-        }
-        const rect = event.currentTarget.getBoundingClientRect();
-        setContextMenu({ x: event.clientX - rect.left + event.currentTarget.scrollLeft, y: event.clientY - rect.top + event.currentTarget.scrollTop });
-      }}
-    >
-      <div data-testid="grid-spacer" style={{ width: totalWidth, height: totalHeight }} />
-      <canvas ref={canvasRef} className="grid-canvas" aria-hidden="true" />
-      {editing && (
-        <input
-          className="cell-editor"
-          autoFocus
-          value={draft}
-          aria-label={editing.header ? "Edit column header" : "Edit cell"}
-          style={{
-            left: ROW_HEADER_WIDTH + columnMetrics.offsetAt(editing.column) + 1,
-            top: editing.header ? 1 : COLUMN_HEADER_HEIGHT + rowMetrics.offsetAt(editing.viewRow) + 1,
-            width: columnMetrics.sizeAt(editing.column) - 2,
-            height: (editing.header ? COLUMN_HEADER_HEIGHT : rowMetrics.sizeAt(editing.viewRow)) - 2,
-          }}
-          onChange={(event) => setDraft(event.target.value)}
-          onBlur={() => void commitEdit()}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") void commitEdit();
-            if (event.key === "Escape") {
-              setEditing(null);
-              viewportRef.current?.focus();
+    <div className="sheet-grid">
+      {isSheet && (
+        <div className="formula-toolbar">
+          <output className="cell-address" aria-label="Cell address">
+            {columnName(editing?.column ?? selection.focus.column)}
+            {(editing?.sourceRow ?? activeInfo?.row ?? selection.focus.row) + 1}
+          </output>
+          <span className="formula-symbol">ƒx</span>
+          <input
+            ref={formulaBarRef}
+            aria-label="Formula bar"
+            disabled={readOnly}
+            value={editing ? draft : (activeInfo?.source ?? "")}
+            onFocus={() => {
+              if (!editing) {
+                setDraft(activeInfo?.source ?? "");
+                setEditing({
+                  viewRow: selection.focus.row,
+                  sourceRow: activeInfo?.row ?? selection.focus.row,
+                  column: selection.focus.column,
+                  header: false,
+                });
+              }
+              setBarEditing(true);
+            }}
+            onChange={(event) => setDraft(event.target.value)}
+            onBlur={() => {
+              if (!referenceDrag.current)
+                void commitEdit().catch((reason) => onError(String(reason)));
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                void commitEdit().catch((reason) => onError(String(reason)));
+              }
+              if (event.key === "Escape") {
+                setEditing(null);
+                setBarEditing(false);
+                viewportRef.current?.focus();
+              }
+            }}
+          />
+          <select
+            aria-label="Cell type"
+            value={activeInfo?.cellType ?? "auto"}
+            disabled={readOnly}
+            onChange={(event) =>
+              void changeType(event.target.value as CellType).catch((reason) =>
+                onError(String(reason)),
+              )
             }
-          }}
-        />
-      )}
-      {contextMenu && (
-        <div className="grid-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} role="menu">
-          <button onClick={() => void runContextOperation("insertRow")}>Insert row</button>
-          <button onClick={() => void runContextOperation("deleteRow")}>Delete row</button>
-          <span />
-          <button onClick={() => void runContextOperation("insertColumn")}>Insert column</button>
-          <button onClick={() => void runContextOperation("deleteColumn")}>Delete column</button>
+          >
+            <option value="auto">Auto</option>
+            <option value="text">Text</option>
+            <option value="number">Number</option>
+            <option value="boolean">Boolean</option>
+          </select>
+          <button
+            disabled={readOnly}
+            title="Paste values (Cmd/Ctrl+Shift+V)"
+            onClick={() =>
+              void pasteSelection(true).catch((reason) =>
+                onError(String(reason)),
+              )
+            }
+          >
+            Paste values
+          </button>
         </div>
       )}
+      {isSheet && activeInfo?.error && (
+        <div className="cell-error-detail" role="status">
+          {activeInfo.error.code} {activeInfo.error.message}
+        </div>
+      )}
+      {isSheet && activeInfo?.pending && !activeInfo.error && (
+        <div className="cell-pending-detail" role="status">
+          {activeInfo.display === "…"
+            ? "Waiting for calculation"
+            : "Pending calculation · displaying a cached result"}
+        </div>
+      )}
+      <div
+        ref={viewportRef}
+        className="grid-viewport"
+        aria-readonly={readOnly}
+        tabIndex={0}
+        onScroll={() => {
+          draw();
+          void loadVisibleWindow();
+          setContextMenu(null);
+          if (onViewportChange && viewportFrame.current === null) {
+            viewportFrame.current = window.requestAnimationFrame(() => {
+              viewportFrame.current = null;
+              const viewport = viewportRef.current;
+              if (viewport)
+                onViewportChange({
+                  scrollTop: viewport.scrollTop,
+                  scrollLeft: viewport.scrollLeft,
+                });
+            });
+          }
+        }}
+        onKeyDown={handleKeyDown}
+        style={{
+          cursor:
+            resizeState?.axis === "column" || resizeHover === "column"
+              ? "col-resize"
+              : resizeState?.axis === "row" || resizeHover === "row"
+                ? "row-resize"
+                : undefined,
+        }}
+        onPointerDown={(event) => {
+          if (event.button !== 0) return;
+          setContextMenu(null);
+          if (isSheet && editing && draft.startsWith("=")) {
+            const target = targetFromPointer(event);
+            if (target?.mode === "cells") {
+              event.preventDefault();
+              const input = barEditing
+                ? formulaBarRef.current
+                : cellEditorRef.current;
+              referenceDrag.current = {
+                anchor: {
+                  row: cachedRow(target.row)?.sourceRow ?? target.row,
+                  column: target.column,
+                },
+                base: draft,
+                start: input?.selectionStart ?? draft.length,
+                end: input?.selectionEnd ?? draft.length,
+              };
+              event.currentTarget.setPointerCapture?.(event.pointerId);
+              insertReference(target);
+              return;
+            }
+          }
+          const resizeTarget = resizeTargetFromPointer(event);
+          if (resizeTarget) {
+            event.preventDefault();
+            event.currentTarget.setPointerCapture?.(event.pointerId);
+            const metrics =
+              resizeTarget.axis === "column" ? columnMetrics : rowMetrics;
+            const startClientPosition =
+              resizeTarget.axis === "column" ? event.clientX : event.clientY;
+            setResizeState({
+              ...resizeTarget,
+              pointerId: event.pointerId,
+              startClientPosition,
+              startSize: metrics.sizeAt(resizeTarget.index),
+              currentSize: metrics.sizeAt(resizeTarget.index),
+            });
+            setResizeHover(resizeTarget.axis);
+            return;
+          }
+          const viewport = viewportRef.current;
+          if (viewport) {
+            const rect = viewport.getBoundingClientRect();
+            const absoluteX = event.clientX - rect.left + viewport.scrollLeft;
+            const absoluteY = event.clientY - rect.top + viewport.scrollTop;
+            const columnOffset = absoluteX - ROW_HEADER_WIDTH;
+            const column = columnMetrics.indexAt(columnOffset);
+            const withinColumn = columnOffset - columnMetrics.offsetAt(column);
+            if (
+              absoluteY < COLUMN_HEADER_HEIGHT &&
+              absoluteX >= ROW_HEADER_WIDTH &&
+              withinColumn >= columnMetrics.sizeAt(column) - 24
+            ) {
+              if (!readOnly) onHeaderSort(column);
+              return;
+            }
+          }
+          const target = targetFromPointer(event);
+          if (!target) return;
+          dragAnchor.current = target;
+          publishSelection(rangeForTarget(target, event.shiftKey));
+        }}
+        onPointerMove={(event) => {
+          if (referenceDrag.current && event.buttons === 1) {
+            const target = targetFromPointer(event);
+            if (target) insertReference(target);
+            return;
+          }
+          if (resizeState) {
+            const clientPosition =
+              resizeState.axis === "column" ? event.clientX : event.clientY;
+            const minimum =
+              resizeState.axis === "column" ? MIN_COLUMN_WIDTH : MIN_ROW_HEIGHT;
+            const maximum =
+              resizeState.axis === "column" ? MAX_COLUMN_WIDTH : MAX_ROW_HEIGHT;
+            setResizeState({
+              ...resizeState,
+              currentSize: clampGridSize(
+                resizeState.startSize +
+                  clientPosition -
+                  resizeState.startClientPosition,
+                minimum,
+                maximum,
+              ),
+            });
+            return;
+          }
+          if (event.buttons !== 1) {
+            setResizeHover(resizeTargetFromPointer(event)?.axis ?? null);
+            return;
+          }
+          if (!dragAnchor.current || event.buttons !== 1) return;
+          const target = targetFromPointer(event);
+          if (!target) return;
+          const anchor = dragAnchor.current;
+          publishSelection(
+            rangeForTarget({ ...target, mode: anchor.mode }, true),
+          );
+        }}
+        onPointerUp={(event) => {
+          if (referenceDrag.current) {
+            referenceDrag.current = null;
+            if (event.currentTarget.hasPointerCapture?.(event.pointerId))
+              event.currentTarget.releasePointerCapture(event.pointerId);
+            const input = barEditing
+              ? formulaBarRef.current
+              : cellEditorRef.current;
+            input?.focus();
+            input?.setSelectionRange(draft.length, draft.length);
+            return;
+          }
+          dragAnchor.current = null;
+          if (!resizeState) return;
+          if (event.currentTarget.hasPointerCapture?.(resizeState.pointerId)) {
+            event.currentTarget.releasePointerCapture(resizeState.pointerId);
+          }
+          const next =
+            resizeState.axis === "column"
+              ? {
+                  ...initialSizing,
+                  columnWidths: withSizeOverride(
+                    initialSizing.columnWidths,
+                    resizeState.index,
+                    resizeState.currentSize,
+                    DEFAULT_COLUMN_WIDTH,
+                  ),
+                }
+              : {
+                  ...initialSizing,
+                  rowHeights: withSizeOverride(
+                    initialSizing.rowHeights,
+                    resizeState.index,
+                    resizeState.currentSize,
+                    DEFAULT_ROW_HEIGHT,
+                  ),
+                };
+          publishSizing(next);
+          setResizeState(null);
+          setResizeHover(resizeTargetFromPointer(event)?.axis ?? null);
+        }}
+        onPointerCancel={() => {
+          dragAnchor.current = null;
+          setResizeState(null);
+          setResizeHover(null);
+        }}
+        onPointerLeave={() => {
+          if (!resizeState) setResizeHover(null);
+        }}
+        onDoubleClick={(event) => {
+          const resizeTarget = resizeTargetFromPointer(event);
+          if (resizeTarget) {
+            event.preventDefault();
+            autoFit(resizeTarget);
+            return;
+          }
+          const target = targetFromPointer(event);
+          if (target && !readOnly) void beginEditing(target);
+        }}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          const target = targetFromPointer(event);
+          if (target) publishSelection(rangeForTarget(target, false));
+          if (readOnly) {
+            setContextMenu(null);
+            return;
+          }
+          const rect = event.currentTarget.getBoundingClientRect();
+          setContextMenu({
+            x: event.clientX - rect.left + event.currentTarget.scrollLeft,
+            y: event.clientY - rect.top + event.currentTarget.scrollTop,
+          });
+        }}
+      >
+        <div
+          data-testid="grid-spacer"
+          style={{ width: totalWidth, height: totalHeight }}
+        />
+        <canvas ref={canvasRef} className="grid-canvas" aria-hidden="true" />
+        {editing && !barEditing && (
+          <input
+            ref={cellEditorRef}
+            className="cell-editor"
+            autoFocus
+            value={draft}
+            aria-label={editing.header ? "Edit column header" : "Edit cell"}
+            style={{
+              left:
+                ROW_HEADER_WIDTH + columnMetrics.offsetAt(editing.column) + 1,
+              top: editing.header
+                ? 1
+                : COLUMN_HEADER_HEIGHT +
+                  rowMetrics.offsetAt(editing.viewRow) +
+                  1,
+              width: columnMetrics.sizeAt(editing.column) - 2,
+              height:
+                (editing.header
+                  ? COLUMN_HEADER_HEIGHT
+                  : rowMetrics.sizeAt(editing.viewRow)) - 2,
+            }}
+            onChange={(event) => setDraft(event.target.value)}
+            onBlur={() => {
+              if (!referenceDrag.current)
+                void commitEdit().catch((reason) => onError(String(reason)));
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter")
+                void commitEdit().catch((reason) => onError(String(reason)));
+              if (event.key === "Escape") {
+                setEditing(null);
+                viewportRef.current?.focus();
+              }
+            }}
+          />
+        )}
+        {contextMenu && (
+          <div
+            className="grid-context-menu"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+            role="menu"
+          >
+            <button onClick={() => void runContextOperation("insertRow")}>
+              Insert row
+            </button>
+            <button onClick={() => void runContextOperation("deleteRow")}>
+              Delete row
+            </button>
+            <span />
+            <button onClick={() => void runContextOperation("insertColumn")}>
+              Insert column
+            </button>
+            <button onClick={() => void runContextOperation("deleteColumn")}>
+              Delete column
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

@@ -6,7 +6,8 @@ import DocumentTabs from "./DocumentTabs";
 import ExplorerPanel from "./ExplorerPanel";
 import PythonMacroPanel from "./PythonMacroDialog";
 import SearchBar from "./SearchBar";
-import RibbonHeader from "./RibbonHeader";
+import RibbonHeader, { type RibbonHeaderProps } from "./RibbonHeader";
+import { createPortal } from "react-dom";
 import UnsavedChangesDialog from "./UnsavedChangesDialog";
 import {
   readThemePreference,
@@ -113,6 +114,9 @@ function shortPath(path: string): string {
 
 export interface CsvWorkspaceProps {
   managed?: boolean;
+  ribbonTarget?: HTMLElement | null;
+  ribbonVisible?: boolean;
+  ribbonControls?: Pick<RibbonHeaderProps, "navigation" | "fileActions">;
   theme?: ThemeMode;
   active?: boolean;
   documents?: DocumentSummary[];
@@ -802,7 +806,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
         ) {
           clearSizing(documentId, "columns");
         } else if (
-          command.kind === "setCells" &&
+          (command.kind === "setCells" || command.kind === "setSheetCells") &&
           (document.filtersActive || document.sortCount > 0)
         ) {
           clearSizing(documentId, "rows");
@@ -909,9 +913,8 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
     restoreExplorerAfterMacro.current = false;
   };
 
-  return (
-    <main className="app-shell" data-theme={theme}>
-      <RibbonHeader
+  const ribbon = <RibbonHeader
+        {...props.ribbonControls}
         documentName={summary.displayName}
         dirty={summary.dirty}
         busy={busy || props.active === false}
@@ -962,8 +965,13 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
           void applyEdit({ kind: "setDelimiter", delimiter })
         }
         onDocumentNameCommit={renameDocument}
-      />
+      />;
 
+  return (
+    <main className={`app-shell${props.managed ? " managed-grid" : ""}`} data-theme={theme}>
+      {props.managed
+        ? props.ribbonVisible && props.ribbonTarget && createPortal(ribbon, props.ribbonTarget)
+        : ribbon}
       <section className="content-region">
         {searchOpen && summary.documentId !== 0 && (
           <SearchBar

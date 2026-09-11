@@ -49,7 +49,10 @@ export default function ProjectScriptEditor({
     Boolean(draft) ||
     previewScript !== script.revision ||
     !input ||
-    preview?.baseRevision !== input.revision;
+    preview?.baseRevision !== input.revision ||
+    (preview?.baseCalculationRevision ?? 0) !==
+      (input?.calculationRevision ?? 0) ||
+    (input?.pendingCells ?? 0) > 0;
   useEffect(() => {
     void ipc
       .getPythonStatus()

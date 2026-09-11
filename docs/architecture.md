@@ -5,7 +5,7 @@
 1. Rust owns parsing, serialization, and the durable document model.
 2. The frontend renders a view of the document and submits explicit edits.
 3. Large grid rendering must not require one DOM node per cell.
-4. CSV values remain strings. Type inference may be added later as a non-destructive view concern.
+4. Original cell content remains textual; project sheets add sparse formula/type metadata and separate calculated scalar/error values.
 5. Frontend/backend messages should be batched before large-file work begins.
 
 ## Initial components
@@ -61,7 +61,7 @@ Creating or opening a document never closes another tab. Multi-file open is sequ
 
 Duplicating a saved document snapshots its current in-memory rows and dialect, writes the first available incremented sibling path, and inserts a clean session immediately after the source. The frontend commits the returned workspace without changing `activeDocumentId`, so the new tab opens in the background while unsaved changes remain on the original.
 
-## Project spaces (0.4)
+## Project spaces
 
 `useWorkspace` owns Home navigation, open spaces, recent files, script drafts, and project lifecycle. `CsvWorkspace` supplies the shared table editing experience. Its targeted grid commands include a document ID so a command cannot reach another mounted workspace. Script editors remain mounted while navigating; drafts are flushed through a serialized queue before saving or running.
 
@@ -70,3 +70,17 @@ Rust stores project ownership above `DocumentSession`. Persistent IDs identify p
 The archive codec lives separately from the CSV parser. Project saves replace one ZIP atomically. Project previews bind the project, script revision, selected table, and document revision. Accepting a preview creates a new table and uses no input-table undo entry. CSV macros continue to use the existing undoable apply operation.
 
 Project crash recovery has its own versioned manifest (`projects-recovery.json`) alongside the compatible CSV recovery manifest. It includes dirty projects and script drafts acknowledged by Rust; it excludes running processes, previews, Python environments, and undo history. Clean projects appear in recent files instead of reopening automatically.
+
+## Calculation (0.5)
+
+`formulas.rs` uses RustPython Parser to construct an allowlisted expression tree and collect cell/range references. A lexical layer preserves reference spans and absolute markers without rewriting string literals. Parsed trees are reused for unchanged formula source. Reverse dependency indexes use direct cell keys and compact rectangles for ranges. Topological evaluation detects cycles before invoking Python.
+
+`sheet_session.rs` extends existing document transactions with sparse metadata changes. Raw `TableDocument` strings remain editable source; cached values drive the view. Structural operations rewrite references atomically, and undo stores only changed metadata. Content revisions and calculation revisions are distinct. Recalculating rebuilds the view without making an independent undo step. Project headers remain source row 1.
+
+`calculation.rs` snapshots pending formulas and referenced values, binds requests to project generation, sheet identity, content revision, and applied-functions revision, and rejects stale publication. `calculation_worker.rs` owns a reusable subprocess and exchanges bounded JSON through private temporary files. The worker interprets validated trees rather than evaluating raw cell text. User Functions code is explicitly activated Python code with normal interpreter permissions. Each generation builds a new module namespace; source edits only update the persisted draft until successful application.
+
+Calculations and macros share an async mutex covering execution and publication. Project state is locked only for preparation/publication; Python runs outside document locks. Worker reservation and generation checks share the project lock so cancellation cannot miss a job during startup. Interpreter changes join the same queue and invalidate cached results. Formula results are published through `tablune-calculation` project summaries, and grid windows include displayed values plus editable cell information. React batches confirmed edits before scheduling a new generation.
+
+Format 2 stores raw rows plus sparse sheet metadata in each table entry, and keeps Functions draft/applied source separately. Recovery uses the same metadata and reads older formats. Loaded caches are marked pending; no runtime process or trust authorization survives reopening. Export and transformation snapshots materialize current results and check calculation revision when accepting previews.
+
+On macOS, grid clipboard reads/writes use small NSPasteboard IPC commands to avoid WebKit's additional paste authorization prompt. Clipboard generation still guards formula-aware copies; other platforms retain the browser clipboard fallback.

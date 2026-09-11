@@ -1,10 +1,17 @@
-# Tablune 0.4 product scope
+# Tablune 0.5 product scope
 
 ## Product statement
 
-Tablune Sheets 0.4 is a desktop CSV editor and a persistent local workspace for data projects. It is not a general spreadsheet application.
+Tablune Sheets 0.5 combines the existing CSV editor with calculable sheets inside persistent local data projects.
 
 ## Included
+
+- Python expressions in project cells, relative/absolute cell references, and tracked literal ranges
+- Project Functions draft/applied module with explicit activation
+- Formula bar, reference insertion, per-cell types, error details, recalculate/cancel controls
+- Incremental dependency calculation, cycle detection, revision-safe result publication
+- Formula-aware copy/paste and structural undo/redo
+- Format-2 persistence/recovery, backward reading, and cached results requiring session enablement
 
 - Home, recent files, and multiple simultaneously open project/CSV spaces
 - Self-contained, versioned `.tablune` project files with atomic saving
@@ -39,16 +46,18 @@ Tablune Sheets 0.4 is a desktop CSV editor and a persistent local workspace for 
 
 ## Excluded
 
-- Formulas and calculation engine
+- Cross-sheet references and multi-cell formula results
 - Styling and number formats
 - Excel workbook/worksheet compatibility
-- Formula engines, transformation pipelines, and linked external sources
+- Excel formula syntax, transformation pipelines, and linked external sources
 - XLSX import or export
 - Charts and pivot tables
 - Sandboxed macros, package installation, and managed Python environments
 - Collaboration and cloud storage
-- Automatic type conversion
+- Reinterpretation of imported formula-like strings or loss of original textual spelling
 
 ## Acceptance criterion
+
+In a project, enter `=B1+C1`, edit an input, and see the dependent result update while its formula remains editable. Apply a project function, copy a relative formula, save/reopen without executing code, enable calculation, and export current values.
 
 On macOS, a user can safely edit and recover a CSV, inspect up to 100,000 rows through a windowed canvas, create non-destructive views, preview and undo Python transformations, and export results without losing or coercing textual cell values.

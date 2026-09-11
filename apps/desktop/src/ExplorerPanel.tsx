@@ -132,7 +132,7 @@ export default function ExplorerPanel({
             <button onClick={() => void setSort("descending")}>Sort Z → A</button>
             <button onClick={() => void setSort(null)}>Clear</button>
           </div>
-          {summary.sortCount > 0 && <button className="wide-action" onClick={() => void onApplySort()}>Apply sort to data</button>}
+          {summary.sortCount > 0 && <button className="wide-action" disabled={(summary.formulaCount??0)>0} title={(summary.formulaCount??0)>0?"Use view sorting on sheets with formulas":undefined} onClick={() => void onApplySort()}>Apply sort to data</button>}
         </section>
 
         <section className="explorer-section">

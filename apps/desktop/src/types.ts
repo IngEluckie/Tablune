@@ -7,6 +7,9 @@ export interface Selection {
 }
 
 export interface DocumentSummary {
+  calculationRevision?: number;
+  formulaCount?: number;
+  pendingCells?: number;
   projectId?: number | null;
   view?: ViewState;
   documentId: DocumentId;
@@ -40,6 +43,7 @@ export interface GridRow {
   sourceRow: number;
   rowId: number;
   cells: string[];
+  inputs?: CellInfo[] | null;
 }
 
 export interface GridWindow {
@@ -81,6 +85,8 @@ export interface CellInput {
 }
 
 export type EditCommand =
+  | { kind: "setSheetCells"; cells: SheetCellInput[] }
+  | { kind: "setCellTypes"; cells: CellCoordinate[]; cellType: CellType }
   | { kind: "setCells"; cells: CellInput[] }
   | { kind: "insertRows"; index: number; count: number }
   | { kind: "deleteRows"; index: number; count: number }
@@ -100,7 +106,17 @@ export interface SortSpec {
 
 export interface FilterSpec {
   column: number;
-  operator: "contains" | "equals" | "startsWith" | "endsWith" | "empty" | "notEmpty" | "values" | "greaterThan" | "lessThan" | "between";
+  operator:
+    | "contains"
+    | "equals"
+    | "startsWith"
+    | "endsWith"
+    | "empty"
+    | "notEmpty"
+    | "values"
+    | "greaterThan"
+    | "lessThan"
+    | "between";
   value: string;
   secondValue: string;
   values: string[];
@@ -182,6 +198,7 @@ export interface MacroChangeSample {
 export interface MacroPreview {
   id: string;
   baseRevision: number;
+  baseCalculationRevision?: number;
   rowsBefore: number;
   rowsAfter: number;
   columnsBefore: number;
@@ -196,15 +213,78 @@ export interface MacroPreview {
   samples: MacroChangeSample[];
 }
 
-export interface ScriptSummary { id: string; name: string; code: string; revision: number; inputTableId: string | null }
-export interface ProjectTableSummary { id: string; document: DocumentSummary }
-export interface ProjectSummary { projectId: number; persistentId: string; name: string; path: string | null; dirty: boolean; revision: string; tables: ProjectTableSummary[]; scripts: ScriptSummary[] }
-export interface RecentFile { path: string; kind: "csv" | "project" }
+export interface ScriptSummary {
+  id: string;
+  name: string;
+  code: string;
+  revision: number;
+  inputTableId: string | null;
+}
+export interface ProjectTableSummary {
+  id: string;
+  document: DocumentSummary;
+}
+export interface ProjectSummary {
+  functions?: FunctionsData;
+  calculation?: CalculationSummary;
+  projectId: number;
+  persistentId: string;
+  name: string;
+  path: string | null;
+  dirty: boolean;
+  revision: string;
+  tables: ProjectTableSummary[];
+  scripts: ScriptSummary[];
+}
+export interface RecentFile {
+  path: string;
+  kind: "csv" | "project";
+}
 export type ProjectAction =
+  | { kind: "updateFunctions"; code: string; expectedRevision: number }
   | { kind: "newTable" | "newScript" }
   | { kind: "importTable"; path: string }
   | { kind: "renameTable"; tableId: string; name: string }
   | { kind: "duplicateTable" | "deleteTable"; tableId: string }
   | { kind: "importScript"; name: string; code: string }
-  | { kind: "updateScript"; scriptId: string; name: string; code: string; inputTableId: string | null; expectedRevision: number }
+  | {
+      kind: "updateScript";
+      scriptId: string;
+      name: string;
+      code: string;
+      inputTableId: string | null;
+      expectedRevision: number;
+    }
   | { kind: "deleteScript"; scriptId: string };
+
+export type CellType = "auto" | "text" | "number" | "boolean";
+export interface CellInfo {
+  row: number;
+  column: number;
+  source: string;
+  display: string;
+  formula: boolean;
+  escaped?: boolean;
+  cellType: CellType;
+  pending: boolean;
+  error: { code: string; message: string } | null;
+}
+export interface SheetCellInput {
+  row: number;
+  column: number;
+  value: string;
+  literal?: boolean;
+  cellType?: CellType;
+}
+export interface FunctionsData {
+  draft: string;
+  applied: string;
+  revision: number;
+  draftRevision: number;
+}
+export interface CalculationSummary {
+  enabled: boolean;
+  running: boolean;
+  paused: boolean;
+  error: string | null;
+}

@@ -45,6 +45,9 @@ vi.mock("./ipc", async (original) => ({
   closeProject: vi.fn(),
   getPythonStatus: vi.fn(),
   exitApplication: vi.fn(),
+  enableCalculation: vi.fn(),
+  recalculateProject: vi.fn(),
+  applyFunctions: vi.fn(),
 }));
 vi.mock("./CsvWorkspace", () => ({ default: () => <div>Grid workspace</div> }));
 vi.mock("./PythonMacroEditor", () => ({
@@ -97,6 +100,11 @@ beforeEach(() => {
   });
   vi.mocked(ipc.projectAction).mockImplementation(async (id, action) => {
     const p = backend.projects!.find((p) => p.projectId === id)!;
+    if (action.kind === "updateFunctions") {
+      p.functions ??= { draft: "", applied: "", revision: 0, draftRevision: 0 };
+      p.functions.draft = action.code;
+      p.functions.draftRevision++;
+    }
     if (action.kind === "updateScript") {
       const s = p.scripts.find((s) => s.id === action.scriptId)!;
       expect(action.expectedRevision).toBe(s.revision);
@@ -321,5 +329,87 @@ describe("Home and project lifecycle", () => {
       await saving;
     });
     expect(result.current.savingProjects).toEqual([]);
+  });
+  it("flushes Functions drafts before saving without activating them", async () => {
+    backend.projects = [project(1)];
+    backend.projects[0].functions = {
+      draft: "",
+      applied: "def old(): return 1",
+      revision: 1,
+      draftRevision: 0,
+    };
+    vi.mocked(save).mockResolvedValue("/tmp/functions.tablune");
+    const { result } = renderHook(() => useWorkspace());
+    await waitFor(() => expect(result.current.ready).toBe(true));
+    act(() => result.current.editFunctions(1, "def newer(): return 2"));
+    await act(async () => {
+      await result.current.saveProjectById(1);
+    });
+    expect(ipc.projectAction).toHaveBeenCalledWith(1, {
+      kind: "updateFunctions",
+      code: "def newer(): return 2",
+      expectedRevision: 0,
+    });
+    expect(backend.projects[0].functions.applied).toBe("def old(): return 1");
+    expect(ipc.applyFunctions).not.toHaveBeenCalled();
+  });
+  it("requires session authorization before automatically calculating pending formulas", async () => {
+    backend.projects = [
+      {
+        ...project(1),
+        calculation: {
+          enabled: false,
+          running: false,
+          paused: false,
+          error: null,
+        },
+        tables: [
+          {
+            id: "sheet",
+            document: {
+              documentId: 10,
+              revision: 1,
+              pendingCells: 1,
+            } as import("./types").DocumentSummary,
+          },
+        ],
+      },
+    ];
+    vi.mocked(ask).mockResolvedValue(true);
+    vi.mocked(ipc.enableCalculation).mockImplementation(async () => {
+      backend.projects![0].calculation!.enabled = true;
+      return structuredClone(backend.projects![0]);
+    });
+    vi.mocked(ipc.recalculateProject).mockImplementation(async () => {
+      backend.projects![0].tables[0].document.pendingCells = 0;
+      return structuredClone(backend.projects![0]);
+    });
+    const { result } = renderHook(() => useWorkspace());
+    await waitFor(() => expect(result.current.ready).toBe(true));
+    expect(ipc.recalculateProject).not.toHaveBeenCalled();
+    await act(async () => {
+      await result.current.enableProjectCalculation(1);
+    });
+    await waitFor(() => expect(ipc.recalculateProject).toHaveBeenCalledWith(1));
+    expect(ask).toHaveBeenCalledTimes(1);
+  });
+  it("requires cancelling calculations before closing their project", async () => {
+    backend.projects = [
+      {
+        ...project(1),
+        calculation: {
+          enabled: true,
+          running: true,
+          paused: false,
+          error: null,
+        },
+      },
+    ];
+    const { result } = renderHook(() => useWorkspace());
+    await waitFor(() => expect(result.current.ready).toBe(true));
+    await expect(result.current.requestClose(1)).rejects.toThrow(
+      "Cancel the calculation",
+    );
+    expect(ipc.closeProject).not.toHaveBeenCalled();
   });
 });

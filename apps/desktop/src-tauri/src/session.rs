@@ -1,5 +1,10 @@
+#[path = "calculation.rs"]
+pub mod calculation;
 #[path = "projects.rs"]
 pub mod projects;
+#[path = "sheet_session.rs"]
+pub mod sheets;
+use crate::formulas::{self, DependencyGraph, SheetData};
 use std::{
     borrow::Cow,
     cmp::Ordering,
@@ -33,6 +38,9 @@ fn next_session_identity() -> u64 {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentSummary {
+    pub calculation_revision: u64,
+    pub formula_count: usize,
+    pub pending_cells: usize,
     pub project_id: Option<u64>,
     pub view: ViewState,
     pub document_id: u64,
@@ -58,6 +66,7 @@ pub struct DocumentSummary {
 
 #[derive(Debug, Clone)]
 pub(crate) struct MacroDocumentSnapshot {
+    pub calculation_revision: u64,
     pub document_id: u64,
     pub identity: u64,
     pub revision: u64,
@@ -75,6 +84,7 @@ pub struct GridRow {
     pub source_row: usize,
     pub row_id: u64,
     pub cells: Vec<String>,
+    pub inputs: Option<Vec<sheets::CellInfo>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -149,14 +159,41 @@ pub struct CellInput {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum EditCommand {
-    SetCells { cells: Vec<CellInput> },
-    InsertRows { index: usize, count: usize },
-    DeleteRows { index: usize, count: usize },
-    InsertColumns { index: usize, count: usize },
-    DeleteColumns { index: usize, count: usize },
-    SetDelimiter { delimiter: String },
+    SetSheetCells {
+        cells: Vec<sheets::SheetCellInput>,
+    },
+    SetCellTypes {
+        cells: Vec<CellPosition>,
+        cell_type: formulas::CellType,
+    },
+    SetCells {
+        cells: Vec<CellInput>,
+    },
+    InsertRows {
+        index: usize,
+        count: usize,
+    },
+    DeleteRows {
+        index: usize,
+        count: usize,
+    },
+    InsertColumns {
+        index: usize,
+        count: usize,
+    },
+    DeleteColumns {
+        index: usize,
+        count: usize,
+    },
+    SetDelimiter {
+        delimiter: String,
+    },
     ApplySort,
 }
 
@@ -366,9 +403,46 @@ enum InternalOp {
 
 #[derive(Debug, Clone)]
 struct EditRecord {
+    sheet: Option<SheetChange>,
     forward: InternalOp,
     inverse: InternalOp,
     column_state: Option<ColumnStateChange>,
+}
+
+/// Only changed metadata participates in undo; cached values elsewhere remain owned by the sheet.
+#[derive(Debug, Clone, Serialize)]
+struct SheetChange {
+    cells: Vec<(
+        String,
+        Option<formulas::CellMeta>,
+        Option<formulas::CellMeta>,
+    )>,
+}
+impl SheetChange {
+    fn new(before: &SheetData, after: &SheetData) -> Self {
+        let mut cells = Vec::new();
+        for (key, old) in &before.cells {
+            let new = after.cells.get(key);
+            if Some(old) != new {
+                cells.push((key.clone(), Some(old.clone()), new.cloned()));
+            }
+        }
+        for (key, new) in &after.cells {
+            if !before.cells.contains_key(key) {
+                cells.push((key.clone(), None, Some(new.clone())));
+            }
+        }
+        Self { cells }
+    }
+    fn apply(&self, target: &mut SheetData, forward: bool) {
+        for (key, before, after) in &self.cells {
+            if let Some(value) = if forward { after } else { before } {
+                target.cells.insert(key.clone(), value.clone());
+            } else {
+                target.cells.remove(key);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -384,6 +458,9 @@ struct ColumnStateChange {
 }
 
 pub struct DocumentSession {
+    sheet: SheetData,
+    graph: DependencyGraph,
+    calculation_revision: u64,
     project_id: Option<u64>,
     title: Option<String>,
     document: TableDocument,
@@ -427,6 +504,9 @@ impl Default for DocumentSession {
             identity: next_session_identity(),
             project_id: None,
             title: None,
+            sheet: SheetData::default(),
+            graph: DependencyGraph::default(),
+            calculation_revision: 0,
         };
         session.rebuild_view();
         session
@@ -531,6 +611,9 @@ impl DocumentSession {
             identity: next_session_identity(),
             project_id: None,
             title: None,
+            sheet: SheetData::default(),
+            graph: DependencyGraph::default(),
+            calculation_revision: 0,
         };
         session.rebuild_view();
         session
@@ -558,6 +641,9 @@ impl DocumentSession {
             identity: next_session_identity(),
             project_id: None,
             title: None,
+            sheet: self.sheet.clone(),
+            graph: self.graph.clone(),
+            calculation_revision: 0,
         };
         session.rebuild_view();
         session
@@ -566,6 +652,9 @@ impl DocumentSession {
     pub(crate) fn summary(&self) -> DocumentSummary {
         let header_names = self.header_names();
         DocumentSummary {
+            calculation_revision: self.calculation_revision,
+            formula_count: self.sheet.formulas().count(),
+            pending_cells: self.sheet.formulas().filter(|(_, m)| m.pending).count(),
             document_id: self.identity,
             project_id: self.project_id,
             view: self.view.clone(),
@@ -605,6 +694,9 @@ impl DocumentSession {
 
     fn header_names(&self) -> Vec<String> {
         let count = self.document.column_count();
+        if self.project_id.is_some() {
+            return (0..count).map(column_name).collect();
+        }
         let raw = if self.header_enabled {
             self.document.rows().first()
         } else {
@@ -638,7 +730,9 @@ impl DocumentSession {
     }
 
     fn data_start(&self) -> usize {
-        usize::from(self.header_enabled && self.document.row_count() > 0)
+        usize::from(
+            self.project_id.is_none() && self.header_enabled && self.document.row_count() > 0,
+        )
     }
 
     fn rebuild_view(&mut self) {
@@ -708,9 +802,23 @@ impl DocumentSession {
     }
 
     fn cell_value(&self, row: usize, column: usize) -> &str {
-        self.document
-            .cell(CellPosition { row, column })
-            .unwrap_or("")
+        {
+            let raw = self.raw_cell(row, column);
+            if self.project_id.is_some() {
+                if let Some(meta) = self.sheet.cells.get(&formulas::key((row, column))) {
+                    if let Some(result) = &meta.cached {
+                        return &result.display;
+                    }
+                    if meta.formula {
+                        return "…";
+                    }
+                    if meta.escaped {
+                        return raw.strip_prefix('\'').unwrap_or(raw);
+                    }
+                }
+            }
+            raw
+        }
     }
 
     fn grid_window(
@@ -730,6 +838,11 @@ impl DocumentSession {
                 view_index,
                 source_row,
                 row_id: self.row_ids[source_row],
+                inputs: self.project_id.map(|_| {
+                    (column_start..column_start.saturating_add(column_count.min(200)))
+                        .map(|column| self.cell_info(source_row, column))
+                        .collect()
+                }),
                 cells: (column_start..column_start.saturating_add(column_count.min(200)))
                     .map(|column| self.cell_value(source_row, column).to_string())
                     .collect(),
@@ -809,10 +922,11 @@ impl DocumentSession {
 
     pub(crate) fn macro_snapshot(&self) -> MacroDocumentSnapshot {
         MacroDocumentSnapshot {
+            calculation_revision: self.calculation_revision,
             document_id: self.identity,
             identity: self.identity,
             revision: self.revision,
-            rows: self.document.rows().to_vec(),
+            rows: self.materialized_rows(),
             header_enabled: self.header_enabled,
             display_name: self.summary().display_name,
             delimiter: char::from(self.dialect.delimiter).to_string(),
@@ -894,6 +1008,7 @@ impl DocumentSession {
             }
             self.commit(
                 EditRecord {
+                    sheet: None,
                     forward: InternalOp::SetCells {
                         cells: after,
                         restore_shape: None,
@@ -920,6 +1035,7 @@ impl DocumentSession {
                 .collect();
             self.commit(
                 EditRecord {
+                    sheet: None,
                     forward: InternalOp::ReplaceRows {
                         index: start,
                         remove_count: before_rows.len(),
@@ -964,8 +1080,24 @@ impl DocumentSession {
         Ok(())
     }
 
-    fn commit(&mut self, record: EditRecord, estimated_bytes: usize) -> Result<(), String> {
+    fn commit(&mut self, mut record: EditRecord, mut estimated_bytes: usize) -> Result<(), String> {
+        if self.project_id.is_some() && record.sheet.is_none() {
+            record.sheet = Some(SheetChange::new(
+                &self.sheet,
+                &self.sheet_after(&record.forward),
+            ));
+        }
+        if let Some(change) = &record.sheet {
+            estimated_bytes += serde_json::to_vec(change).map_err(|e| e.to_string())?.len();
+        }
+        if estimated_bytes > HISTORY_BYTES {
+            return Err("The edit exceeds the 64 MiB Undo limit".into());
+        }
         self.execute(&record.forward)?;
+        if let Some(change) = &record.sheet {
+            change.apply(&mut self.sheet, true);
+            self.sync_sheet();
+        }
         if let Some(change) = &record.column_state {
             self.restore_column_state(&change.after);
         }
@@ -992,6 +1124,12 @@ impl DocumentSession {
             ));
         }
         match command {
+            EditCommand::SetSheetCells { cells } => {
+                self.edit_sheet_cells(cells)?;
+            }
+            EditCommand::SetCellTypes { cells, cell_type } => {
+                self.edit_cell_types(cells, cell_type)?;
+            }
             EditCommand::SetCells { cells } => {
                 let original_shape = self
                     .document
@@ -1003,7 +1141,7 @@ impl DocumentSession {
                 let mut after = Vec::new();
                 let mut bytes = 0;
                 for cell in cells {
-                    let old = self.cell_value(cell.row, cell.column).to_string();
+                    let old = self.raw_cell(cell.row, cell.column).to_string();
                     if old != cell.value {
                         bytes += old.len() + cell.value.len() + 32;
                         before.push(CellInput {
@@ -1017,6 +1155,7 @@ impl DocumentSession {
                 if !after.is_empty() {
                     self.commit(
                         EditRecord {
+                            sheet: None,
                             forward: InternalOp::SetCells {
                                 cells: after,
                                 restore_shape: None,
@@ -1044,6 +1183,7 @@ impl DocumentSession {
                     .collect();
                 self.commit(
                     EditRecord {
+                        sheet: None,
                         forward: InternalOp::InsertRows { index, rows, ids },
                         inverse: InternalOp::RemoveRows { index, count },
                         column_state: None,
@@ -1060,6 +1200,7 @@ impl DocumentSession {
                     let bytes = rows.iter().flatten().map(String::len).sum::<usize>() + count * 32;
                     self.commit(
                         EditRecord {
+                            sheet: None,
                             forward: InternalOp::RemoveRows { index, count },
                             inverse: InternalOp::InsertRows { index, rows, ids },
                             column_state: None,
@@ -1077,6 +1218,7 @@ impl DocumentSession {
                 });
                 self.commit(
                     EditRecord {
+                        sheet: None,
                         forward: InternalOp::InsertColumns { index, count },
                         inverse: InternalOp::RemoveColumns { index, count },
                         column_state,
@@ -1100,6 +1242,7 @@ impl DocumentSession {
                     });
                     self.commit(
                         EditRecord {
+                            sheet: None,
                             forward: InternalOp::RemoveColumns { index, count },
                             inverse: InternalOp::RestoreColumns { index, columns },
                             column_state,
@@ -1116,6 +1259,7 @@ impl DocumentSession {
                 if bytes[0] != self.dialect.delimiter {
                     self.commit(
                         EditRecord {
+                            sheet: None,
                             forward: InternalOp::SetDelimiter(bytes[0]),
                             inverse: InternalOp::SetDelimiter(self.dialect.delimiter),
                             column_state: None,
@@ -1125,6 +1269,9 @@ impl DocumentSession {
                 }
             }
             EditCommand::ApplySort => {
+                if self.sheet.formulas().next().is_some() {
+                    return Err("Use view sorting on sheets with formulas; applying the order would change references".into());
+                }
                 if !self.view.sorts.is_empty() {
                     let before = self.row_ids.clone();
                     let mut after = Vec::with_capacity(before.len());
@@ -1138,6 +1285,7 @@ impl DocumentSession {
                     let sorts = std::mem::take(&mut self.view.sorts);
                     let result = self.commit(
                         EditRecord {
+                            sheet: None,
                             forward: InternalOp::ReorderRows(after),
                             inverse: InternalOp::ReorderRows(before),
                             column_state: None,
@@ -1160,6 +1308,11 @@ impl DocumentSession {
             return Ok(());
         };
         self.execute(&transaction.value.inverse)?;
+        if let Some(change) = &transaction.value.sheet {
+            change.apply(&mut self.sheet, false);
+            self.sheet.invalidate_all();
+            self.sync_sheet();
+        }
         if let Some(change) = &transaction.value.column_state {
             self.restore_column_state(&change.before);
         }
@@ -1175,6 +1328,11 @@ impl DocumentSession {
             return Ok(());
         };
         self.execute(&transaction.value.forward)?;
+        if let Some(change) = &transaction.value.sheet {
+            change.apply(&mut self.sheet, true);
+            self.sheet.invalidate_all();
+            self.sync_sheet();
+        }
         if let Some(change) = &transaction.value.column_state {
             self.restore_column_state(&change.after);
         }
@@ -1281,8 +1439,15 @@ impl DocumentSession {
                     .ok_or_else(|| "the selected match is no longer available".to_string())?,
             ]
         };
-        let cells = selected
+        let cells: Vec<CellInput> = selected
             .into_iter()
+            .filter(|found| {
+                !self
+                    .sheet
+                    .cells
+                    .get(&formulas::key((found.source_row, found.column)))
+                    .is_some_and(|m| m.formula)
+            })
             .map(|found| {
                 let value = if request.search.whole_cell {
                     request.replacement.clone()
@@ -1305,6 +1470,23 @@ impl DocumentSession {
             })
             .collect();
         let revision = self.revision;
+        if self.project_id.is_some() {
+            return self.apply_edit(
+                EditCommand::SetSheetCells {
+                    cells: cells
+                        .into_iter()
+                        .map(|c| sheets::SheetCellInput {
+                            row: c.row,
+                            column: c.column,
+                            value: c.value,
+                            literal: true,
+                            cell_type: None,
+                        })
+                        .collect(),
+                },
+                revision,
+            );
+        }
         self.apply_edit(EditCommand::SetCells { cells }, revision)
     }
 
@@ -1668,6 +1850,9 @@ fn session_from_recovery(payload: RecoveryPayload) -> DocumentSession {
         identity: next_session_identity(),
         project_id: None,
         title: None,
+        sheet: SheetData::default(),
+        graph: DependencyGraph::default(),
+        calculation_revision: 0,
     };
     session.rebuild_view();
     session
@@ -2128,6 +2313,8 @@ pub fn session_set_column_type(
             &column_types,
         )?;
         session.column_types = column_types;
+        session.sheet.invalidate_all();
+        session.refresh_literal_caches();
         if session.project_id.is_some() {
             session.revision += 1;
         }
@@ -2196,17 +2383,17 @@ pub fn session_export_view(
     ensure_path_available(&state, Path::new(&path), 0)?;
     let handle = document_handle(&state, document_id)?;
     let session = lock_document(&handle)?;
+    session.ensure_calculated()?;
     let mut rows =
         Vec::with_capacity(session.visible_rows.len() + usize::from(session.header_enabled));
-    if session.header_enabled && session.document.row_count() > 0 {
+    if session.project_id.is_none() && session.header_enabled && session.document.row_count() > 0 {
         rows.push(session.document.rows()[0].clone());
     }
-    rows.extend(
-        session
-            .visible_rows
-            .iter()
-            .map(|row| session.document.rows()[*row].clone()),
-    );
+    rows.extend(session.visible_rows.iter().map(|row| {
+        (0..session.document.rows()[*row].len())
+            .map(|column| session.cell_value(*row, column).to_string())
+            .collect()
+    }));
     tablune_csv::write_path(path, &TableDocument::from_rows(rows), session.dialect)
         .map_err(|error| error.to_string())
 }

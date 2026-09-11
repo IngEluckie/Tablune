@@ -174,6 +174,19 @@ describe("App multidocument tabs", () => {
 
   afterEach(cleanup);
 
+  it("renders only the visible managed workspace ribbon in the application header", async () => {
+    const target = document.createElement("div");
+    document.body.append(target);
+    const props = { managed: true, documents: [summary(1, "One.csv")], selectedId: 1, ribbonTarget: target };
+    const view = render(<App {...props} ribbonVisible />);
+    await waitFor(() => expect(target.textContent).toContain("One.csv"));
+    expect(view.container.querySelector("header")).toBeNull();
+    view.rerender(<App {...props} ribbonVisible={false} />);
+    expect(target.childElementCount).toBe(0);
+    view.unmount();
+    target.remove();
+  });
+
   it("creates a new tab without closing the current document", async () => {
     vi.mocked(newSession).mockResolvedValue(summary(2, "Untitled.csv", false, null));
     render(<App />);

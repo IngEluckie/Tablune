@@ -46,7 +46,7 @@ pnpm check
 pnpm frontend:build
 ```
 
-## Project workspace validation (0.4)
+## Project and calculation validation (0.5)
 
 Use the pnpm version declared in `package.json` (`corepack pnpm --version` should report 10.14.0). The desktop checks can also be run directly as `corepack pnpm --dir apps/desktop check` and `corepack pnpm --dir apps/desktop test` if another pnpm shadows Corepack in PATH.
 
@@ -55,6 +55,9 @@ Project archive behavior is documented in `docs/projects.md`. The opt-in large-t
 ```sh
 cargo test -p tablune-desktop project_100k_by_50_round_trip -- --ignored --nocapture
 cargo test -p tablune-desktop handles_the_100k_by_50_validation_dataset -- --ignored --nocapture
+cargo test -p tablune-desktop ten_thousand_formulas_benchmark -- --ignored --nocapture
 ```
 
-Recorded observations and the native validation scenario are in `docs/validation-0.4.md`.
+Recorded observations and the native validation scenario are in `docs/validation-0.5.md`.
+
+Run performance checks separately from compilation and other benchmarks to reduce contention. The 10,000-formula fixture measures initial evaluation, one confirmed input edit, and incremental evaluation with the same Python process. Its Rust RSS excludes Python child memory; macOS child RSS is recorded separately. These measurements do not expand the 100,000 × 50 in-memory validation target.
