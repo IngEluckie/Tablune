@@ -1,3 +1,4 @@
+import { clampSheetZoom } from "./sheetZoom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -80,6 +81,7 @@ const EMPTY_SELECTION: SelectionRange = {
 const EMPTY_VIEWPORT: GridViewportState = { scrollTop: 0, scrollLeft: 0 };
 
 interface TabUiState {
+  zoom: number;
   view: ViewState;
   selection: SelectionRange;
   viewport: GridViewportState;
@@ -92,6 +94,7 @@ type UnsavedRequest =
 
 function emptyTabUiState(): TabUiState {
   return {
+    zoom: 1,
     view: { sorts: [], filters: [] },
     selection: {
       anchor: { ...EMPTY_SELECTION.anchor },
@@ -915,6 +918,8 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
     restoreExplorerAfterMacro.current = false;
   };
 
+  const changeZoom = (zoom: number) => updateTabUi(summary.documentId, current => ({ ...current, zoom: clampSheetZoom(zoom) }));
+
   const ribbon = <RibbonHeader
         {...props.ribbonControls}
         documentName={summary.displayName}
@@ -929,6 +934,8 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
         canChangeRows={!summary.filtersActive && summary.sortCount === 0}
         canDuplicate={Boolean(props.project) || summary.path !== null}
         hasView={summary.filtersActive || summary.sortCount > 0}
+        zoom={tabUi.zoom}
+        onZoomChange={changeZoom}
         hasCustomSizing={hasCustomSizing}
         theme={theme}
         onNew={() => void createNew()}
@@ -1011,6 +1018,8 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
               summary={summary}
               theme={theme}
               readOnly={macroOpen || props.active === false}
+              zoom={tabUi.zoom}
+              onZoomChange={changeZoom}
               initialSelection={tabUi.selection}
               initialViewport={tabUi.viewport}
               onCreateImageProject={props.onCreateImageProject}

@@ -1,3 +1,4 @@
+import { clampSheetZoom, MIN_SHEET_ZOOM, MAX_SHEET_ZOOM } from "./sheetZoom";
 import {
   type FocusEvent,
   type ReactNode,
@@ -20,6 +21,8 @@ const MENUS: Array<{ id: MenuSection; label: string }> = [
 ];
 
 export interface RibbonHeaderProps {
+  zoom?: number;
+  onZoomChange?: (zoom: number) => void;
   navigation?: ReactNode;
   fileActions?: ReactNode;
   tableAvailable?: boolean;
@@ -81,6 +84,8 @@ function writePinnedPreference(pinned: boolean): void {
 }
 
 export default function RibbonHeader({
+  zoom = 1,
+  onZoomChange,
   navigation,
   fileActions,
   tableAvailable = true,
@@ -373,6 +378,15 @@ export default function RibbonHeader({
                 <button onClick={onFind}>Find</button>
                 <button onClick={onToggleExplorer} disabled={mutationsLocked}>Data Explorer</button>
                 <button onClick={onResetCellSizing} disabled={busy || !hasCustomSizing}>Reset Cell Size</button>
+                {onZoomChange && <div className="sheet-zoom-controls" role="group" aria-label="Sheet zoom">
+                  <button aria-label="Zoom out" disabled={zoom <= MIN_SHEET_ZOOM} onClick={() => onZoomChange(clampSheetZoom(zoom - 0.1))}>−</button>
+                  <label>Zoom <select aria-label="Sheet zoom level" value={Math.round(zoom * 100)} onChange={event => onZoomChange(Number(event.target.value) / 100)}>
+                    {[...new Set([25, 50, 75, 100, 125, 150, 175, 200, 250, 300, Math.round(zoom * 100)])].sort((a, b) => a - b).map(value => <option key={value} value={value}>{value}%</option>)}
+                  </select></label>
+                  <button aria-label="Zoom in" disabled={zoom >= MAX_SHEET_ZOOM} onClick={() => onZoomChange(clampSheetZoom(zoom + 0.1))}>+</button>
+                  <button disabled={zoom === 1} onClick={() => onZoomChange(1)}>Reset Zoom</button>
+                </div>}
+
                 </>}
               </div>
             )}

@@ -1,3 +1,4 @@
+import { clampSheetZoom, useSheetZoom, zoomAxis } from "./sheetZoom";
 import { open, ask } from "@tauri-apps/plugin-dialog";
 import { importCellImage, copyImageAssets, pasteImageAssets } from "./ipc";
 import { useImageThumbnails } from "./imageThumbnails";
@@ -63,8 +64,6 @@ let internalClipboard: {
   generation: number | null;
   inputs: CellInfo[][];
 } | null = null;
-const ROW_HEADER_WIDTH = 52;
-const COLUMN_HEADER_HEIGHT = 32;
 const MIN_ROWS = 100;
 const MIN_COLUMNS = 26;
 const WINDOW_OVERSCAN = 12;
@@ -73,6 +72,8 @@ const SELECTION_ROW_CHUNK = 400;
 export const GRID_WINDOW_COLUMN_LIMIT = 200;
 
 interface CsvGridProps {
+  zoom?: number;
+  onZoomChange?: (zoom: number) => void;
   onCreateImageProject?: (row: number, column: number) => Promise<void>;
   appliedFunctions?: string;
   summary: DocumentSummary;
@@ -294,6 +295,8 @@ const DEFAULT_SELECTION: SelectionRange = {
 };
 
 export default function CsvGrid({
+  zoom: requestedZoom = 1,
+  onZoomChange,
   appliedFunctions = "",
   summary,
   theme,
@@ -311,6 +314,10 @@ export default function CsvGrid({
   onCreateImageProject,
 }: CsvGridProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
+  const zoom = clampSheetZoom(requestedZoom);
+  const ROW_HEADER_WIDTH = 52 * zoom;
+  const COLUMN_HEADER_HEIGHT = 32 * zoom;
+  useSheetZoom(viewportRef, zoom, onZoomChange);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dragAnchor = useRef<GridTarget | null>(null);
   const requestId = useRef(0);
@@ -371,17 +378,17 @@ export default function CsvGrid({
   }, [initialSizing, resizeState, summary.imageRows]);
   const columnMetrics = useMemo(
     () =>
-      createAxisMetrics(
+      zoomAxis(createAxisMetrics(
         columnCount,
         DEFAULT_COLUMN_WIDTH,
         activeSizing.columnWidths,
-      ),
-    [activeSizing.columnWidths, columnCount],
+      ), zoom),
+    [activeSizing.columnWidths, columnCount, zoom],
   );
   const rowMetrics = useMemo(
     () =>
-      createAxisMetrics(rowCount, DEFAULT_ROW_HEIGHT, { ...Object.fromEntries((summary.imageRows ?? []).map(row => [row, 96])), ...activeSizing.rowHeights }),
-    [activeSizing.rowHeights, rowCount, summary.imageRows],
+      zoomAxis(createAxisMetrics(rowCount, DEFAULT_ROW_HEIGHT, { ...Object.fromEntries((summary.imageRows ?? []).map(row => [row, 96])), ...activeSizing.rowHeights }), zoom),
+    [activeSizing.rowHeights, rowCount, summary.imageRows, zoom],
   );
   const totalWidth = ROW_HEADER_WIDTH + columnMetrics.totalSize;
   const totalHeight = COLUMN_HEADER_HEIGHT + rowMetrics.totalSize;
@@ -523,7 +530,7 @@ export default function CsvGrid({
     context.setTransform(scale, 0, 0, scale, 0, 0);
     context.clearRect(0, 0, width, height);
     context.font =
-      "13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+      `${13 * zoom}px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif`;
     context.textBaseline = "middle";
     const firstColumn = columnMetrics.indexAt(
       viewport.scrollLeft - ROW_HEADER_WIDTH,
@@ -542,6 +549,10 @@ export default function CsvGrid({
     context.fillStyle = palette.background;
     context.fillRect(0, 0, width, height);
 
+    context.save();
+    context.beginPath();
+    context.rect(ROW_HEADER_WIDTH, 0, Math.max(0, width - ROW_HEADER_WIDTH), COLUMN_HEADER_HEIGHT);
+    context.clip();
     for (let column = firstColumn; column <= lastColumn; column += 1) {
       const columnWidth = columnMetrics.sizeAt(column);
       const x =
@@ -573,11 +584,16 @@ export default function CsvGrid({
       if (column < summary.headerNames.length) {
         context.fillStyle = palette.headerIcon;
         context.textAlign = "right";
-        context.fillText("↕", x + columnWidth - 9, COLUMN_HEADER_HEIGHT / 2);
+        context.fillText("↕", x + columnWidth - 9 * zoom, COLUMN_HEADER_HEIGHT / 2);
       }
       context.restore();
     }
 
+    context.restore();
+    context.save();
+    context.beginPath();
+    context.rect(0, COLUMN_HEADER_HEIGHT, width, Math.max(0, height - COLUMN_HEADER_HEIGHT));
+    context.clip();
     for (let row = firstRow; row <= lastRow; row += 1) {
       const rowHeight = rowMetrics.sizeAt(row);
       const y =
@@ -599,6 +615,10 @@ export default function CsvGrid({
         ROW_HEADER_WIDTH / 2,
         y + rowHeight / 2,
       );
+      context.save();
+      context.beginPath();
+      context.rect(ROW_HEADER_WIDTH, COLUMN_HEADER_HEIGHT, Math.max(0, width - ROW_HEADER_WIDTH), Math.max(0, height - COLUMN_HEADER_HEIGHT));
+      context.clip();
       for (let column = firstColumn; column <= lastColumn; column += 1) {
         const columnWidth = columnMetrics.sizeAt(column);
         const x =
@@ -622,20 +642,22 @@ export default function CsvGrid({
         context.textAlign = "left";
         context.save();
         context.beginPath();
-        context.rect(x + 6, y, Math.max(0, columnWidth - 12), rowHeight);
+        context.rect(x + 6 * zoom, y, Math.max(0, columnWidth - 12 * zoom), rowHeight);
         context.clip();
         const cellImage = cachedRow(row)?.inputs?.[column - (windowData?.columnStart ?? 0)]?.image;
         const bitmap = cellImage ? thumbnails.get(cellImage.assetId) : undefined;
         if (bitmap) {
-          const scale = Math.min((columnWidth - 16) / bitmap.width, (rowHeight - 8) / bitmap.height);
+          const scale = Math.min((columnWidth - 16 * zoom) / bitmap.width, (rowHeight - 8 * zoom) / bitmap.height);
           const w = bitmap.width * scale, h = bitmap.height * scale;
           context.drawImage(bitmap, x + (columnWidth - w) / 2, y + (rowHeight - h) / 2, w, h);
         } else {
-          context.fillText(cellImage ? `▧ ${cellImage.name}` : getCell(row, column), x + 8, y + rowHeight / 2);
+          context.fillText(cellImage ? `▧ ${cellImage.name}` : getCell(row, column), x + 8 * zoom, y + rowHeight / 2);
         }
         context.restore();
       }
+      context.restore();
     }
+    context.restore();
 
     context.strokeStyle = palette.gridLine;
     context.lineWidth = 1;
@@ -646,8 +668,10 @@ export default function CsvGrid({
         columnMetrics.offsetAt(column) -
         viewport.scrollLeft +
         0.5;
-      context.moveTo(x, 0);
-      context.lineTo(x, height);
+      if (x >= ROW_HEADER_WIDTH) {
+        context.moveTo(x, 0);
+        context.lineTo(x, height);
+      }
     }
     for (let row = firstRow; row <= lastRow + 1; row += 1) {
       const y =
@@ -655,8 +679,10 @@ export default function CsvGrid({
         rowMetrics.offsetAt(row) -
         viewport.scrollTop +
         0.5;
-      context.moveTo(0, y);
-      context.lineTo(width, y);
+      if (y >= COLUMN_HEADER_HEIGHT) {
+        context.moveTo(0, y);
+        context.lineTo(width, y);
+      }
     }
     context.moveTo(ROW_HEADER_WIDTH + 0.5, 0);
     context.lineTo(ROW_HEADER_WIDTH + 0.5, height);
@@ -672,6 +698,10 @@ export default function CsvGrid({
       COLUMN_HEADER_HEIGHT +
       rowMetrics.offsetAt(range.startRow) -
       viewport.scrollTop;
+    context.save();
+    context.beginPath();
+    context.rect(ROW_HEADER_WIDTH, COLUMN_HEADER_HEIGHT, Math.max(0, width - ROW_HEADER_WIDTH), Math.max(0, height - COLUMN_HEADER_HEIGHT));
+    context.clip();
     context.strokeStyle = palette.selectionStroke;
     context.lineWidth = 2;
     context.strokeRect(
@@ -680,7 +710,11 @@ export default function CsvGrid({
       columnMetrics.rangeSize(range.startColumn, range.endColumn + 1) - 2,
       rowMetrics.rangeSize(range.startRow, range.endRow + 1) - 2,
     );
+    context.restore();
   }, [
+    zoom,
+    ROW_HEADER_WIDTH,
+    COLUMN_HEADER_HEIGHT,
     cachedRow,
     thumbnails,
     windowData?.columnStart,
@@ -727,13 +761,15 @@ export default function CsvGrid({
     const viewport = viewportRef.current;
     if (!viewport) return null;
     const rect = viewport.getBoundingClientRect();
-    const absoluteX = event.clientX - rect.left + viewport.scrollLeft;
-    const absoluteY = event.clientY - rect.top + viewport.scrollTop;
-    if (absoluteY < COLUMN_HEADER_HEIGHT && absoluteX >= ROW_HEADER_WIDTH) {
+    const localX = event.clientX - rect.left;
+    const localY = event.clientY - rect.top;
+    const absoluteX = localX + viewport.scrollLeft;
+    const absoluteY = localY + viewport.scrollTop;
+    if (localY < COLUMN_HEADER_HEIGHT && localX >= ROW_HEADER_WIDTH) {
       const index = boundaryAt(columnMetrics, absoluteX - ROW_HEADER_WIDTH);
       if (index !== null) return { axis: "column", index };
     }
-    if (absoluteX < ROW_HEADER_WIDTH && absoluteY >= COLUMN_HEADER_HEIGHT) {
+    if (localX < ROW_HEADER_WIDTH && localY >= COLUMN_HEADER_HEIGHT) {
       const index = boundaryAt(rowMetrics, absoluteY - COLUMN_HEADER_HEIGHT);
       if (index !== null) return { axis: "row", index };
     }
@@ -747,19 +783,21 @@ export default function CsvGrid({
     const viewport = viewportRef.current;
     if (!viewport) return null;
     const rect = viewport.getBoundingClientRect();
-    const absoluteX = event.clientX - rect.left + viewport.scrollLeft;
-    const absoluteY = event.clientY - rect.top + viewport.scrollTop;
-    if (absoluteX < ROW_HEADER_WIDTH && absoluteY < COLUMN_HEADER_HEIGHT) {
+    const localX = event.clientX - rect.left;
+    const localY = event.clientY - rect.top;
+    const absoluteX = localX + viewport.scrollLeft;
+    const absoluteY = localY + viewport.scrollTop;
+    if (localX < ROW_HEADER_WIDTH && localY < COLUMN_HEADER_HEIGHT) {
       return { row: 0, column: 0, mode: "cells" };
     }
-    if (absoluteY < COLUMN_HEADER_HEIGHT) {
+    if (localY < COLUMN_HEADER_HEIGHT) {
       return {
         row: 0,
         column: columnMetrics.indexAt(absoluteX - ROW_HEADER_WIDTH),
         mode: "columns",
       };
     }
-    if (absoluteX < ROW_HEADER_WIDTH) {
+    if (localX < ROW_HEADER_WIDTH) {
       return {
         row: rowMetrics.indexAt(absoluteY - COLUMN_HEADER_HEIGHT),
         column: 0,
@@ -1479,8 +1517,8 @@ export default function CsvGrid({
               ...resizeTarget,
               pointerId: event.pointerId,
               startClientPosition,
-              startSize: metrics.sizeAt(resizeTarget.index),
-              currentSize: metrics.sizeAt(resizeTarget.index),
+              startSize: metrics.sizeAt(resizeTarget.index) / zoom,
+              currentSize: metrics.sizeAt(resizeTarget.index) / zoom,
             });
             setResizeHover(resizeTarget.axis);
             return;
@@ -1489,14 +1527,14 @@ export default function CsvGrid({
           if (viewport) {
             const rect = viewport.getBoundingClientRect();
             const absoluteX = event.clientX - rect.left + viewport.scrollLeft;
-            const absoluteY = event.clientY - rect.top + viewport.scrollTop;
+            const localY = event.clientY - rect.top;
             const columnOffset = absoluteX - ROW_HEADER_WIDTH;
             const column = columnMetrics.indexAt(columnOffset);
             const withinColumn = columnOffset - columnMetrics.offsetAt(column);
             if (
-              absoluteY < COLUMN_HEADER_HEIGHT &&
-              absoluteX >= ROW_HEADER_WIDTH &&
-              withinColumn >= columnMetrics.sizeAt(column) - 24
+              localY < COLUMN_HEADER_HEIGHT &&
+              event.clientX - rect.left >= ROW_HEADER_WIDTH &&
+              withinColumn >= columnMetrics.sizeAt(column) - 24 * zoom
             ) {
               if (!readOnly) onHeaderSort(column);
               return;
@@ -1524,8 +1562,7 @@ export default function CsvGrid({
               ...resizeState,
               currentSize: clampGridSize(
                 resizeState.startSize +
-                  clientPosition -
-                  resizeState.startClientPosition,
+                  (clientPosition - resizeState.startClientPosition) / zoom,
                 minimum,
                 maximum,
               ),
@@ -1631,6 +1668,8 @@ export default function CsvGrid({
             value={draft}
             aria-label={editing.header ? "Edit column header" : "Edit cell"}
             style={{
+              fontSize: 13 * zoom,
+              padding: `0 ${7 * zoom}px`,
               left:
                 ROW_HEADER_WIDTH + columnMetrics.offsetAt(editing.column) + 1,
               top: editing.header

@@ -26,6 +26,7 @@ The initial release targets macOS for development and validation, while preservi
 - Import CSV data into a project or create a project from an edited CSV
 - Create a new CSV document
 - Open and inspect UTF-8 CSV, TSV, and semicolon-delimited files
+- Zoom each sheet from View, with trackpad pinch or Ctrl+mouse wheel
 - Edit cell values in a virtualized canvas grid
 - Insert and delete rows and columns
 - Copy, cut, and paste tabular data

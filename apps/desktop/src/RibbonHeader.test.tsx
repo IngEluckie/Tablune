@@ -242,3 +242,17 @@ describe("RibbonHeader", () => {
     expect(screen.getByRole("button", { name: "Rename Untitled.csv" })).toBeTruthy();
   });
 });
+
+it("provides sheet zoom controls in View", () => {
+  const onZoomChange = vi.fn();
+  const { rerender } = render(<RibbonHeader {...defaultProps} zoom={1} onZoomChange={onZoomChange} />);
+  fireEvent.mouseEnter(screen.getByRole("button", { name: "View" }));
+  fireEvent.change(screen.getByLabelText("Sheet zoom level"), { target: { value: "150" } });
+  expect(onZoomChange).toHaveBeenLastCalledWith(1.5);
+  rerender(<RibbonHeader {...defaultProps} zoom={1.5} onZoomChange={onZoomChange} />);
+  fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
+  expect(onZoomChange).toHaveBeenLastCalledWith(1.6);
+  fireEvent.click(screen.getByRole("button", { name: "Reset Zoom" }));
+  expect(onZoomChange).toHaveBeenLastCalledWith(1);
+  cleanup();
+});

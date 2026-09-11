@@ -352,3 +352,29 @@ it("does not modify cells when an image fails validation", async () => {
   await waitFor(() => expect(onError).toHaveBeenCalledWith("Error: Invalid image"));
   expect(onApplyEdit).not.toHaveBeenCalled();
 });
+
+it("keeps pointer selection and cell editing aligned at 200% zoom", async () => {
+  const onSelectionChange = vi.fn();
+  const { container } = render(<CsvGrid summary={summary} theme="light" zoom={2} onApplyEdit={vi.fn(async () => {})} onSelectionChange={onSelectionChange} onError={vi.fn()} onHeaderSort={vi.fn()} />);
+  await waitFor(() => expect(ipc.getGridWindow).toHaveBeenCalled());
+  const viewport = container.querySelector(".grid-viewport")!;
+  fireEvent.pointerDown(viewport, { clientX: 440, clientY: 130, button: 0 });
+  expect(onSelectionChange).toHaveBeenLastCalledWith({ anchor: { row: 1, column: 1 }, focus: { row: 1, column: 1 }, mode: "cells" });
+  fireEvent.keyDown(viewport, { key: "x" });
+  const input = await screen.findByLabelText("Edit cell");
+  expect(input.style.left).toBe("425px");
+  expect(input.style.top).toBe("121px");
+  expect(input.style.width).toBe("318px");
+  expect(input.style.fontSize).toBe("26px");
+});
+
+it("selects fixed column headers correctly after scrolling a zoomed sheet", async () => {
+  const onSelectionChange = vi.fn();
+  const { container } = render(<CsvGrid summary={summary} theme="light" zoom={2} onApplyEdit={vi.fn(async () => {})} onSelectionChange={onSelectionChange} onError={vi.fn()} onHeaderSort={vi.fn()} />);
+  await waitFor(() => expect(ipc.getGridWindow).toHaveBeenCalled());
+  const viewport = container.querySelector<HTMLDivElement>(".grid-viewport")!;
+  viewport.scrollLeft = 320;
+  viewport.scrollTop = 200;
+  fireEvent.pointerDown(viewport, { clientX: 120, clientY: 20, button: 0 });
+  expect(onSelectionChange.mock.lastCall?.[0]).toMatchObject({ mode: "columns", focus: { column: 1 } });
+});

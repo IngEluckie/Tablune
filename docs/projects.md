@@ -91,3 +91,11 @@ A formula that references an image receives `#VALUE!`; unrelated formulas still 
 Recovery format 3 stores image descriptors alongside project data, and binary assets in `projects-recovery-assets/<hash>` beside the recovery manifest. Resources are written before atomically publishing that manifest; recovery reads formats 1 and 2 as before. Saves omit resources not referenced by current tables, while open sessions retain resources needed for undo and the internal clipboard. Recovery still excludes the undo history.
 
 Image URLs, external image clipboard input, drag and drop, mixed text/image content, and Python-created images are outside this version.
+
+## Sheet zoom
+
+**View → Zoom** offers levels from 25% to 300%, −/+ buttons, and **Reset Zoom** (100%). Ctrl+mouse wheel and trackpad pinch gestures zoom the sheet at the pointer; ordinary two-finger scrolling still pans. Toolbar changes preserve the top-left visible part of the sheet. The controls affect the canvas, headers, images, selection, and cell editor, leaving the surrounding application at its normal size.
+
+Zoom is independent for each open CSV/table and retained when switching editors during the session. It does not change cell dimensions, data, undo history, or the saved project format. Reset Cell Size and Reset Zoom are separate operations.
+
+The native WebKit path handles [gesture events](https://developer.apple.com/documentation/webkitjs/gestureevent); the wheel path supports Ctrl+wheel, including precision trackpad deltas, without also applying wheel zoom during an active native pinch.
