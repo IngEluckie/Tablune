@@ -1,3 +1,4 @@
+import { ask } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import type {
   ColumnProfile,
@@ -103,7 +104,7 @@ export const getFacets = (
     limit,
   });
 export const exportSessionView = (documentId: DocumentId, path: string) =>
-  invoke<void>("session_export_view", { documentId, path });
+  exportWithImages("session_export_view", documentId, path);
 export const writeWorkspaceRecovery = () =>
   invoke<void>("workspace_write_recovery");
 export const recoveryAvailable = () =>
@@ -170,7 +171,7 @@ export const projectAction = (
 export const closeProject = (projectId: number, discardUnsaved: boolean) =>
   invoke<void>("project_close", { projectId, discardUnsaved });
 export const exportProjectTable = (documentId: number, path: string) =>
-  invoke<void>("project_export_table", { documentId, path });
+  exportWithImages("project_export_table", documentId, path);
 export const getRecentFiles = () =>
   invoke<import("./types").RecentFile[]>("recent_files");
 export const removeRecentFile = (path: string) =>
@@ -217,3 +218,19 @@ export const readNativeClipboard = () =>
   invoke<string | null>("clipboard_read_text");
 export const writeNativeClipboard = (text: string) =>
   invoke<boolean>("clipboard_write_text", { text });
+
+export const importCellImage = (documentId: number, path: string) =>
+  invoke<import("./types").CellImage>("image_import", { documentId, path });
+export const readCellImage = (documentId: number, assetId: string, thumbnail: boolean) =>
+  invoke<ArrayBuffer | number[]>("image_read", { documentId, assetId, thumbnail });
+export const copyImageAssets = (documentId: number, assetIds: string[]) =>
+  invoke<void>("image_clipboard_copy", { documentId, assetIds });
+export const pasteImageAssets = (documentId: number, assetIds: string[]) =>
+  invoke<void>("image_clipboard_paste", { documentId, assetIds });
+
+async function exportWithImages(command: string, documentId: number, path: string) {
+  const summary = await getSessionSummary(documentId);
+  const hasImages = (summary.imageCount ?? 0) > 0;
+  if (hasImages && !await ask("CSV cannot contain images. Export their file names as text? The images will remain in your project.", { title: "Export CSV", kind: "warning" })) return;
+  await invoke<void>(command, { documentId, path, allowImages: hasImages });
+}

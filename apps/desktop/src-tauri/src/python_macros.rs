@@ -757,7 +757,7 @@ async fn run_preview(
         }
         {
             let current = session::lock_document(&handle)?;
-            current.ensure_calculated()?;
+            current.ensure_transformable()?;
             if current.summary().calculation_revision != snapshot.calculation_revision {
                 return Err("Calculated input changed; run preview again".into());
             }
@@ -792,7 +792,7 @@ pub async fn project_python_preview(
         let handle = session::projects::handle(&workspace, project_id)?;
         let p = session::projects::lock_project(&handle)?;
         let (script, input) = p.script_input(&script_id)?;
-        session::lock_document(&input)?.ensure_calculated()?;
+        session::lock_document(&input)?.ensure_transformable()?;
         let snapshot = session::lock_document(&input)?.macro_snapshot();
         (script, snapshot)
     };
@@ -847,7 +847,7 @@ pub fn project_python_result(
     let mut p = session::projects::lock_project(&handle)?;
     let (script, input) = p.script_input(&script_id)?;
     let input = session::lock_document(&input)?;
-    input.ensure_calculated()?;
+    input.ensure_transformable()?;
     let snapshot = input.macro_snapshot();
     let pending = {
         let mut rt = lock_runtime(&runtime.inner)?;

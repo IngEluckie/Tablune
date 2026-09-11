@@ -228,6 +228,7 @@ export function useWorkspace() {
     setSpace(p.projectId);
     if (p.tables[0])
       openTab(p.projectId, { kind: "table", id: p.tables[0].id });
+    return p;
   };
   const newCsv = async () => {
     const d = await ipc.newSession();

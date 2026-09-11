@@ -425,6 +425,7 @@ mod tests {
             ..DocumentSession::default()
         };
         s.edit_sheet_cells(vec![sheets::SheetCellInput {
+            image: None,
             row: 0,
             column: 0,
             value: "=1+2".into(),
@@ -442,6 +443,7 @@ mod tests {
         };
         assert_ne!(other.identity, s.identity);
         s.edit_sheet_cells(vec![sheets::SheetCellInput {
+            image: None,
             row: 0,
             column: 0,
             value: "=4+5".into(),

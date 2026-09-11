@@ -51,7 +51,7 @@ Opening or recovering a project does not run code. Saved results appear as pendi
 
 Edits invalidate affected formulas and their dependents; unrelated formulas retain their results. A Rust dependency graph orders evaluation and detects cycles. A reusable Python process evaluates validated expression trees, with a fresh module namespace per project generation. Macros and calculation share one application-wide queue. Navigating remains possible while a job runs; cancel a project's job before closing it. **Cancel calculation** and a timeout leave formulas pending with no automatic infinite retries; **Recalculate** resumes explicitly. Limits remain two minutes per execution, 1 MiB of module source, 1 MiB of captured console output, and 512 MiB of protocol input/output. Each formula is limited to 16 KiB, and a referenced range to 50 million cells; these are rejection limits, not performance guarantees.
 
-## File format, version 2
+## File format, version 3
 
 A `.tablune` file is a ZIP containing:
 
@@ -62,7 +62,7 @@ A `.tablune` file is a ZIP containing:
 
 The runtime does not extract archive entries to the filesystem. It checks IDs, references, duplicate entries, archive integrity, and supported format version before registration. Limits are 2 GiB of uncompressed archive entries, 16 MiB for the manifest, and 1 MiB per script. These are validation limits, not a promise that datasets at the limit fit in available RAM. Save writes a sibling temporary file and atomically replaces the destination only after successful completion.
 
-Version-1 projects are read without reinterpreting their data. Migration happens in memory, and the next save writes version 2. Earlier application versions reject the new format. Dependencies are rebuilt on open without running Python.
+Version-1 and version-2 projects are read without reinterpreting their data. Migration happens in memory, and the next save writes version 3. Earlier application versions reject the new format. Dependencies are rebuilt on open without running Python.
 
 Project identity is persistent; open-session IDs are regenerated. A second copy of the same saved project has independent sessions. Reopening the same canonical path activates its existing space. Concurrent open/save operations reserve their destination path, and Save As cannot claim another open project's path.
 
@@ -72,6 +72,22 @@ Data edits, formulas, cell types, Functions drafts/applied code, script source, 
 
 Formula edits are flushed before save/close. Saving during calculation writes a coherent snapshot, retaining pending status for unfinished results; saving never starts Python.
 
-Draft edits are held immediately in the frontend and transferred to Rust after a short debounce. Save, execution, and closing flush pending drafts first. A failed draft write leaves the draft in the editor and prevents saving stale code. Background recovery covers dirty projects, including new projects and changes only to formulas or Functions/script drafts. Project recovery format 2 contains the same formula/type/cache/function data as the archive and still reads recovery format 1. Like CSV recovery, this is periodic crash protection, not a guarantee for the final keystrokes before a sudden exit.
+Draft edits are held immediately in the frontend and transferred to Rust after a short debounce. Save, execution, and closing flush pending drafts first. A failed draft write leaves the draft in the editor and prevents saving stale code. Background recovery covers dirty projects, including new projects and changes only to formulas or Functions/script drafts. Project recovery format 3 contains the same formula/type/cache/function data as the archive, includes image descriptors with separate binary resources, and still reads recovery formats 1 and 2. Like CSV recovery, this is periodic crash protection, not a guarantee for the final keystrokes before a sudden exit.
 
 Projects do not embed Python interpreters, packages, console output, preview results that were not accepted, or undo stacks. Recovery does not restart scripts, calculations, or execution authorization. The original CSV recovery formats remain supported.
+
+## Images in cells (format 3)
+
+Use **Edit → Insert image…** or the cell context menu to insert a PNG/JPEG into the active cell. CSV workspaces offer to create a project first. An image replaces the previous cell content as one undoable edit. Enter or double-click opens a proportional full preview, with controls to replace/remove the image and edit alternative text. Typing or pasting text replaces the image. Image rows automatically use 96 px unless manually resized; automatic heights are reconstructed on reopening. Manual grid sizing remains session-only.
+
+Original files are embedded, so moving/deleting the source does not break a saved project. Each resource is addressed by its SHA-256 hash and shared across cells in the project. The format-3 manifest adds `assets`, mapping each hash to its format and dimensions; bytes are stored in ZIP entries `assets/<hash>`. Each cell's optional `image` metadata contains `assetId`, `name`, and `alt`. Its textual row/source representation is the filename, with formula mode disabled. Images are not scalar calculation results. Versions 1 and 2 remain readable; all new saves use version 3, which older applications reject.
+
+Inputs must decode as PNG/JPEG and be at most 20 MiB and 25 megapixels. Resource hashes, dimensions, formats, and cell references are validated before a project is opened. Thumbnails are generated at up to 256 × 256, requested only for the current grid window with at most four requests per window, and retained in a 64 MiB decoded-image cache per mounted grid. The original is loaded on demand for preview. Unsupported or damaged input leaves the cell unchanged.
+
+Copy/cut/paste inside Tablune preserves images across sheets and projects. The internal clipboard retains its image resources even after the source project closes. External clipboard text, pasting into CSV, and **Paste values** use filenames. Search, filtering, sorting, and profiles use filenames; replace-text and cell-type changes skip image cells. Structural edits and undo/redo preserve image references. Sorting a sheet that contains formulas remains subject to the existing restriction on physically applying sorts.
+
+A formula that references an image receives `#VALUE!`; unrelated formulas still calculate. Python transformations with images as input are blocked in this first version. Both CSV export paths require confirmation before writing image filenames; image bytes remain in the project. Formula readiness/error rules still apply.
+
+Recovery format 3 stores image descriptors alongside project data, and binary assets in `projects-recovery-assets/<hash>` beside the recovery manifest. Resources are written before atomically publishing that manifest; recovery reads formats 1 and 2 as before. Saves omit resources not referenced by current tables, while open sessions retain resources needed for undo and the internal clipboard. Recovery still excludes the undo history.
+
+Image URLs, external image clipboard input, drag and drop, mixed text/image content, and Python-created images are outside this version.

@@ -44,6 +44,8 @@ pub struct TableMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectData {
     #[serde(default)]
+    pub assets: crate::images::Assets,
+    #[serde(default)]
     pub functions: FunctionsData,
     pub version: u8,
     pub id: String,
@@ -110,6 +112,7 @@ pub(crate) fn update_directory(
     Ok(())
 }
 pub struct ProjectSession {
+    image_assets: crate::images::SharedAssets,
     pub(crate) runtime_id: u64,
     pub(super) data: ProjectData,
     path: Option<PathBuf>,
@@ -226,6 +229,7 @@ impl ProjectSession {
         dirty: bool,
     ) -> Result<Self, String> {
         archive::validate(&data)?;
+        let image_assets = Arc::new(Mutex::new(data.assets.clone()));
         let runtime_id = next_session_identity();
         let mut tables = Vec::new();
         for (meta, rows) in data.tables.iter().zip(std::mem::take(&mut data.rows)) {
@@ -236,6 +240,7 @@ impl ProjectSession {
                 header_enabled: meta.header_enabled,
                 column_types: meta.column_types.clone(),
             });
+            session.image_assets = image_assets.clone();
             session.sheet = meta.sheet.clone();
             session.sheet.invalidate_all();
             session.sync_sheet();
@@ -247,6 +252,7 @@ impl ProjectSession {
             tables.push(Arc::new(Mutex::new(session)));
         }
         let mut project = Self {
+            image_assets,
             runtime_id,
             data,
             path,
@@ -255,7 +261,7 @@ impl ProjectSession {
             calculation: CalculationSummary::default(),
             calculation_generation: 0,
         };
-        project.data.version = 2;
+        project.data.version = 3;
         project.data.rows.clear();
         if !dirty {
             project.saved_signature = project.signature()?;
@@ -342,6 +348,11 @@ impl ProjectSession {
         sessions: &[std::sync::MutexGuard<'_, DocumentSession>],
     ) -> ProjectData {
         let mut data = self.data.clone();
+        data.assets = self
+            .image_assets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         for (meta, session) in data.tables.iter_mut().zip(sessions) {
             meta.sheet = session.sheet.clone();
             meta.dialect = session.dialect;
@@ -353,6 +364,7 @@ impl ProjectSession {
             .iter()
             .map(|s| s.document.rows().to_vec())
             .collect();
+        crate::images::retain_referenced(&mut data);
         data
     }
     fn add_table(&mut self, mut session: DocumentSession, title: &str) -> Result<u64, String> {
@@ -361,6 +373,7 @@ impl ProjectSession {
             self.data.tables.iter().map(|m| m.name.clone()),
         );
         session.path = None;
+        session.image_assets = self.image_assets.clone();
         session.project_id = Some(self.runtime_id);
         session.title = Some(title.clone());
         session.sync_sheet();
@@ -467,6 +480,7 @@ fn project_new_internal(
         .transpose()?;
     let mut project = ProjectSession::from_data(
         ProjectData {
+            assets: Default::default(),
             functions: FunctionsData::default(),
             version: 1,
             id: persistent_id(),
@@ -859,11 +873,15 @@ pub fn project_export_table(
     state: State<'_, WorkspaceState>,
     document_id: u64,
     path: String,
+    allow_images: Option<bool>,
 ) -> Result<(), String> {
     ensure_path_available(&state, Path::new(&path), 0)?;
     let handle = document_handle(&state, document_id)?;
     let s = lock_document(&handle)?;
     s.ensure_calculated()?;
+    if s.sheet.cells.values().any(|m| m.image.is_some()) && allow_images != Some(true) {
+        return Err("CSV exports image names only. Confirm image export before continuing".into());
+    }
     tablune_csv::write_path(
         path,
         &TableDocument::from_rows(s.materialized_rows()),
@@ -980,24 +998,74 @@ pub(super) fn write_recovery(app: &AppHandle, state: &WorkspaceState) -> Result<
         });
     }
     let path = recovery_path(app)?;
+    write_recovery_assets(&path, &projects)?;
+    let referenced: HashSet<String> = projects
+        .iter()
+        .flat_map(|p| p.data.assets.keys().cloned())
+        .collect();
     if projects.is_empty() {
-        remove_if_exists(&path).map_err(|e| e.to_string())
+        remove_if_exists(&path).map_err(|e| e.to_string())?;
     } else {
         write_bytes_atomic(
             &path,
             &serde_json::to_vec(&RecoveryProjects {
-                version: 2,
+                version: 3,
                 projects,
             })
             .map_err(|e| e.to_string())?,
-        )
+        )?;
     }
+    // Only prune after publishing the replacement manifest. Failed writes leave the old recovery intact.
+    prune_recovery_assets(&path, &referenced);
+    Ok(())
+}
+fn prune_recovery_assets(path: &Path, referenced: &HashSet<String>) {
+    if let Ok(entries) = fs::read_dir(path.with_file_name("projects-recovery-assets")) {
+        for entry in entries.flatten() {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if crate::images::valid_id(&id) && !referenced.contains(&id) {
+                if let Err(error) = fs::remove_file(entry.path()) {
+                    report_nonfatal("pruning recovery images", &error.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn write_recovery_assets(path: &Path, projects: &[RecoveryProject]) -> Result<(), String> {
+    let dir = path.with_file_name("projects-recovery-assets");
+    for project in projects {
+        for (id, asset) in &project.data.assets {
+            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            write_bytes_atomic(&dir.join(id), &asset.bytes)?;
+        }
+    }
+    Ok(())
+}
+fn read_recovery_assets(path: &Path, data: &mut ProjectData) -> Result<(), String> {
+    for (id, asset) in &mut data.assets {
+        if !crate::images::valid_id(id) {
+            return Err("Invalid recovery image identifier".into());
+        }
+        use std::io::Read;
+        let file = fs::File::open(path.with_file_name("projects-recovery-assets").join(id))
+            .map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(crate::images::MAX_IMAGE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        asset.bytes = Arc::new(bytes);
+    }
+    Ok(())
 }
 pub(super) fn discard_recovery(app: &AppHandle) -> Result<(), String> {
     let _lock = RECOVERY_LOCK
         .lock()
         .map_err(|_| "Recovery writer unavailable")?;
-    remove_if_exists(&recovery_path(app)?).map_err(|e| e.to_string())
+    let path = recovery_path(app)?;
+    remove_if_exists(&path).map_err(|e| e.to_string())?;
+    prune_recovery_assets(&path, &HashSet::new());
+    Ok(())
 }
 pub(super) fn read_recovery(app: &AppHandle) -> Result<Vec<RecoveryProject>, String> {
     let path = recovery_path(app)?;
@@ -1005,11 +1073,12 @@ pub(super) fn read_recovery(app: &AppHandle) -> Result<Vec<RecoveryProject>, Str
         return Ok(Vec::new());
     }
     let mut payload: RecoveryProjects = read_json(&path)?;
-    if !matches!(payload.version, 1 | 2) {
+    if !matches!(payload.version, 1..=3) {
         return Err("Unsupported project recovery version".into());
     }
     for p in &mut payload.projects {
         p.data.rows = std::mem::take(&mut p.rows);
+        read_recovery_assets(&path, &mut p.data)?;
         archive::validate(&p.data)?;
     }
     Ok(payload.projects)
@@ -1033,6 +1102,7 @@ mod tests {
     use super::*;
     fn fixture() -> ProjectData {
         ProjectData {
+            assets: Default::default(),
             functions: FunctionsData::default(),
             version: 1,
             id: "project-fixture".into(),
@@ -1071,6 +1141,116 @@ mod tests {
                 vec!["a;\"b".into(), "".into()],
             ]],
         }
+    }
+    fn project_with_image() -> ProjectSession {
+        let p = ProjectSession::from_data(fixture(), None, true).unwrap();
+        let (image, asset) = crate::images::fixture();
+        p.image_assets
+            .lock()
+            .unwrap()
+            .insert(image.asset_id.clone(), asset);
+        lock_document(&p.tables[0])
+            .unwrap()
+            .edit_sheet_cells(vec![sheets::SheetCellInput {
+                image: Some(image),
+                row: 1,
+                column: 1,
+                value: String::new(),
+                literal: true,
+                cell_type: None,
+            }])
+            .unwrap();
+        p
+    }
+    #[test]
+    fn images_round_trip_sort_duplicate_and_recover_without_source_files() {
+        let mut p = project_with_image();
+        let path = temporary_path();
+        p.save_to(path.clone()).unwrap();
+        let data = archive::read(&path).unwrap();
+        assert_eq!(data.version, 3);
+        assert_eq!(data.assets.len(), 1);
+        let mut restored = ProjectSession::from_data(data, None, true).unwrap();
+        {
+            let mut s = lock_document(&restored.tables[0]).unwrap();
+            assert_eq!(s.cell_info(1, 1).image.as_ref().unwrap().name, "photo.png");
+            let revision = s.revision;
+            s.apply_edit(EditCommand::ApplySort, revision).unwrap();
+            let image = s
+                .sheet
+                .cells
+                .iter()
+                .find(|(_, m)| m.image.is_some())
+                .unwrap();
+            let (r, c) = formulas::position(image.0).unwrap();
+            assert_eq!(s.cell_value(r, c), "photo.png");
+            s.undo().unwrap();
+        }
+        let duplicate = lock_document(&restored.tables[0])
+            .unwrap()
+            .duplicate_to(PathBuf::new());
+        restored.add_table(duplicate, "Copy").unwrap();
+        let sessions = restored
+            .tables
+            .iter()
+            .map(lock_document)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut snapshot = restored.snapshot_with(&sessions);
+        assert_eq!(snapshot.assets.len(), 1);
+        assert!(
+            snapshot.tables[1]
+                .sheet
+                .cells
+                .values()
+                .any(|m| m.image.is_some())
+        );
+        let rows = std::mem::take(&mut snapshot.rows);
+        let recovery = RecoveryProject {
+            data: snapshot,
+            rows,
+            path: None,
+        };
+        write_recovery_assets(&path, std::slice::from_ref(&recovery)).unwrap();
+        let json = serde_json::to_vec(&recovery).unwrap();
+        let mut loaded: RecoveryProject = serde_json::from_slice(&json).unwrap();
+        assert!(loaded.data.assets.values().all(|a| a.bytes.is_empty()));
+        read_recovery_assets(&path, &mut loaded.data).unwrap();
+        loaded.data.rows = loaded.rows;
+        archive::validate(&loaded.data).unwrap();
+        let id = loaded.data.assets.keys().next().unwrap().clone();
+        fs::remove_file(path.with_file_name("projects-recovery-assets").join(id)).unwrap();
+        assert!(read_recovery_assets(&path, &mut loaded.data).is_err());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn saves_prune_unused_assets_and_reject_missing_or_corrupt_resources() {
+        let p = project_with_image();
+        let mut sessions = p
+            .tables
+            .iter()
+            .map(lock_document)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut data = p.snapshot_with(&sessions);
+        data.assets.clear();
+        assert!(archive::validate(&data).is_err());
+        data = p.snapshot_with(&sessions);
+        data.assets.values_mut().next().unwrap().bytes = Arc::new(vec![1, 2, 3]);
+        assert!(archive::validate(&data).is_err());
+        sessions[0]
+            .edit_sheet_cells(vec![sheets::SheetCellInput {
+                image: None,
+                row: 1,
+                column: 1,
+                value: String::new(),
+                literal: true,
+                cell_type: None,
+            }])
+            .unwrap();
+        assert!(p.snapshot_with(&sessions).assets.is_empty());
+        sessions[0].undo().unwrap();
+        assert_eq!(p.snapshot_with(&sessions).assets.len(), 1);
     }
     fn temporary_path() -> PathBuf {
         let dir = std::env::temp_dir().join(persistent_id());
@@ -1458,6 +1638,7 @@ mod tests {
             s.apply_edit(
                 EditCommand::SetSheetCells {
                     cells: vec![sheets::SheetCellInput {
+                        image: None,
                         row: 1,
                         column: 2,
                         value: "=f(21)".into(),
@@ -1474,7 +1655,7 @@ mod tests {
         let path = temporary_path();
         p.save_to(path.clone()).unwrap();
         let data = archive::read(&path).unwrap();
-        assert_eq!(data.version, 2);
+        assert_eq!(data.version, 3);
         assert_eq!(data.functions.draft, p.data.functions.draft);
         assert_eq!(data.functions.applied, p.data.functions.applied);
         let restored = ProjectSession::from_data(data, Some(path.clone()), false).unwrap();
@@ -1512,7 +1693,7 @@ mod tests {
         zip.finish().unwrap();
         let p = ProjectSession::from_data(archive::read(&path).unwrap(), Some(path.clone()), false)
             .unwrap();
-        assert_eq!(p.data.version, 2);
+        assert_eq!(p.data.version, 3);
         let s = lock_document(&p.tables[0]).unwrap();
         assert!(!s.cell_info(1, 0).formula);
         assert_eq!(s.cell_value(1, 0), "=danger()");
@@ -1526,6 +1707,7 @@ mod tests {
         let mut table = lock_document(&p.tables[0]).unwrap();
         table
             .edit_sheet_cells(vec![sheets::SheetCellInput {
+                image: None,
                 row: 1,
                 column: 2,
                 value: "=unsaved()".into(),

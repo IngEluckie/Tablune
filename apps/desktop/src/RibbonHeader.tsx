@@ -50,6 +50,7 @@ export interface RibbonHeaderProps {
   onPaste: () => void;
   onInsertRow: () => void;
   onDeleteRow: () => void;
+  onInsertImage?: () => void;
   onInsertColumn: () => void;
   onDeleteColumn: () => void;
   onFind: () => void;
@@ -110,6 +111,7 @@ export default function RibbonHeader({
   onPaste,
   onInsertRow,
   onDeleteRow,
+  onInsertImage,
   onInsertColumn,
   onDeleteColumn,
   onFind,
@@ -327,6 +329,7 @@ export default function RibbonHeader({
                 <button onClick={onCut} disabled={busy || mutationsLocked}>Cut</button>
                 <button onClick={onCopy} disabled={busy}>Copy</button>
                 <button onClick={onPaste} disabled={busy || mutationsLocked}>Paste</button>
+                <button onClick={onInsertImage} disabled={busy || mutationsLocked || !onInsertImage}>Insert image…</button>
                 <span className="ribbon-divider" aria-hidden="true" />
                 <button onClick={onFind}>Find</button>
               </div>

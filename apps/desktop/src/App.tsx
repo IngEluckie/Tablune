@@ -450,6 +450,22 @@ export default function App() {
               theme={theme}
               active={w.space === "csv" && !w.busy && w.closeRequest === null}
               documents={w.workspace.documents}
+              onCreateImageProject={async (row, column) => {
+                try {
+                const source = w.workspace.documents.find(d => d.documentId === w.selectedCsv);
+                if (!source) return;
+                const name = await requestName("Create project from CSV", source.displayName.replace(/\.[^.]+$/, ""));
+                if (!name) return;
+                const project = await w.createProject(name, source.documentId);
+                const table = project.tables[0]?.document;
+                if (!table) return;
+                const path = await open({ title: "Insert image", multiple: false, filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg"] }] });
+                if (typeof path !== "string") return;
+                const image = await ipc.importCellImage(table.documentId, path);
+                await ipc.applySessionEdit(table.documentId, { kind: "setSheetCells", cells: [{ row, column, value: image.name, image, literal: true }] }, table.revision);
+                w.commit(await ipc.getWorkspaceSummary());
+                } catch (reason) { w.report(reason); throw reason; }
+              }}
               selectedId={w.selectedCsv}
               onDocuments={updateDocuments}
               onActivate={w.setSelectedCsv}

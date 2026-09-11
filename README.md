@@ -11,11 +11,12 @@ The initial release targets macOS for development and validation, while preservi
 
 ## Current scope (0.5)
 
+- Insert embedded PNG/JPEG images into project cells, preview them, and copy them between projects
 - Write cell formulas such as `=B1 + C1` in project sheets and recalculate affected cells automatically
 - Use relative/absolute references, ranges, Python expressions, and project-defined functions
 - Edit the original formula in a formula bar while the grid shows its result
 - Apply cell types, copy formulas with adjusted references, paste values, and undo structural changes
-- Save formulas, original text, function drafts/applied code, and cached results in format-2 projects
+- Save formulas, original text, function drafts/applied code, and cached results in format-3 projects
 - Enable Python explicitly for each project session before any calculation runs
 
 - Start from Home with recent files and multiple open workspaces

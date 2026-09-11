@@ -113,6 +113,7 @@ function shortPath(path: string): string {
 }
 
 export interface CsvWorkspaceProps {
+  onCreateImageProject?: (row: number, column: number) => Promise<void>;
   managed?: boolean;
   appliedFunctions?: string;
   ribbonTarget?: HTMLElement | null;
@@ -783,9 +784,9 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
   };
 
   const applyEdit = useCallback(
-    async (command: EditCommand) => {
+    async (command: EditCommand, target?: { documentId: number; revision: number }) => {
       if (macroOpen) return;
-      const documentId = activeDocumentIdRef.current;
+      const documentId = target?.documentId ?? activeDocumentIdRef.current;
       const document = documentsRef.current.find(
         (candidate) => candidate.documentId === documentId,
       );
@@ -793,7 +794,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
       try {
         setError(null);
         updateDocument(
-          await applySessionEdit(documentId, command, document.revision),
+          await applySessionEdit(documentId, command, target?.revision ?? document.revision),
         );
         if (
           command.kind === "insertRows" ||
@@ -843,7 +844,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
     }
   };
 
-  const runGridCommand = (command: "copy" | "cut" | "paste") => {
+  const runGridCommand = (command: "copy" | "cut" | "paste" | "insertImage") => {
     if (macroOpen && command !== "copy") return;
     document.dispatchEvent(
       new CustomEvent("tablune-grid-command", {
@@ -935,6 +936,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
         onSave={() => void saveDocumentById(summary.documentId)}
         onSaveAs={() => void saveDocumentById(summary.documentId, true)}
         onDuplicate={() => void duplicateDocument()}
+        onInsertImage={() => runGridCommand("insertImage")}
         onExportView={() => void exportView()}
         onUndo={() => void runHistoryCommand(summary.documentId, undoSession)}
         onRedo={() => void runHistoryCommand(summary.documentId, redoSession)}
@@ -1011,6 +1013,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
               readOnly={macroOpen || props.active === false}
               initialSelection={tabUi.selection}
               initialViewport={tabUi.viewport}
+              onCreateImageProject={props.onCreateImageProject}
               initialSizing={tabUi.sizing}
               onApplyEdit={applyEdit}
               onSelectionChange={(selection) =>

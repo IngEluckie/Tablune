@@ -10,8 +10,15 @@ import {
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import CsvGrid, { flushCellEdits } from "./CsvGrid";
 import * as ipc from "./ipc";
+import { open } from "@tauri-apps/plugin-dialog";
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(), ask: vi.fn() }));
 import type { CellInfo, DocumentSummary } from "./types";
 vi.mock("./ipc", () => ({
+  getSessionSummary: vi.fn(),
+  importCellImage: vi.fn(),
+  readCellImage: vi.fn(),
+  copyImageAssets: vi.fn(),
+  pasteImageAssets: vi.fn(),
   getGridWindow: vi.fn(),
   getSheetCell: vi.fn(),
   shiftSheetFormulas: vi.fn(),
@@ -58,6 +65,7 @@ let clipboard = "";
 let generation = 0;
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(ipc.getSessionSummary).mockResolvedValue(summary);
   vi.mocked(ipc.readNativeClipboard).mockResolvedValue(null);
   vi.mocked(ipc.writeNativeClipboard).mockResolvedValue(false);
   clipboard = "";
@@ -323,4 +331,24 @@ it("applies a type to the selected cell through an undoable edit", async () => {
       cellType: "text",
     }),
   );
+});
+
+it("inserts a file image in the active cell with the captured document revision", async () => {
+  const image = { assetId: "a".repeat(64), name: "photo.png", alt: "" };
+  vi.mocked(open).mockResolvedValue("/tmp/photo.png");
+  vi.mocked(ipc.importCellImage).mockResolvedValue(image);
+  const onApplyEdit = vi.fn(async () => {});
+  render(<CsvGrid summary={summary} theme="light" onApplyEdit={onApplyEdit} onSelectionChange={vi.fn()} onError={vi.fn()} onHeaderSort={vi.fn()} />);
+  await waitFor(() => expect(ipc.getGridWindow).toHaveBeenCalled());
+  act(() => document.dispatchEvent(new CustomEvent("tablune-grid-command", { detail: { command: "insertImage", documentId: 1 } })));
+  await waitFor(() => expect(onApplyEdit).toHaveBeenCalledWith({ kind: "setSheetCells", cells: [{ row: 0, column: 0, value: "photo.png", image, literal: true }] }, { documentId: 1, revision: 1 }));
+});
+it("does not modify cells when an image fails validation", async () => {
+  vi.mocked(open).mockResolvedValue("/tmp/invalid.png");
+  vi.mocked(ipc.importCellImage).mockRejectedValue(new Error("Invalid image"));
+  const onApplyEdit = vi.fn(async () => {}), onError = vi.fn();
+  render(<CsvGrid summary={summary} theme="light" onApplyEdit={onApplyEdit} onSelectionChange={vi.fn()} onError={onError} onHeaderSort={vi.fn()} />);
+  act(() => document.dispatchEvent(new CustomEvent("tablune-grid-command", { detail: { command: "insertImage", documentId: 1 } })));
+  await waitFor(() => expect(onError).toHaveBeenCalledWith("Error: Invalid image"));
+  expect(onApplyEdit).not.toHaveBeenCalled();
 });

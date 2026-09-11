@@ -954,3 +954,19 @@ button { cursor: default; }
 .formula-suggestions [role="option"] { padding:7px 12px; cursor:pointer; font:13px ui-monospace,monospace; color:var(--text-strong); }
 .formula-suggestions [aria-selected="true"] { background:var(--accent-soft); color:var(--accent); }
 .formula-suggestions span { color:var(--text-muted); }
+
+.image-preview {
+  width: min(900px, 90vw);
+  max-height: 90vh;
+  border: 1px solid var(--border, #888);
+  border-radius: 12px;
+  padding: 24px;
+  background: var(--surface, Canvas);
+  color: var(--text, CanvasText);
+}
+.image-preview::backdrop { background: #0009; }
+.image-preview h2 { margin: 0 0 16px; overflow-wrap: anywhere; }
+.image-preview > img { display: block; width: 100%; height: min(55vh, 600px); object-fit: contain; margin-bottom: 16px; }
+.image-preview label { display: grid; gap: 6px; }
+.image-preview input { width: 100%; box-sizing: border-box; }
+.image-preview-actions { display: flex; gap: 12px; justify-content: flex-end; margin-top: 20px; flex-wrap: wrap; }

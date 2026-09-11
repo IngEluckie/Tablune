@@ -6,6 +6,7 @@ use std::{
 use tauri::{Emitter, Manager};
 
 mod formulas;
+mod images;
 mod python_macros;
 mod session;
 use session::projects;
@@ -78,6 +79,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             exit_application,
+            images::image_import,
+            images::image_read,
+            images::image_clipboard_copy,
+            images::image_clipboard_paste,
             session::sheets::sheet_cell,
             session::sheets::clipboard_generation,
             session::sheets::clipboard_read_text,

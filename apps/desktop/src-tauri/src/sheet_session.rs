@@ -5,6 +5,8 @@ use crate::formulas::{CellMeta, CellResult, CellType, Position, Shift};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SheetCellInput {
+    #[serde(default)]
+    pub image: Option<crate::images::CellImage>,
     pub row: usize,
     pub column: usize,
     pub value: String,
@@ -16,6 +18,7 @@ pub struct SheetCellInput {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CellInfo {
+    pub image: Option<crate::images::CellImage>,
     pub row: usize,
     pub column: usize,
     pub source: String,
@@ -54,6 +57,9 @@ impl DocumentSession {
     }
     pub(super) fn scalar_at(&self, p: Position) -> CellResult {
         let meta = self.sheet.cells.get(&formulas::key(p));
+        if meta.is_some_and(|m| m.image.is_some()) {
+            return CellResult::error("#VALUE!", "Images cannot be used in formulas");
+        }
         if let Some(m) = meta.filter(|m| m.formula) {
             return m.cached.clone().unwrap_or_else(|| {
                 CellResult::error(
@@ -72,10 +78,13 @@ impl DocumentSession {
         let meta = self.sheet.cells.get(&formulas::key((row, column)));
         let result = self.scalar_at((row, column));
         CellInfo {
+            image: meta.and_then(|m| m.image.clone()),
             row,
             column,
             source: self.raw_cell(row, column).into(),
-            display: if meta.is_some_and(|m| m.formula && m.cached.is_none()) {
+            display: if let Some(image) = meta.and_then(|m| m.image.as_ref()) {
+                image.name.clone()
+            } else if meta.is_some_and(|m| m.formula && m.cached.is_none()) {
                 "…".into()
             } else {
                 result.display.clone()
@@ -84,7 +93,7 @@ impl DocumentSession {
             escaped: meta.is_some_and(|m| m.escaped),
             cell_type: meta.map(|m| m.cell_type).unwrap_or_default(),
             pending: meta.is_some_and(|m| m.pending),
-            error: if meta.is_some_and(|m| m.formula && m.cached.is_none()) {
+            error: if meta.is_some_and(|m| m.image.is_some() || (m.formula && m.cached.is_none())) {
                 None
             } else {
                 result.error
@@ -101,7 +110,7 @@ impl DocumentSession {
                     .enumerate()
                     .map(|(c, raw)| {
                         if self.project_id.is_some() {
-                            self.scalar_at((r, c)).display
+                            self.cell_value(r, c).to_owned()
                         } else {
                             raw.clone()
                         }
@@ -109,6 +118,14 @@ impl DocumentSession {
                     .collect()
             })
             .collect()
+    }
+    pub(crate) fn ensure_transformable(&self) -> Result<(), String> {
+        if self.sheet.cells.values().any(|m| m.image.is_some()) {
+            return Err(
+                "Python transformations do not yet support tables containing images".into(),
+            );
+        }
+        self.ensure_calculated()
     }
     pub(crate) fn ensure_calculated(&self) -> Result<(), String> {
         if self.project_id.is_some() && !self.sheet.is_ready() {
@@ -164,6 +181,7 @@ impl DocumentSession {
                     sheet.cells.insert(
                         k,
                         CellMeta {
+                            image: None,
                             formula: c.value.starts_with('='),
                             source: c.value.clone(),
                             escaped: c.value.starts_with('\''),
@@ -285,9 +303,24 @@ impl DocumentSession {
             .map(|c| (formulas::key((c.row, c.column)), c))
             .collect();
         let mut changed = Vec::new();
-        for (k, c) in cells {
+        for (k, mut c) in cells {
+            if let Some(image) = &c.image {
+                image.validate()?;
+                if !self
+                    .image_assets
+                    .lock()
+                    .map_err(|_| "Image store unavailable")?
+                    .contains_key(&image.asset_id)
+                {
+                    return Err("Image resource is missing".into());
+                }
+                c.value = image.name.clone();
+                c.literal = true;
+                c.cell_type = Some(CellType::Text);
+            }
             let previous = after.cells.get(&k).cloned().unwrap_or_default();
             let meta = CellMeta {
+                image: c.image,
                 formula: !c.literal && c.value.starts_with('='),
                 source: c.value.clone(),
                 escaped: !c.literal && c.value.starts_with('\''),
@@ -299,6 +332,7 @@ impl DocumentSession {
                 && previous.formula == meta.formula
                 && previous.escaped == meta.escaped
                 && previous.cell_type == meta.cell_type
+                && previous.image == meta.image
             {
                 continue;
             }
@@ -358,7 +392,7 @@ impl DocumentSession {
         for c in cells {
             let k = formulas::key((c.row, c.column));
             let m = after.cells.entry(k.clone()).or_default();
-            if m.cell_type != cell_type {
+            if m.image.is_none() && m.cell_type != cell_type {
                 m.cell_type = cell_type;
                 changed.push(k);
             }
@@ -495,12 +529,141 @@ mod tests {
             ..DocumentSession::default()
         }
     }
+    #[test]
+    fn images_are_atomic_undoable_and_follow_structural_edits() {
+        let mut s = sheet();
+        edit(&mut s, &[(0, 0, "original"), (1, 0, "another")]);
+        let (image, asset) = crate::images::fixture();
+        s.image_assets
+            .lock()
+            .unwrap()
+            .insert(image.asset_id.clone(), asset);
+        let input = SheetCellInput {
+            image: Some(image.clone()),
+            row: 0,
+            column: 0,
+            value: String::new(),
+            literal: true,
+            cell_type: None,
+        };
+        s.edit_sheet_cells(vec![input.clone()]).unwrap();
+        assert_eq!(s.cell_info(0, 0).image, Some(image.clone()));
+        assert_eq!(s.cell_value(0, 0), "photo.png");
+        assert_eq!(s.scalar_at((0, 0)).error.unwrap().code, "#VALUE!");
+        assert!(s.ensure_transformable().is_err());
+        assert!(s.ensure_calculated().is_ok());
+        s.edit_cell_types(vec![CellPosition { row: 0, column: 0 }], CellType::Number)
+            .unwrap();
+        assert_eq!(s.cell_info(0, 0).cell_type, CellType::Text);
+        s.undo().unwrap();
+        assert_eq!(s.cell_value(0, 0), "original");
+        s.redo().unwrap();
+        s.apply_edit(EditCommand::InsertRows { index: 0, count: 1 }, s.revision)
+            .unwrap();
+        assert_eq!(s.cell_info(1, 0).image, Some(image.clone()));
+        s.apply_edit(EditCommand::DeleteRows { index: 1, count: 1 }, s.revision)
+            .unwrap();
+        assert_eq!(s.summary().image_count, 0);
+        s.undo().unwrap();
+        assert_eq!(s.cell_info(1, 0).image, Some(image.clone()));
+        s.apply_edit(
+            EditCommand::InsertColumns { index: 0, count: 1 },
+            s.revision,
+        )
+        .unwrap();
+        assert_eq!(s.cell_info(1, 1).image, Some(image.clone()));
+        s.undo().unwrap();
+        let mut missing = input;
+        missing.image.as_mut().unwrap().asset_id = "0".repeat(64);
+        let revision = s.revision;
+        assert!(s.edit_sheet_cells(vec![missing]).is_err());
+        assert_eq!(s.revision, revision);
+        assert_eq!(s.cell_info(1, 0).image, Some(image));
+    }
+    #[test]
+    fn thousand_images_remain_windowed_searchable_and_immune_to_replace_text() {
+        let mut s = sheet();
+        let (image, asset) = crate::images::fixture();
+        s.image_assets
+            .lock()
+            .unwrap()
+            .insert(image.asset_id.clone(), asset);
+        s.edit_sheet_cells(
+            (0..1000)
+                .map(|row| SheetCellInput {
+                    image: Some(image.clone()),
+                    row,
+                    column: 0,
+                    value: String::new(),
+                    literal: true,
+                    cell_type: None,
+                })
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(s.summary().image_count, 1000);
+        assert_eq!(s.summary().image_rows.len(), 1000);
+        assert_eq!(s.image_assets.lock().unwrap().len(), 1);
+        let window = s.grid_window(980, 12, 0, 1);
+        assert_eq!(window.rows.len(), 12);
+        assert!(
+            window
+                .rows
+                .iter()
+                .all(|r| r.inputs.as_ref().unwrap()[0].image.is_some())
+        );
+        let search: SearchRequest =
+            serde_json::from_value(serde_json::json!({"query":"photo.png", "limit":2000})).unwrap();
+        assert_eq!(s.search(&search).len(), 1000);
+        let revision = s.revision;
+        s.replace(ReplaceRequest {
+            search,
+            replacement: "changed".into(),
+            replace_all: true,
+            expected_revision: revision,
+            target: None,
+        })
+        .unwrap();
+        assert_eq!(s.revision, revision);
+        assert_eq!(s.materialized_rows()[999][0], "photo.png");
+        s.view.filters.push(serde_json::from_value(serde_json::json!({"column":0,"operator":"notEmpty","value":"","secondValue":"","values":[],"columnType":"text","caseSensitive":false})).unwrap());
+        s.rebuild_view();
+        assert_eq!(s.summary().visible_row_count, 1000);
+    }
+    #[test]
+    fn image_references_fail_calculation_but_unrelated_formulas_work() {
+        let mut s = sheet();
+        let (image, asset) = crate::images::fixture();
+        s.image_assets
+            .lock()
+            .unwrap()
+            .insert(image.asset_id.clone(), asset);
+        s.edit_sheet_cells(vec![SheetCellInput {
+            image: Some(image),
+            row: 0,
+            column: 0,
+            value: String::new(),
+            literal: true,
+            cell_type: None,
+        }])
+        .unwrap();
+        edit(&mut s, &[(0, 1, "=A1"), (0, 2, "=2+3")]);
+        let mut worker = crate::python_macros::calculation_worker::test_worker();
+        super::super::calculation::calculate_with_test_worker(&mut s, "", &mut worker);
+        assert_eq!(s.cell_info(0, 1).error.unwrap().code, "#VALUE!");
+        assert_eq!(s.cell_info(0, 2).display, "5");
+        edit(&mut s, &[(0, 0, "7")]);
+        super::super::calculation::calculate_with_test_worker(&mut s, "", &mut worker);
+        assert_eq!(s.cell_info(0, 1).display, "7");
+        assert!(s.cell_info(0, 0).image.is_none());
+    }
     fn edit(s: &mut DocumentSession, cells: &[(usize, usize, &str)]) {
         s.apply_edit(
             EditCommand::SetSheetCells {
                 cells: cells
                     .iter()
                     .map(|(r, c, v)| SheetCellInput {
+                        image: None,
                         row: *r,
                         column: *c,
                         value: (*v).into(),
@@ -655,6 +818,7 @@ mod tests {
         s.edit_sheet_cells(
             (0..10_000)
                 .map(|row| SheetCellInput {
+                    image: None,
                     row,
                     column: 2,
                     value: format!("=A{}+B{}", row + 1, row + 1),

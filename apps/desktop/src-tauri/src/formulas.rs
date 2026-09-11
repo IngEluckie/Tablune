@@ -71,6 +71,7 @@ impl CellResult {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CellMeta {
+    pub image: Option<crate::images::CellImage>,
     pub formula: bool,
     pub source: String,
     pub escaped: bool,

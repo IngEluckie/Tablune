@@ -19,7 +19,7 @@ struct StoredTableRef<'a> {
 }
 const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(super) fn validate(data: &ProjectData) -> Result<(), String> {
-    if !matches!(data.version, 1 | 2) {
+    if !matches!(data.version, 1..=3) {
         return Err(format!("Unsupported .tablune version {}", data.version));
     }
     if data.functions.draft.len() > 1024 * 1024 || data.functions.applied.len() > 1024 * 1024 {
@@ -42,10 +42,25 @@ pub(super) fn validate(data: &ProjectData) -> Result<(), String> {
             return Err("Invalid or duplicate project identifier".into());
         }
     }
+    for (id, asset) in &data.assets {
+        if data.version < 3 || !crate::images::valid_id(id) {
+            return Err("Invalid image asset version or identifier".into());
+        }
+        crate::images::validate_asset(id, asset)?;
+    }
     let mut names = HashSet::new();
     for t in &data.tables {
         super::name(&t.name)?;
         for (key, meta) in &t.sheet.cells {
+            if let Some(image) = &meta.image {
+                image.validate()?;
+                if meta.formula
+                    || meta.source != image.name
+                    || !data.assets.contains_key(&image.asset_id)
+                {
+                    return Err("Invalid or missing cell image".into());
+                }
+            }
             if let Some(result) = &meta.cached {
                 crate::formulas::validate_result(result)?;
             }
@@ -71,7 +86,7 @@ pub(super) fn validate(data: &ProjectData) -> Result<(), String> {
     }
     for (table, rows) in data.tables.iter().zip(&data.rows) {
         for (key, meta) in &table.sheet.cells {
-            if meta.formula {
+            if meta.formula || meta.image.is_some() {
                 let (r, c) = crate::formulas::position(key).ok_or("Invalid cell address")?;
                 if rows.get(r).and_then(|row| row.get(c)) != Some(&meta.source) {
                     return Err("Formula source does not match table content".into());
@@ -109,7 +124,7 @@ pub(super) fn read(path: &Path) -> Result<ProjectData, String> {
     let mut data: ProjectData =
         serde_json::from_slice(&entry(&mut zip, "manifest.json", 16 * 1024 * 1024)?)
             .map_err(|e| e.to_string())?;
-    if !matches!(data.version, 1 | 2) {
+    if !matches!(data.version, 1..=3) {
         return Err(format!("Unsupported .tablune version {}", data.version));
     }
     for t in &mut data.tables {
@@ -127,7 +142,7 @@ pub(super) fn read(path: &Path) -> Result<ProjectData, String> {
             data.rows.push(table.rows);
         }
     }
-    if data.version == 2 {
+    if data.version >= 2 {
         data.functions.draft =
             String::from_utf8(entry(&mut zip, "functions/draft.py", 1024 * 1024)?)
                 .map_err(|e| e.to_string())?;
@@ -142,6 +157,16 @@ pub(super) fn read(path: &Path) -> Result<ProjectData, String> {
             1024 * 1024,
         )?)
         .map_err(|e| e.to_string())?;
+    }
+    for (id, asset) in &mut data.assets {
+        if !crate::images::valid_id(id) {
+            return Err("Invalid image identifier".into());
+        }
+        asset.bytes = std::sync::Arc::new(entry(
+            &mut zip,
+            &format!("assets/{id}"),
+            crate::images::MAX_IMAGE_BYTES,
+        )?);
     }
     validate(&data)?;
     Ok(data)
@@ -177,8 +202,9 @@ pub(super) fn write(path: &Path, data: &ProjectData) -> Result<(), String> {
         zip.start_file("manifest.json", options)
             .map_err(|e| e.to_string())?;
         let mut manifest = ProjectData {
+            assets: data.assets.clone(),
             functions: data.functions.clone(),
-            version: 2,
+            version: 3,
             id: data.id.clone(),
             name: data.name.clone(),
             tables: data.tables.clone(),
@@ -219,6 +245,11 @@ pub(super) fn write(path: &Path, data: &ProjectData) -> Result<(), String> {
             )
             .map_err(|e| e.to_string())?;
             buffer.flush().map_err(|e| e.to_string())?;
+        }
+        for (id, asset) in &data.assets {
+            zip.start_file(format!("assets/{id}"), options)
+                .map_err(|e| e.to_string())?;
+            zip.write_all(&asset.bytes).map_err(|e| e.to_string())?;
         }
         for s in &data.scripts {
             zip.start_file(format!("scripts/{}.py", s.id), options)

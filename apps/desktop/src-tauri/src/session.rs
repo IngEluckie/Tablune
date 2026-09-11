@@ -38,6 +38,8 @@ fn next_session_identity() -> u64 {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentSummary {
+    pub image_count: usize,
+    pub image_rows: Vec<usize>,
     pub calculation_revision: u64,
     pub formula_count: usize,
     pub pending_cells: usize,
@@ -458,10 +460,11 @@ struct ColumnStateChange {
 }
 
 pub struct DocumentSession {
+    pub(crate) image_assets: crate::images::SharedAssets,
     sheet: SheetData,
     graph: DependencyGraph,
     calculation_revision: u64,
-    project_id: Option<u64>,
+    pub(crate) project_id: Option<u64>,
     title: Option<String>,
     document: TableDocument,
     path: Option<PathBuf>,
@@ -504,6 +507,7 @@ impl Default for DocumentSession {
             identity: next_session_identity(),
             project_id: None,
             title: None,
+            image_assets: Default::default(),
             sheet: SheetData::default(),
             graph: DependencyGraph::default(),
             calculation_revision: 0,
@@ -611,6 +615,7 @@ impl DocumentSession {
             identity: next_session_identity(),
             project_id: None,
             title: None,
+            image_assets: Default::default(),
             sheet: SheetData::default(),
             graph: DependencyGraph::default(),
             calculation_revision: 0,
@@ -641,6 +646,7 @@ impl DocumentSession {
             identity: next_session_identity(),
             project_id: None,
             title: None,
+            image_assets: self.image_assets.clone(),
             sheet: self.sheet.clone(),
             graph: self.graph.clone(),
             calculation_revision: 0,
@@ -652,6 +658,26 @@ impl DocumentSession {
     pub(crate) fn summary(&self) -> DocumentSummary {
         let header_names = self.header_names();
         DocumentSummary {
+            image_count: self
+                .sheet
+                .cells
+                .values()
+                .filter(|m| m.image.is_some())
+                .count(),
+            image_rows: {
+                let rows: HashSet<_> = self
+                    .sheet
+                    .cells
+                    .iter()
+                    .filter(|(_, m)| m.image.is_some())
+                    .filter_map(|(k, _)| formulas::position(k).map(|p| p.0))
+                    .collect();
+                self.visible_rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| rows.contains(r).then_some(i))
+                    .collect()
+            },
             calculation_revision: self.calculation_revision,
             formula_count: self.sheet.formulas().count(),
             pending_cells: self.sheet.formulas().filter(|(_, m)| m.pending).count(),
@@ -806,6 +832,9 @@ impl DocumentSession {
             let raw = self.raw_cell(row, column);
             if self.project_id.is_some() {
                 if let Some(meta) = self.sheet.cells.get(&formulas::key((row, column))) {
+                    if let Some(image) = &meta.image {
+                        return &image.name;
+                    }
                     if let Some(result) = &meta.cached {
                         return &result.display;
                     }
@@ -1275,7 +1304,7 @@ impl DocumentSession {
                 if !self.view.sorts.is_empty() {
                     let before = self.row_ids.clone();
                     let mut after = Vec::with_capacity(before.len());
-                    if self.header_enabled && !before.is_empty() {
+                    if self.data_start() == 1 && !before.is_empty() {
                         after.push(before[0]);
                     }
                     let mut all_rows: Vec<usize> =
@@ -1446,7 +1475,7 @@ impl DocumentSession {
                     .sheet
                     .cells
                     .get(&formulas::key((found.source_row, found.column)))
-                    .is_some_and(|m| m.formula)
+                    .is_some_and(|m| m.formula || m.image.is_some())
             })
             .map(|found| {
                 let value = if request.search.whole_cell {
@@ -1476,6 +1505,7 @@ impl DocumentSession {
                     cells: cells
                         .into_iter()
                         .map(|c| sheets::SheetCellInput {
+                            image: None,
                             row: c.row,
                             column: c.column,
                             value: c.value,
@@ -1850,6 +1880,7 @@ fn session_from_recovery(payload: RecoveryPayload) -> DocumentSession {
         identity: next_session_identity(),
         project_id: None,
         title: None,
+        image_assets: Default::default(),
         sheet: SheetData::default(),
         graph: DependencyGraph::default(),
         calculation_revision: 0,
@@ -2379,11 +2410,15 @@ pub fn session_export_view(
     state: State<'_, WorkspaceState>,
     document_id: u64,
     path: String,
+    allow_images: Option<bool>,
 ) -> Result<(), String> {
     ensure_path_available(&state, Path::new(&path), 0)?;
     let handle = document_handle(&state, document_id)?;
     let session = lock_document(&handle)?;
     session.ensure_calculated()?;
+    if session.sheet.cells.values().any(|m| m.image.is_some()) && allow_images != Some(true) {
+        return Err("CSV exports image names only. Confirm image export before continuing".into());
+    }
     let mut rows =
         Vec::with_capacity(session.visible_rows.len() + usize::from(session.header_enabled));
     if session.project_id.is_none() && session.header_enabled && session.document.row_count() > 0 {

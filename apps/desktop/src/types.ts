@@ -7,6 +7,8 @@ export interface Selection {
 }
 
 export interface DocumentSummary {
+  imageCount?: number;
+  imageRows?: number[];
   calculationRevision?: number;
   formulaCount?: number;
   pendingCells?: number;
@@ -258,7 +260,9 @@ export type ProjectAction =
   | { kind: "deleteScript"; scriptId: string };
 
 export type CellType = "auto" | "text" | "number" | "boolean";
+export interface CellImage { assetId: string; name: string; alt: string; }
 export interface CellInfo {
+  image?: CellImage | null;
   row: number;
   column: number;
   source: string;
@@ -270,6 +274,7 @@ export interface CellInfo {
   error: { code: string; message: string } | null;
 }
 export interface SheetCellInput {
+  image?: CellImage | null;
   row: number;
   column: number;
   value: string;

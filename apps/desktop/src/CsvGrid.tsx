@@ -1,3 +1,7 @@
+import { open, ask } from "@tauri-apps/plugin-dialog";
+import { importCellImage, copyImageAssets, pasteImageAssets } from "./ipc";
+import { useImageThumbnails } from "./imageThumbnails";
+import ImagePreview from "./ImagePreview";
 import FormulaInput from "./FormulaInput";
 import {
   type KeyboardEvent,
@@ -22,6 +26,7 @@ import {
 } from "./gridSizing";
 import {
   getGridWindow,
+  getSessionSummary,
   getSheetCell,
   shiftSheetFormulas,
   clipboardGeneration,
@@ -30,6 +35,7 @@ import {
 } from "./ipc";
 import { GRID_PALETTES, type ThemeMode } from "./theme";
 import type {
+  CellImage,
   CellCoordinate,
   CellInfo,
   CellType,
@@ -67,11 +73,12 @@ const SELECTION_ROW_CHUNK = 400;
 export const GRID_WINDOW_COLUMN_LIMIT = 200;
 
 interface CsvGridProps {
+  onCreateImageProject?: (row: number, column: number) => Promise<void>;
   appliedFunctions?: string;
   summary: DocumentSummary;
   theme: ThemeMode;
   readOnly?: boolean;
-  onApplyEdit: (command: EditCommand) => Promise<void>;
+  onApplyEdit: (command: EditCommand, target?: { documentId: number; revision: number }) => Promise<void>;
   onSelectionChange: (selection: SelectionRange) => void;
   onError: (message: string) => void;
   initialSelection?: SelectionRange;
@@ -301,6 +308,7 @@ export default function CsvGrid({
   onSizingChange,
   reveal,
   onHeaderSort,
+  onCreateImageProject,
 }: CsvGridProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -313,6 +321,9 @@ export default function CsvGrid({
   const [editing, setEditing] = useState<EditingCell | null>(null);
   const [draft, setDraft] = useState("");
   const isSheet = summary.projectId != null;
+  const previewRevision = useRef(0);
+  const [imagePreview, setImagePreview] = useState<CellInfo | null>(null);
+  const thumbnails = useImageThumbnails(summary.documentId, windowData);
   const [activeInfo, setActiveInfo] = useState<CellInfo | null>(null);
   const [barEditing, setBarEditing] = useState(false);
   const formulaBarRef = useRef<HTMLInputElement>(null);
@@ -354,10 +365,10 @@ export default function CsvGrid({
         initialSizing.rowHeights,
         resizeState.index,
         resizeState.currentSize,
-        DEFAULT_ROW_HEIGHT,
+        (summary.imageRows ?? []).includes(resizeState.index) ? 96 : DEFAULT_ROW_HEIGHT,
       ),
     };
-  }, [initialSizing, resizeState]);
+  }, [initialSizing, resizeState, summary.imageRows]);
   const columnMetrics = useMemo(
     () =>
       createAxisMetrics(
@@ -369,8 +380,8 @@ export default function CsvGrid({
   );
   const rowMetrics = useMemo(
     () =>
-      createAxisMetrics(rowCount, DEFAULT_ROW_HEIGHT, activeSizing.rowHeights),
-    [activeSizing.rowHeights, rowCount],
+      createAxisMetrics(rowCount, DEFAULT_ROW_HEIGHT, { ...Object.fromEntries((summary.imageRows ?? []).map(row => [row, 96])), ...activeSizing.rowHeights }),
+    [activeSizing.rowHeights, rowCount, summary.imageRows],
   );
   const totalWidth = ROW_HEADER_WIDTH + columnMetrics.totalSize;
   const totalHeight = COLUMN_HEADER_HEIGHT + rowMetrics.totalSize;
@@ -438,6 +449,7 @@ export default function CsvGrid({
   useEffect(() => {
     requestId.current += 1;
     setWindowData(null);
+    setImagePreview(null);
     setEditing(null);
     setContextMenu(null);
     setSelection(initialSelection);
@@ -612,7 +624,15 @@ export default function CsvGrid({
         context.beginPath();
         context.rect(x + 6, y, Math.max(0, columnWidth - 12), rowHeight);
         context.clip();
-        context.fillText(getCell(row, column), x + 8, y + rowHeight / 2);
+        const cellImage = cachedRow(row)?.inputs?.[column - (windowData?.columnStart ?? 0)]?.image;
+        const bitmap = cellImage ? thumbnails.get(cellImage.assetId) : undefined;
+        if (bitmap) {
+          const scale = Math.min((columnWidth - 16) / bitmap.width, (rowHeight - 8) / bitmap.height);
+          const w = bitmap.width * scale, h = bitmap.height * scale;
+          context.drawImage(bitmap, x + (columnWidth - w) / 2, y + (rowHeight - h) / 2, w, h);
+        } else {
+          context.fillText(cellImage ? `▧ ${cellImage.name}` : getCell(row, column), x + 8, y + rowHeight / 2);
+        }
         context.restore();
       }
     }
@@ -662,6 +682,8 @@ export default function CsvGrid({
     );
   }, [
     cachedRow,
+    thumbnails,
+    windowData?.columnStart,
     columnMetrics,
     getCell,
     rowMetrics,
@@ -671,17 +693,19 @@ export default function CsvGrid({
     theme,
   ]);
 
+  const viewportCallbacks = useRef({ draw, loadVisibleWindow });
+  viewportCallbacks.current = { draw, loadVisibleWindow };
+  useLayoutEffect(() => { draw(); }, [draw]);
   useLayoutEffect(() => {
-    draw();
     const viewport = viewportRef.current;
     if (!viewport) return;
     const observer = new ResizeObserver(() => {
-      draw();
-      void loadVisibleWindow();
+      viewportCallbacks.current.draw();
+      void viewportCallbacks.current.loadVisibleWindow();
     });
     observer.observe(viewport);
     return () => observer.disconnect();
-  }, [draw, loadVisibleWindow]);
+  }, []);
 
   const boundaryAt = (metrics: AxisMetrics, offset: number): number | null => {
     if (offset < 0 || offset > metrics.totalSize) return null;
@@ -760,8 +784,8 @@ export default function CsvGrid({
         rowHeights: withSizeOverride(
           initialSizing.rowHeights,
           target.index,
-          DEFAULT_ROW_HEIGHT,
-          DEFAULT_ROW_HEIGHT,
+          (summary.imageRows ?? []).includes(target.index) ? 96 : DEFAULT_ROW_HEIGHT,
+          (summary.imageRows ?? []).includes(target.index) ? 96 : DEFAULT_ROW_HEIGHT,
         ),
       });
       return;
@@ -868,6 +892,10 @@ export default function CsvGrid({
     if (target.mode !== "cells") return;
     const sourceRow = await sourceRowForView(target.row);
     if (sourceRow === null) return;
+    if (isSheet) {
+      const info = await getSheetCell(summary.documentId, sourceRow, target.column);
+      if (info.image) { previewRevision.current = summary.revision; setImagePreview(info); return; }
+    }
     publishSelection(rangeForTarget(target, false));
     setBarEditing(false);
     setDraft(
@@ -929,9 +957,33 @@ export default function CsvGrid({
     return fetchGridSelectionMatrix(summary.documentId, range);
   };
 
+  const insertImage = async () => {
+    await commitEdit();
+    if (!isSheet) {
+      if (onCreateImageProject && await ask("Images need a .tablune project. Create a project from this CSV?", { title: "Insert image", kind: "info" })) await onCreateImageProject(await sourceRowForView(selection.focus.row) ?? selection.focus.row, selection.focus.column);
+      else if (!onCreateImageProject) onError("Create a project from this CSV to insert images.");
+      return;
+    }
+    const target = { documentId: summary.documentId, revision: (await getSessionSummary(summary.documentId)).revision };
+    const column = selection.focus.column;
+    const row = await sourceRowForView(selection.focus.row);
+    if (row === null) return;
+    const path = await open({ title: "Insert image", multiple: false, filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg"] }] });
+    if (typeof path !== "string") return;
+    const image = await importCellImage(summary.documentId, path);
+    await onApplyEdit({ kind: "setSheetCells", cells: [{ row, column, value: image.name, image, literal: true }] }, target);
+  };
+  const updatePreviewImage = async (image: CellImage | null) => {
+    if (!imagePreview) return;
+    await onApplyEdit({ kind: "setSheetCells", cells: [{ row: imagePreview.row, column: imagePreview.column, value: image?.name ?? "", image, literal: true }] }, { documentId: summary.documentId, revision: previewRevision.current });
+    setImagePreview(null);
+    viewportRef.current?.focus();
+  };
   const copySelection = async () => {
     const { matrix, inputs } = await fetchSelectionMatrix();
     const text = encodeClipboardMatrix(matrix);
+    const imageIds = [...new Set(inputs.flat().flatMap(cell => cell.image ? [cell.image.assetId] : []))];
+    if (imageIds.length || internalClipboard?.inputs.flat().some(cell => cell.image)) await copyImageAssets(summary.documentId, imageIds);
     await writeClipboard(text);
     internalClipboard = isSheet
       ? {
@@ -966,6 +1018,7 @@ export default function CsvGrid({
 
   const pasteSelection = async (valuesOnly = false) => {
     await pendingEdit.current;
+    const pasteTarget = { documentId: summary.documentId, revision: summary.revision };
     const nativeText = await readNativeClipboard();
     if (nativeText == null && !navigator.clipboard?.readText)
       throw new Error("Clipboard reading is unavailable.");
@@ -976,12 +1029,14 @@ export default function CsvGrid({
     const copied =
       !valuesOnly &&
       isSheet &&
-      internalClipboard?.documentId === summary.documentId &&
+      internalClipboard != null &&
       internalClipboard.text === text &&
       generation !== null &&
       generation === internalClipboard.generation
         ? internalClipboard
         : null;
+    const imageIds = [...new Set(copied?.inputs.flat().flatMap(cell => cell.image ? [cell.image.assetId] : []) ?? [])];
+    if (imageIds.length) await pasteImageAssets(summary.documentId, imageIds);
     const matrix = parseClipboardMatrix(text);
     if (!matrix.length) return;
     const range = normalizeSelection(selection);
@@ -1019,6 +1074,7 @@ export default function CsvGrid({
         cells.push({
           literal: isSheet && !original?.formula && !original?.escaped,
           cellType: original?.cellType,
+          image: original?.image,
           row: sourceRow,
           column: range.startColumn + columnOffset,
           value:
@@ -1035,11 +1091,11 @@ export default function CsvGrid({
         cells[index].value = translated[i];
       });
     }
-    if (cells.length)
-      await onApplyEdit({
-        kind: isSheet ? "setSheetCells" : "setCells",
-        cells,
-      });
+    if (cells.length) {
+      const command: EditCommand = { kind: isSheet ? "setSheetCells" : "setCells", cells };
+      if (imageIds.length) await onApplyEdit(command, pasteTarget);
+      else await onApplyEdit(command);
+    }
   };
 
   useEffect(() => {
@@ -1055,7 +1111,7 @@ export default function CsvGrid({
       const command = typeof detail === "string" ? detail : detail.command;
       if (readOnly && command !== "copy") return;
       const operation =
-        command === "copy"
+        command === "insertImage" ? insertImage : command === "copy"
           ? copySelection
           : command === "cut"
             ? cutSelection
@@ -1269,6 +1325,9 @@ export default function CsvGrid({
   };
   return (
     <div className="sheet-grid">
+      {imagePreview?.image && <ImagePreview info={imagePreview} documentId={summary.documentId} readOnly={readOnly}
+        onClose={() => { setImagePreview(null); viewportRef.current?.focus(); }}
+        onSave={updatePreviewImage} onError={onError} />}
       {isSheet && (
         <div className="formula-toolbar">
           <output className="cell-address" aria-label="Cell address">
@@ -1282,8 +1341,10 @@ export default function CsvGrid({
             onComplete={setDraft}
             aria-label="Formula bar"
             disabled={readOnly}
+            readOnly={!!activeInfo?.image && !editing}
             value={editing ? draft : (activeInfo?.source ?? "")}
             onFocus={() => {
+              if (activeInfo?.image) return;
               if (!editing) {
                 setDraft(activeInfo?.source ?? "");
                 setEditing({
@@ -1315,7 +1376,7 @@ export default function CsvGrid({
           <select
             aria-label="Cell type"
             value={activeInfo?.cellType ?? "auto"}
-            disabled={readOnly}
+            disabled={readOnly || !!activeInfo?.image}
             onChange={(event) =>
               void changeType(event.target.value as CellType).catch((reason) =>
                 onError(String(reason)),
@@ -1517,7 +1578,7 @@ export default function CsvGrid({
                     initialSizing.rowHeights,
                     resizeState.index,
                     resizeState.currentSize,
-                    DEFAULT_ROW_HEIGHT,
+                    (summary.imageRows ?? []).includes(resizeState.index) ? 96 : DEFAULT_ROW_HEIGHT,
                   ),
                 };
           publishSizing(next);
@@ -1604,6 +1665,7 @@ export default function CsvGrid({
             style={{ left: contextMenu.x, top: contextMenu.y }}
             role="menu"
           >
+            <button disabled={readOnly} onClick={() => { setContextMenu(null); void insertImage().catch(reason => onError(String(reason))); }}>Insert image…</button>
             <button onClick={() => void runContextOperation("insertRow")}>
               Insert row
             </button>
