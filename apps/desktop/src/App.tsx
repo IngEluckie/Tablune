@@ -3,6 +3,7 @@ import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import CsvWorkspace from "./CsvWorkspace";
 import RibbonHeader from "./RibbonHeader";
 import ProjectSidebar from "./ProjectSidebar";
+import ProjectTabs from "./ProjectTabs";
 import ProjectFunctionsEditor from "./ProjectFunctionsEditor";
 import ProjectScriptEditor from "./ProjectScriptEditor";
 import { useWorkspace, type ProjectTab } from "./useWorkspace";
@@ -633,32 +634,14 @@ export default function App() {
                 )}
               </ProjectSidebar>
               <div className="project-main">
-                <div
-                  className="project-tabs"
-                  role="tablist"
-                  aria-label="Project editors"
-                >
-                  {visibleTabs.map((t) => (
-                    <div
-                      key={`${t.kind}:${t.id}`}
-                      className={active?.id === t.id ? "selected" : ""}
-                    >
-                      <button
-                        role="tab"
-                        aria-selected={active?.id === t.id}
-                        onClick={() => w.openTab(p.projectId, t)}
-                      >
-                        {tabName(p, t)}
-                      </button>
-                      <button
-                        aria-label={`Close ${tabName(p, t)} editor`}
-                        onClick={() => w.closeTab(p.projectId, t)}
-                      >
-                        ×
-                      </button>
-                    </div>
-                  ))}
-                </div>
+                <ProjectTabs
+                  tabs={visibleTabs.map((tab) => ({ ...tab, name: tabName(p, tab)! }))}
+                  active={active}
+                  disabled={locked}
+                  onActivate={(tab) => w.openTab(p.projectId, tab)}
+                  onClose={(tab) => w.closeTab(p.projectId, tab)}
+                  onNew={() => void newTable(p)}
+                />
                 {!active && (
                   <div className="empty-workspace">
                     <h1>{p.name}</h1>
@@ -686,6 +669,7 @@ export default function App() {
                 <div className="grid-host" hidden={!table}>
                   <CsvWorkspace
                     managed
+                    appliedFunctions={p.functions?.applied ?? ""}
                     ribbonTarget={ribbonTarget}
                     ribbonVisible={w.space === p.projectId && Boolean(table)}
                     ribbonControls={{ navigation, fileActions }}

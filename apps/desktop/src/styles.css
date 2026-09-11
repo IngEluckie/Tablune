@@ -886,11 +886,7 @@ button { cursor: default; }
 .project-navigator .navigator-item[aria-pressed="true"] { background:var(--accent-soft); color:var(--accent); }
 .item-actions { margin-top:24px; padding-top:16px; border-top:1px solid var(--border); display:flex; flex-direction:column; gap:6px; }
 .project-main { display:flex; flex-direction:column; min-width:0; min-height:0; }
-.project-tabs { display:flex; overflow-x:auto; flex-shrink:0; background:var(--surface); border-bottom:1px solid var(--border); min-height:37px; }
-.project-tabs > div { display:flex; flex-shrink:0; border-right:1px solid var(--border); }
-.project-tabs > div.selected { box-shadow:inset 0 -2px var(--accent); background:var(--accent-soft); }
-.project-tabs button { background:transparent; border:0; border-radius:0; font-size:12px; }
-.project-main .document-tabs { display:none; }
+.project-main .grid-host .document-tabs { display:none; }
 .empty-workspace { display:flex; align-items:center; justify-content:center; flex-direction:column; flex:1; color:var(--text-muted); gap:12px; min-height:240px; }
 .empty-workspace h1,.empty-workspace h2 { font-size:24px; color:var(--text); margin:0; }
 .empty-workspace button { margin:4px; }
@@ -941,3 +937,20 @@ button { cursor: default; }
 .project-navigator .calculation-toolbar { align-items:stretch; flex-direction:column; gap:7px; padding:0 0 14px; margin-bottom:14px; }
 .project-navigator .calculation-toolbar button { white-space:normal; }
 .project-navigator .calculation-toolbar span { overflow-wrap:anywhere; }
+
+/* Project editors share the compact CSV tab strip, with a downward-opening list. */
+.project-editor-tabs { flex:0 0 20px; height:20px; }
+.project-editor-tabs button { border-radius:0; background:transparent; }
+.project-editor-tabs .document-tab-main { border:0; padding:2px 2px 0 10px; font-size:11px; }
+.project-editor-tabs .document-tab-close { border:0; padding:0; font-size:14px; }
+.project-editor-tabs .tab-scroll-button,.project-editor-tabs .tab-action-button { padding:0; border-top:0; border-bottom:0; font-size:15px; }
+.project-editor-tabs .document-tabs-list { top:calc(100% + 5px); bottom:auto; }
+.project-editor-tabs .document-tabs-list button { border:0; padding:0 9px; }
+.project-editor-tabs .document-tabs-list button span:last-child { color:inherit; font-size:12px; }
+
+.formula-input-container { position:relative; flex:1; min-width:0; }
+.formula-input-container input { width:100%; }
+.formula-suggestions { position:absolute; top:calc(100% + 3px); left:0; z-index:30; width:min(360px,100%); max-height:220px; overflow:auto; background:var(--surface); border:1px solid var(--border-control); border-radius:6px; box-shadow:0 6px 20px var(--menu-shadow); }
+.formula-suggestions [role="option"] { padding:7px 12px; cursor:pointer; font:13px ui-monospace,monospace; color:var(--text-strong); }
+.formula-suggestions [aria-selected="true"] { background:var(--accent-soft); color:var(--accent); }
+.formula-suggestions span { color:var(--text-muted); }

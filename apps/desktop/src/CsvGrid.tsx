@@ -1,3 +1,4 @@
+import FormulaInput from "./FormulaInput";
 import {
   type KeyboardEvent,
   useCallback,
@@ -66,6 +67,7 @@ const SELECTION_ROW_CHUNK = 400;
 export const GRID_WINDOW_COLUMN_LIMIT = 200;
 
 interface CsvGridProps {
+  appliedFunctions?: string;
   summary: DocumentSummary;
   theme: ThemeMode;
   readOnly?: boolean;
@@ -285,6 +287,7 @@ const DEFAULT_SELECTION: SelectionRange = {
 };
 
 export default function CsvGrid({
+  appliedFunctions = "",
   summary,
   theme,
   readOnly = false,
@@ -1273,8 +1276,10 @@ export default function CsvGrid({
             {(editing?.sourceRow ?? activeInfo?.row ?? selection.focus.row) + 1}
           </output>
           <span className="formula-symbol">ƒx</span>
-          <input
-            ref={formulaBarRef}
+          <FormulaInput
+            inputRef={formulaBarRef}
+            appliedCode={appliedFunctions}
+            onComplete={setDraft}
             aria-label="Formula bar"
             disabled={readOnly}
             value={editing ? draft : (activeInfo?.source ?? "")}

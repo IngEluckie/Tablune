@@ -114,6 +114,7 @@ function shortPath(path: string): string {
 
 export interface CsvWorkspaceProps {
   managed?: boolean;
+  appliedFunctions?: string;
   ribbonTarget?: HTMLElement | null;
   ribbonVisible?: boolean;
   ribbonControls?: Pick<RibbonHeaderProps, "navigation" | "fileActions">;
@@ -1003,6 +1004,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
         >
           {summary.documentId !== 0 && (
             <CsvGrid
+              appliedFunctions={props.appliedFunctions}
               key={`grid-${summary.documentId}`}
               summary={summary}
               theme={theme}
