@@ -326,6 +326,8 @@ export default function CsvGrid({
   const [windowData, setWindowData] = useState<GridWindow | null>(null);
   const [selection, setSelection] = useState<SelectionRange>(initialSelection);
   const [editing, setEditing] = useState<EditingCell | null>(null);
+  const editingRef = useRef(editing);
+  editingRef.current = editing;
   const [draft, setDraft] = useState("");
   const isSheet = summary.projectId != null;
   const previewRevision = useRef(0);
@@ -460,7 +462,10 @@ export default function CsvGrid({
     setEditing(null);
     setContextMenu(null);
     setSelection(initialSelection);
-  }, [initialSelection, summary.documentId]);
+    // Selection is echoed by the workspace after every click. Restore it only
+    // when changing documents, without resetting an edit or its loaded cells.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [summary.documentId]);
 
   useEffect(() => {
     if (readOnly) {
@@ -903,16 +908,21 @@ export default function CsvGrid({
     };
   };
 
-  const sourceRowForView = async (viewRow: number): Promise<number | null> => {
+  const knownSourceRowForView = (viewRow: number): number | null => {
     const cached = cachedRow(viewRow);
     if (cached) return cached.sourceRow;
-    const data = await getGridWindow(summary.documentId, viewRow, 1, 0, 1);
-    if (data.documentId !== summary.documentId) return null;
-    if (data.rows[0]) return data.rows[0].sourceRow;
     if (!summary.filtersActive && summary.sortCount === 0) {
       return viewRow + Number(summary.headerEnabled && !isSheet);
     }
     return null;
+  };
+
+  const sourceRowForView = async (viewRow: number): Promise<number | null> => {
+    const known = knownSourceRowForView(viewRow);
+    if (known !== null) return known;
+    const data = await getGridWindow(summary.documentId, viewRow, 1, 0, 1);
+    if (data.documentId !== summary.documentId) return null;
+    return data.rows[0]?.sourceRow ?? null;
   };
 
   const beginEditing = async (target: GridTarget) => {
@@ -951,26 +961,30 @@ export default function CsvGrid({
   };
 
   const commitEdit = (): Promise<void> => {
-    if (pendingEdit.current) return pendingEdit.current;
-    const target = editing;
-    if (!target) return Promise.resolve();
+    const target = editingRef.current;
+    if (!target) return pendingEdit.current ?? Promise.resolve();
+    // Enter and blur can commit the same editor before React renders again.
+    editingRef.current = null;
     setEditing(null);
     setBarEditing(false);
     if (readOnly) return Promise.resolve();
-    const operation = onApplyEdit({
+    const command: EditCommand = {
       kind: isSheet ? "setSheetCells" : "setCells",
       cells: [{ row: target.sourceRow, column: target.column, value: draft }],
-    });
+    };
+    // Apply consecutive cells in order so each uses the latest revision.
+    const operation = pendingEdit.current
+      ? pendingEdit.current.then(() => onApplyEdit(command))
+      : onApplyEdit(command);
     pendingEdit.current = operation;
     pendingCellEdits.add(operation);
     void operation.then(
       () => {
-        pendingEdit.current = null;
+        if (pendingEdit.current === operation) pendingEdit.current = null;
         pendingCellEdits.delete(operation);
-        viewportRef.current?.focus();
       },
       () => {
-        pendingEdit.current = null;
+        if (pendingEdit.current === operation) pendingEdit.current = null;
         pendingCellEdits.delete(operation);
       },
     );
@@ -1252,7 +1266,7 @@ export default function CsvGrid({
       return;
     } else if (event.key.length === 1 && !modifier && !event.altKey) {
       event.preventDefault();
-      void sourceRowForView(selection.focus.row).then((sourceRow) => {
+      const startTyping = (sourceRow: number | null) => {
         if (sourceRow === null) return;
         setDraft(event.key);
         setEditing({
@@ -1261,7 +1275,12 @@ export default function CsvGrid({
           column: selection.focus.column,
           header: false,
         });
-      });
+      };
+      const sourceRow = knownSourceRowForView(selection.focus.row);
+      if (sourceRow !== null) startTyping(sourceRow);
+      else void sourceRowForView(selection.focus.row)
+        .then(startTyping)
+        .catch((reason) => onError(String(reason)));
       return;
     } else return;
     event.preventDefault();
@@ -1403,6 +1422,7 @@ export default function CsvGrid({
               if (event.key === "Enter") {
                 event.preventDefault();
                 void commitEdit().catch((reason) => onError(String(reason)));
+                viewportRef.current?.focus();
               }
               if (event.key === "Escape") {
                 setEditing(null);
@@ -1689,8 +1709,11 @@ export default function CsvGrid({
                 void commitEdit().catch((reason) => onError(String(reason)));
             }}
             onKeyDown={(event) => {
-              if (event.key === "Enter")
+              if (event.key === "Enter") {
+                event.preventDefault();
                 void commitEdit().catch((reason) => onError(String(reason)));
+                viewportRef.current?.focus();
+              }
               if (event.key === "Escape") {
                 setEditing(null);
                 viewportRef.current?.focus();

@@ -8,11 +8,12 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { useState } from "react";
 import CsvGrid, { flushCellEdits } from "./CsvGrid";
 import * as ipc from "./ipc";
 import { open } from "@tauri-apps/plugin-dialog";
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(), ask: vi.fn() }));
-import type { CellInfo, DocumentSummary } from "./types";
+import type { CellInfo, DocumentSummary, SelectionRange } from "./types";
 vi.mock("./ipc", () => ({
   getSessionSummary: vi.fn(),
   importCellImage: vi.fn(),
@@ -212,6 +213,99 @@ it("edits the formula source while the cell displays its result", async () => {
       cells: [{ row: 0, column: 0, value: "=B1+C1+5" }],
     }),
   );
+});
+it("keeps the editor and its text when the workspace remembers the selected cell", async () => {
+  const onApplyEdit = vi.fn(async () => {});
+  const onError = vi.fn();
+  function Workspace() {
+    const [selection, setSelection] = useState<SelectionRange>({
+      anchor: { row: 0, column: 0 },
+      focus: { row: 0, column: 0 },
+      mode: "cells",
+    });
+    return <CsvGrid summary={summary} theme="light" initialSelection={selection}
+      onSelectionChange={setSelection} onApplyEdit={onApplyEdit}
+      onError={onError} onHeaderSort={vi.fn()} />;
+  }
+  const { container } = render(<Workspace />);
+  await waitFor(() => expect(screen.getByLabelText("Formula bar")).toHaveProperty("value", "=B1+C1"));
+  const viewport = container.querySelector(".grid-viewport")!;
+  fireEvent.doubleClick(viewport, { clientX: 780, clientY: 75, button: 0 });
+  const editor = await screen.findByLabelText("Edit cell");
+  fireEvent.change(editor, { target: { value: "E2 text stays" } });
+  fireEvent.keyDown(editor, { key: "Enter" });
+  await waitFor(() => expect(onApplyEdit).toHaveBeenCalledWith({
+    kind: "setSheetCells",
+    cells: [{ row: 1, column: 4, value: "E2 text stays" }],
+  }));
+  expect(onError).not.toHaveBeenCalled();
+});
+it("does not interrupt typing in E2 when the previous cell finishes saving", async () => {
+  let finish!: () => void;
+  const onApplyEdit = vi.fn<() => Promise<void>>()
+    .mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }))
+    .mockResolvedValue(undefined);
+  const { container } = mount(onApplyEdit);
+  const viewport = container.querySelector(".grid-viewport")!;
+  await waitFor(() => expect(screen.getByLabelText("Formula bar")).toHaveProperty("value", "=B1+C1"));
+  fireEvent.keyDown(viewport, { key: "a" });
+  let editor = await screen.findByLabelText("Edit cell");
+  fireEvent.change(editor, { target: { value: "First cell" } });
+  fireEvent.keyDown(editor, { key: "Enter" });
+  fireEvent.pointerDown(viewport, { clientX: 780, clientY: 75, button: 0 });
+  fireEvent.keyDown(viewport, { key: "r" });
+  editor = await screen.findByLabelText("Edit cell");
+  fireEvent.change(editor, { target: { value: "rrrr" } });
+  expect(document.activeElement).toBe(editor);
+  await act(async () => { finish(); });
+  expect(screen.getByLabelText("Edit cell")).toBe(editor);
+  expect(document.activeElement).toBe(editor);
+  expect(editor).toHaveProperty("value", "rrrr");
+  expect(onApplyEdit).toHaveBeenCalledTimes(1);
+});
+it("saves both cells when the second edit is committed before the first one completes", async () => {
+  let finish!: () => void;
+  const onApplyEdit = vi.fn<() => Promise<void>>()
+    .mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }))
+    .mockResolvedValue(undefined);
+  const { container } = mount(onApplyEdit);
+  const viewport = container.querySelector(".grid-viewport")!;
+  await waitFor(() => expect(screen.getByLabelText("Formula bar")).toHaveProperty("value", "=B1+C1"));
+  fireEvent.keyDown(viewport, { key: "d" });
+  let editor = await screen.findByLabelText("Edit cell");
+  fireEvent.change(editor, { target: { value: "First edit" } });
+  fireEvent.keyDown(editor, { key: "Enter" });
+  fireEvent.pointerDown(viewport, { clientX: 780, clientY: 75, button: 0 });
+  fireEvent.keyDown(viewport, { key: "e" });
+  editor = await screen.findByLabelText("Edit cell");
+  fireEvent.change(editor, { target: { value: "Second edit" } });
+  fireEvent.keyDown(editor, { key: "Enter" });
+  expect(onApplyEdit).toHaveBeenCalledTimes(1);
+  await act(async () => {
+    const flush = flushCellEdits();
+    finish();
+    await flush;
+  });
+  expect(onApplyEdit.mock.calls).toEqual([
+    [{ kind: "setSheetCells", cells: [{ row: 0, column: 0, value: "First edit" }] }],
+    [{ kind: "setSheetCells", cells: [{ row: 1, column: 4, value: "Second edit" }] }],
+  ]);
+});
+it("starts typing immediately in an empty cell beyond the used rows", async () => {
+  const { container, onApplyEdit } = mount();
+  const viewport = container.querySelector(".grid-viewport")!;
+  await waitFor(() => expect(screen.getByLabelText("Formula bar")).toHaveProperty("value", "=B1+C1"));
+  fireEvent.pointerDown(viewport, { clientX: 780, clientY: 330, button: 0 });
+  fireEvent.keyDown(viewport, { key: "r" });
+  // The editor must receive the very next keystroke without waiting for IPC.
+  const editor = screen.getByLabelText("Edit cell");
+  expect(editor).toHaveProperty("value", "r");
+  fireEvent.change(editor, { target: { value: "rapid typing" } });
+  fireEvent.keyDown(editor, { key: "Enter" });
+  await waitFor(() => expect(onApplyEdit).toHaveBeenCalledWith({
+    kind: "setSheetCells",
+    cells: [{ row: 10, column: 4, value: "rapid typing" }],
+  }));
 });
 it("inserts a grid reference without committing the formula prematurely", async () => {
   const { container, onApplyEdit } = mount();

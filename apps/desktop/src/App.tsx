@@ -289,8 +289,8 @@ export default function App() {
       </>);
   return (
     <main className="app-shell product-shell" data-theme={theme}>
-      <div className="application-ribbon" ref={setRibbonTarget}>
-        {!tableRibbonVisible && <RibbonHeader
+      <div className="application-ribbon" ref={setRibbonTarget} hidden={w.space === "home"}>
+        {w.space !== "home" && !tableRibbonVisible && <RibbonHeader
           tableAvailable={false}
           navigation={navigation}
           fileActions={fileActions}
