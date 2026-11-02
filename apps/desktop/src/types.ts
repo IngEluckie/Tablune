@@ -36,6 +36,7 @@ export interface DocumentSummary {
 }
 
 export interface WorkspaceSummary {
+  markdown?: MarkdownDocument[];
   projects?: ProjectSummary[];
   documents: DocumentSummary[];
 }
@@ -227,6 +228,7 @@ export interface ProjectTableSummary {
   document: DocumentSummary;
 }
 export interface ProjectSummary {
+  markdown?: MarkdownDocument[];
   functions?: FunctionsData;
   calculation?: CalculationSummary;
   projectId: number;
@@ -240,7 +242,7 @@ export interface ProjectSummary {
 }
 export interface RecentFile {
   path: string;
-  kind: "csv" | "project";
+  kind: "csv" | "project" | "markdown";
 }
 export type ProjectAction =
   | { kind: "updateFunctions"; code: string; expectedRevision: number }
@@ -293,3 +295,20 @@ export interface CalculationSummary {
   paused: boolean;
   error: string | null;
 }
+
+export interface MarkdownDocument {
+  id: string;
+  name: string;
+  content: string;
+  revision: number;
+  path: string | null;
+  dirty: boolean;
+  images: Record<string, string>;
+}
+export type MarkdownAction =
+  | { kind: "new"; name: string }
+  | { kind: "open" | "save"; path: string }
+  | { kind: "update"; content: string; expectedRevision: number }
+  | { kind: "rename"; name: string }
+  | { kind: "delete"; discard: boolean }
+  | { kind: "copyToProject"; targetProjectId: number };

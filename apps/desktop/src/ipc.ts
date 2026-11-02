@@ -234,3 +234,10 @@ async function exportWithImages(command: string, documentId: number, path: strin
   if (hasImages && !await ask("CSV cannot contain images. Export their file names as text? The images will remain in your project.", { title: "Export CSV", kind: "warning" })) return;
   await invoke<void>(command, { documentId, path, allowImages: hasImages });
 }
+
+export const markdownAction = (projectId: number | null, documentId: string | null, action: import("./types").MarkdownAction) =>
+  invoke<import("./types").MarkdownDocument>("markdown_action", { projectId, documentId, action });
+export const importMarkdownImage = (projectId: number | null, documentId: string, path: string | null, bytes: number[] | null = null) =>
+  invoke<string>("markdown_image_import", { projectId, documentId, path, bytes });
+export const readMarkdownImage = (projectId: number | null, documentId: string, url: string) =>
+  invoke<ArrayBuffer>("markdown_image_read", { projectId, documentId, url });

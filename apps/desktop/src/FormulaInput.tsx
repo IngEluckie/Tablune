@@ -1,20 +1,6 @@
 import { type ComponentProps, type RefObject, useId, useMemo, useState } from "react";
-import { pythonLanguage } from "@codemirror/lang-python";
-
-export function appliedFunctionNames(code: string): string[] {
-  const names = new Set<string>();
-  const root = pythonLanguage.parser.parse(code).topNode;
-  for (let node = root.firstChild; node; node = node.nextSibling) {
-    const definition = node.name === "DecoratedStatement" ? node.getChild("FunctionDefinition") : node;
-    if (definition?.name !== "FunctionDefinition") continue;
-    const name = definition.getChild("VariableName");
-    if (name) {
-      const text = code.slice(name.from, name.to);
-      if (!text.startsWith("_")) names.add(text);
-    }
-  }
-  return [...names].sort();
-}
+import { BUILTIN_FUNCTIONS, projectFunctions, searchFunctions } from "./formulaCatalog";
+export { appliedFunctionNames } from "./formulaCatalog";
 
 type Props = Omit<ComponentProps<"input">, "value" | "ref"> & {
   value: string;
@@ -23,7 +9,7 @@ type Props = Omit<ComponentProps<"input">, "value" | "ref"> & {
   onComplete: (value: string) => void;
 };
 export default function FormulaInput({ appliedCode, inputRef, onComplete, onChange, onFocus, onBlur, onKeyDown, onSelect, value, ...props }: Props) {
-  const names = useMemo(() => appliedFunctionNames(appliedCode), [appliedCode]);
+  const functions = useMemo(() => [...BUILTIN_FUNCTIONS, ...projectFunctions(appliedCode)], [appliedCode]);
   const [focused, setFocused] = useState(false);
   const [cursor, setCursor] = useState(0);
   const [dismissed, setDismissed] = useState(false);
@@ -31,9 +17,9 @@ export default function FormulaInput({ appliedCode, inputRef, onComplete, onChan
   const id = useId();
   const prefix = value.slice(0, cursor);
   // Complete the initial function name; never offer names inside string literals or arguments.
-  const match = /^=\s*([A-Za-z_][A-Za-z_0-9]*)?$/.exec(prefix);
+  const match = /^=\s*([\p{L}_][\p{L}\p{N}_]*)?$/u.exec(prefix);
   const query = match?.[1] ?? "";
-  const matches = focused && !dismissed && match ? names.filter(name => name.toLowerCase().startsWith(query.toLowerCase())) : [];
+  const matches = focused && !dismissed && match ? searchFunctions(functions, query) : [];
   const active = Math.min(index, Math.max(0, matches.length - 1));
   const choose = (name: string) => {
     const start = cursor - query.length;
@@ -65,14 +51,14 @@ export default function FormulaInput({ appliedCode, inputRef, onComplete, onChan
             document.getElementById(`${id}-${next}`)?.scrollIntoView?.({ block: "nearest" });
             return;
           }
-          if (event.key === "Enter") { event.preventDefault(); event.stopPropagation(); choose(matches[active]); return; }
+          if (event.key === "Enter" || event.key === "Tab") { event.preventDefault(); event.stopPropagation(); choose(matches[active].name); return; }
           if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setDismissed(true); return; }
         }
         onKeyDown?.(event);
       }} />
-    {matches.length > 0 && <div className="formula-suggestions" id={id} role="listbox" aria-label="Applied functions">
-      {matches.map((name, option) => <div key={name} id={`${id}-${option}`} role="option" aria-selected={option === active}
-        onMouseDown={event => event.preventDefault()} onMouseEnter={() => setIndex(option)} onClick={() => choose(name)}>{name}<span>()</span></div>)}
+    {matches.length > 0 && <div className="formula-suggestions" id={id} role="listbox" aria-label="Funciones disponibles">
+      {matches.map((fn, option) => <div key={fn.name} id={`${id}-${option}`} role="option" aria-selected={option === active}
+        onMouseDown={event => event.preventDefault()} onMouseEnter={() => setIndex(option)} onClick={() => choose(fn.name)}><code>{fn.name}()</code><span>{fn.project ? "Del proyecto" : fn.label}</span></div>)}
     </div>}
   </div>;
 }

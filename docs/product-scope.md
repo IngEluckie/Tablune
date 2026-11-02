@@ -6,16 +6,21 @@ Tablune Sheets 0.5 combines the existing CSV editor with calculable sheets insid
 
 ## Included
 
+- Standalone and project Markdown documents with visual/source editing
+- Local images, portable Markdown export, document recovery and close protection
+- Block menu, formatting toolbar, search, heading outline and cross-mode undo
+
+
 - Python expressions in project cells, relative/absolute cell references, and tracked literal ranges
 - Project Functions draft/applied module with explicit activation
 - Formula bar, reference insertion, per-cell types, error details, recalculate/cancel controls
 - Incremental dependency calculation, cycle detection, revision-safe result publication
 - Formula-aware copy/paste and structural undo/redo
-- Format-2 persistence/recovery, backward reading, and cached results requiring session enablement
+- Format-4 persistence/recovery, backward reading, and cached results requiring session enablement
 
 - Home, recent files, and multiple simultaneously open project/CSV spaces
 - Self-contained, versioned `.tablune` project files with atomic saving
-- Project tables and Python scripts with independent central editor tabs
+- Project table tabs with Python script and Functions editors in the left sidebar
 - Script input selection and reusable preview-to-result-table workflow
 - Project-wide dirty protection and recovery, including script-only changes
 - CSV-to-project copying and table/script import and export

@@ -11,12 +11,19 @@ The initial release targets macOS for development and validation, while preservi
 
 ## Current scope (0.5)
 
+- Create standalone Markdown documents or keep them alongside tables in projects
+- Edit visually with live formatting, a `/` block menu, or Markdown source mode
+- Import local PNG/JPEG images, find text, navigate headings, and undo across editor modes
+- Save standalone documents with portable image folders, or embed everything in a format-4 project
+- Recover unsaved Markdown and protect pending edits when saving or closing
+
+
 - Insert embedded PNG/JPEG images into project cells, preview them, and copy them between projects
 - Write cell formulas such as `=B1 + C1` in project sheets and recalculate affected cells automatically
 - Use relative/absolute references, ranges, Python expressions, and project-defined functions
 - Edit the original formula in a formula bar while the grid shows its result
 - Apply cell types, copy formulas with adjusted references, paste values, and undo structural changes
-- Save formulas, original text, function drafts/applied code, and cached results in format-3 projects
+- Save formulas, original text, function drafts/applied code, and cached results in format-4 projects
 - Enable Python explicitly for each project session before any calculation runs
 
 - Start from Home with recent files and multiple open workspaces
@@ -67,6 +74,22 @@ pnpm install
 pnpm dev
 ```
 
+## Install on Linux (CachyOS / Arch)
+
+Install Rust, Node.js 22+, npm, Python 3.10+, `base-devel`, and
+`webkit2gtk-4.1`, then run this from the repository as your normal user:
+
+```bash
+bash scripts/install-linux.sh
+```
+
+The script downloads the pinned pnpm version, installs locked dependencies, and
+builds a release with its Python resources. It installs into `~/.local` and adds
+**Tablune Sheets** with its icon to the application menu. It requires Internet
+access during the first build and does not require `sudo`. Run the same command
+again to rebuild and update the installation. Linux compilation and GUI behavior
+must be validated on the target machine.
+
 ## Quality checks
 
 ```bash
@@ -82,13 +105,17 @@ Tablune 0.5 adds Python calculation inside existing project sheets. Rust owns or
 
 ## Working with projects
 
-Choose **New project** on Home, import CSV tables, and create or import a Python script. In the central script editor, choose an input table, run a preview, and select **Create result table**. Each accepted execution adds an editable copy; it never overwrites the input or a previous result. Saving a project stores all its tables and scripts in one `.tablune` file. Reopen it later and select a different table to reuse the script.
+Choose **New project** on Home, import CSV tables, and create or import a Python script. In the left sidebar's script editor, choose an input table, run a preview, and select **Create result table** while keeping the active table visible on the right. **Back to project items** returns to the table and script list without discarding edits. Each accepted execution adds an editable copy; it never overwrites the input or a previous result. Saving a project stores all its tables and scripts in one `.tablune` file. Reopen it later and select a different table to reuse the script.
 
 CSV workspaces retain their existing macro panel and save behavior. **Create project from this CSV** copies the current in-memory data and view, including unsaved edits, while leaving the original CSV open. Exporting a table produces a CSV and does not save the project.
 
 ## Python in cells
 
 In a project sheet, enter `10` in B1, `20` in C1, and `=B1 + C1` in A1. Choose **Enable Python** to calculate: A1 displays `30`, retains its formula, and updates when B1 or C1 changes. Imported headers remain visible in row 1; all project columns use A, B, C addresses.
+
+Use **Fórmulas → Insertar función** to open the searchable side catalog. It explains the built-ins in Spanish and lists applied project functions with their signatures and docstrings. Inserting a function starts an editable formula; click a cell or drag a range to supply its arguments, then press Enter. The formula bar also suggests built-ins and applied project functions. **Funciones del proyecto → Nueva función** appends a template to the existing module; apply it in the Functions editor when ready.
+
+**Σ Autosuma** proposes a formula and an editable destination before writing. Select a range, or an empty cell below/to the right of contiguous numbers. Review the highlighted range and choose **Insertar suma**. Occupied destinations and destinations inside the summed range are rejected. Autosuma requires a sheet view without sorting or filters. Calculation controls in **Fórmulas** activate Python, recalculate, or cancel the current calculation; browsing the catalog never runs Python.
 
 Open **Functions**, define a function, and choose **Apply functions**:
 
@@ -100,3 +127,22 @@ def precio_final(base, impuesto):
 Use it in a cell as `=precio_final(B2, C2)`. Editing the module saves a draft; only a successful explicit application changes the active functions. `=sum(cells("B2:B10"))` reads a row-major range. Empty cells become `None`, and `00123` remains text. An initial apostrophe forces literal text.
 
 Python 3.10+ and any imported packages must already be installed in the user-selected environment. Projects contain source code, not Python installations or dependencies. Opening a project shows cached results as pending and never executes Python; enable it again for that session. User functions run with normal interpreter permissions, and the separate process is not a security sandbox. Exporting or transforming a sheet requires current results without formula errors. See [project and formula behavior](docs/projects.md) and [validation](docs/validation-0.5.md).
+
+## Markdown documents
+
+Choose **New document** on Home, or **Documents → New document** inside a project.
+Use **Visual** for live editing and **Markdown code** for source. Type `/` for blocks,
+select text for formatting, use **Insert image…**, or paste/drop an image. Selecting
+an image exposes its description. **Find** (Ctrl/Cmd+F) and **Outline** navigate
+the document. Ctrl/Cmd+S saves the file or its containing project.
+
+Standalone `.md`/`.markdown` files save imported images in a neighboring
+`<filename>.assets` folder. Move that folder with the Markdown file. Project
+documents and images are embedded in `.tablune`; **Export Markdown…** writes an
+independent document plus its resources without saving the project.
+
+HTML, front matter and unsupported rich-text syntax stay in source mode. Remote
+images and paths outside an imported document's directory tree are retained as
+references but are not loaded; use Insert image to embed them locally. Projects
+saved by this version use format 4 and require an application supporting format 4.
+See [Markdown behavior and validation](docs/markdown.md).

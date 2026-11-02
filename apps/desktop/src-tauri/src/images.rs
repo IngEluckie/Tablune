@@ -98,12 +98,17 @@ pub fn validate_asset(id: &str, asset: &ImageAsset) -> Result<(), String> {
     Ok(())
 }
 pub fn retain_referenced(data: &mut session::projects::ProjectData) {
-    let ids: HashSet<_> = data
+    let mut ids: HashSet<_> = data
         .tables
         .iter()
         .flat_map(|t| t.sheet.cells.values())
         .filter_map(|m| m.image.as_ref().map(|i| i.asset_id.clone()))
         .collect();
+    ids.extend(
+        data.markdown
+            .iter()
+            .flat_map(|d| d.images.values().cloned()),
+    );
     data.assets.retain(|id, _| ids.contains(id));
 }
 fn store(state: &WorkspaceState, document_id: u64) -> Result<SharedAssets, String> {

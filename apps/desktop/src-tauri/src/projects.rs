@@ -44,6 +44,8 @@ pub struct TableMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectData {
     #[serde(default)]
+    pub markdown: Vec<super::markdown::MarkdownDocument>,
+    #[serde(default)]
     pub assets: crate::images::Assets,
     #[serde(default)]
     pub functions: FunctionsData,
@@ -64,6 +66,7 @@ pub struct ProjectTableSummary {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectSummary {
+    pub markdown: Vec<super::markdown::MarkdownDocument>,
     pub functions: FunctionsData,
     pub calculation: CalculationSummary,
     pub project_id: u64,
@@ -112,7 +115,7 @@ pub(crate) fn update_directory(
     Ok(())
 }
 pub struct ProjectSession {
-    image_assets: crate::images::SharedAssets,
+    pub(super) image_assets: crate::images::SharedAssets,
     pub(crate) runtime_id: u64,
     pub(super) data: ProjectData,
     path: Option<PathBuf>,
@@ -261,7 +264,7 @@ impl ProjectSession {
             calculation: CalculationSummary::default(),
             calculation_generation: 0,
         };
-        project.data.version = 3;
+        project.data.version = 4;
         project.data.rows.clear();
         if !dirty {
             project.saved_signature = project.signature()?;
@@ -317,6 +320,7 @@ impl ProjectSession {
             s.calculation_revision.hash(&mut hash);
         }
         Ok(ProjectSummary {
+            markdown: self.data.markdown.clone(),
             functions: self.data.functions.clone(),
             calculation: CalculationSummary {
                 enabled: self.calculation.enabled,
@@ -470,7 +474,7 @@ pub async fn project_new(
     .await
     .map_err(|e| e.to_string())?
 }
-fn project_new_internal(
+pub(super) fn project_new_internal(
     state: &WorkspaceState,
     name: String,
     source_document_id: Option<u64>,
@@ -480,6 +484,7 @@ fn project_new_internal(
         .transpose()?;
     let mut project = ProjectSession::from_data(
         ProjectData {
+            markdown: Vec::new(),
             assets: Default::default(),
             functions: FunctionsData::default(),
             version: 1,
@@ -903,7 +908,7 @@ fn recent_path(app: &AppHandle) -> Result<PathBuf, String> {
         .join("recents.json"))
 }
 static RECENTS_LOCK: Mutex<()> = Mutex::new(());
-pub(super) fn remember(app: &AppHandle, path: &str, kind: &str) {
+pub(crate) fn remember(app: &AppHandle, path: &str, kind: &str) {
     let result = (|| -> Result<(), String> {
         let _lock = RECENTS_LOCK.lock().map_err(|e| e.to_string())?;
         let file = recent_path(app)?;
@@ -1009,7 +1014,7 @@ pub(super) fn write_recovery(app: &AppHandle, state: &WorkspaceState) -> Result<
         write_bytes_atomic(
             &path,
             &serde_json::to_vec(&RecoveryProjects {
-                version: 3,
+                version: 4,
                 projects,
             })
             .map_err(|e| e.to_string())?,
@@ -1073,7 +1078,7 @@ pub(super) fn read_recovery(app: &AppHandle) -> Result<Vec<RecoveryProject>, Str
         return Ok(Vec::new());
     }
     let mut payload: RecoveryProjects = read_json(&path)?;
-    if !matches!(payload.version, 1..=3) {
+    if !matches!(payload.version, 1..=4) {
         return Err("Unsupported project recovery version".into());
     }
     for p in &mut payload.projects {
@@ -1100,8 +1105,97 @@ pub(super) fn restore_projects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn markdown_round_trip_and_document_only_changes_are_persistent() {
+        let mut data = fixture();
+        data.version = 4;
+        data.markdown
+            .push(super::super::markdown::MarkdownDocument {
+                id: "notes-fixture".into(),
+                name: "Notes.md".into(),
+                content: "# Café\n\n- [x] Done\n".into(),
+                revision: 1,
+                path: None,
+                dirty: true,
+                images: Default::default(),
+            });
+        let path = std::env::temp_dir().join(format!("{}.tablune", persistent_id()));
+        archive::write(&path, &data).unwrap();
+        let read = archive::read(&path).unwrap();
+        assert_eq!(read.version, 4);
+        assert_eq!(read.markdown[0].content, data.markdown[0].content);
+        let mut p = ProjectSession::from_data(read, Some(path.clone()), false).unwrap();
+        assert!(!p.summary().unwrap().dirty);
+        p.data.markdown[0].content.push_str("Edited");
+        p.data.markdown[0].revision += 1;
+        assert!(p.summary().unwrap().dirty);
+        p.save_to(path.clone()).unwrap();
+        assert!(!p.summary().unwrap().dirty);
+        assert!(
+            archive::read(&path).unwrap().markdown[0]
+                .content
+                .ends_with("Edited")
+        );
+        let snapshot = p.snapshot_with(
+            &p.tables
+                .iter()
+                .map(lock_document)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        let recovered: ProjectData = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(recovered.markdown[0].content, p.data.markdown[0].content);
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn markdown_images_are_embedded_and_survive_deleting_the_original_file() {
+        let directory = std::env::temp_dir().join(persistent_id());
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("original.png");
+        let (_, fixture_asset) = crate::images::fixture();
+        fs::write(&source, fixture_asset.bytes.as_ref()).unwrap();
+        let original_bytes = fs::read(&source).unwrap();
+        let (asset_id, asset) = crate::images::from_bytes(original_bytes.clone()).unwrap();
+        let reference = format!("tablune-asset:{asset_id}");
+        let mut data = fixture();
+        data.version = 4;
+        // Only the Markdown document references this image; there are no cells.
+        data.tables.clear();
+        data.rows.clear();
+        data.scripts.clear();
+        data.assets.insert(asset_id.clone(), asset);
+        data.markdown
+            .push(super::super::markdown::MarkdownDocument {
+                id: "illustrated-document".into(),
+                name: "Notes.md".into(),
+                content: format!("# Notes\n\n![Description]({reference})\n"),
+                revision: 1,
+                path: None,
+                dirty: true,
+                images: std::collections::BTreeMap::from([(reference.clone(), asset_id.clone())]),
+            });
+        let mut project = ProjectSession::from_data(data, None, true).unwrap();
+        let path = directory.join("portable.tablune");
+        project.save_to(path.clone()).unwrap();
+        drop(project);
+        fs::remove_file(&source).unwrap();
+        let reopened = archive::read(&path).unwrap();
+        assert_eq!(reopened.assets[&asset_id].bytes.as_ref(), &original_bytes);
+        assert_eq!(reopened.markdown[0].images[&reference], asset_id);
+        let restored = ProjectSession::from_data(reopened, Some(path), false).unwrap();
+        assert!(!restored.summary().unwrap().dirty);
+        assert_eq!(
+            restored.image_assets.lock().unwrap()[&asset_id]
+                .bytes
+                .as_ref(),
+            &original_bytes
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
     fn fixture() -> ProjectData {
         ProjectData {
+            markdown: Vec::new(),
             assets: Default::default(),
             functions: FunctionsData::default(),
             version: 1,
@@ -1168,7 +1262,7 @@ mod tests {
         let path = temporary_path();
         p.save_to(path.clone()).unwrap();
         let data = archive::read(&path).unwrap();
-        assert_eq!(data.version, 3);
+        assert_eq!(data.version, 4);
         assert_eq!(data.assets.len(), 1);
         let mut restored = ProjectSession::from_data(data, None, true).unwrap();
         {
@@ -1655,7 +1749,7 @@ mod tests {
         let path = temporary_path();
         p.save_to(path.clone()).unwrap();
         let data = archive::read(&path).unwrap();
-        assert_eq!(data.version, 3);
+        assert_eq!(data.version, 4);
         assert_eq!(data.functions.draft, p.data.functions.draft);
         assert_eq!(data.functions.applied, p.data.functions.applied);
         let restored = ProjectSession::from_data(data, Some(path.clone()), false).unwrap();
@@ -1693,7 +1787,7 @@ mod tests {
         zip.finish().unwrap();
         let p = ProjectSession::from_data(archive::read(&path).unwrap(), Some(path.clone()), false)
             .unwrap();
-        assert_eq!(p.data.version, 3);
+        assert_eq!(p.data.version, 4);
         let s = lock_document(&p.tables[0]).unwrap();
         assert!(!s.cell_info(1, 0).formula);
         assert_eq!(s.cell_value(1, 0), "=danger()");

@@ -363,6 +363,19 @@ describe("App multidocument tabs", () => {
     expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["second.csv", "first.csv"]);
   });
 
+  it("leaves sidebar Python shortcuts to the editor without undoing or closing the table", async () => {
+    render(<><div className="sidebar-editor"><textarea aria-label="Sidebar Python" /></div><App /></>);
+    await screen.findByRole("tab", { name: "first.csv" });
+    const editor = screen.getByRole("textbox", { name: "Sidebar Python" });
+    for (const key of ["z", "y", "f", "w", "t", "Tab"]) {
+      fireEvent.keyDown(editor, { key, ctrlKey: true });
+    }
+    expect(undoSession).not.toHaveBeenCalled();
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(newSession).not.toHaveBeenCalled();
+    expect(screen.getByTestId("grid").getAttribute("data-document-id")).toBe("1");
+  });
+
   it("cycles tabs with Ctrl+Tab and creates with the platform shortcut", async () => {
     vi.mocked(getWorkspaceSummary).mockResolvedValue({
       documents: [summary(1, "first.csv"), summary(2, "second.csv")],

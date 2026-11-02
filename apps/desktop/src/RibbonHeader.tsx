@@ -8,7 +8,7 @@ import {
 } from "react";
 import type { ThemeMode } from "./theme";
 
-type MenuSection = "file" | "edit" | "data" | "view";
+type MenuSection = "file" | "edit" | "data" | "formulas" | "view";
 
 const PIN_STORAGE_KEY = "tablune.ribbonPinned";
 const CLOSE_DELAY_MS = 180;
@@ -17,10 +17,23 @@ const MENUS: Array<{ id: MenuSection; label: string }> = [
   { id: "file", label: "File" },
   { id: "edit", label: "Edit" },
   { id: "data", label: "Data" },
+  { id: "formulas", label: "Fórmulas" },
   { id: "view", label: "View" },
 ];
 
 export interface RibbonHeaderProps {
+  formulas?: {
+    enabled: boolean;
+    running: boolean;
+    status: string;
+    autoSumAvailable: boolean;
+    onAutoSum: () => void;
+    onInsert: () => void;
+    onProject: () => void;
+    onEnable: () => void;
+    onRecalculate: () => void;
+    onCancel: () => void;
+  };
   zoom?: number;
   onZoomChange?: (zoom: number) => void;
   navigation?: ReactNode;
@@ -84,6 +97,7 @@ function writePinnedPreference(pinned: boolean): void {
 }
 
 export default function RibbonHeader({
+  formulas,
   zoom = 1,
   onZoomChange,
   navigation,
@@ -229,9 +243,10 @@ export default function RibbonHeader({
       <header className="compact-header">
         <nav className="header-menus" aria-label="Application sections">
           {navigation}
-          {MENUS.filter((menu) => tableAvailable || menu.id === "file" || menu.id === "view").map((menu) => (
+          {MENUS.filter((menu) => (menu.id !== "formulas" || !!formulas) && (tableAvailable || menu.id === "file" || menu.id === "view")).map((menu) => (
             <button
               key={menu.id}
+              data-formula-tools={menu.id === "formulas" ? "" : undefined}
               className={`header-menu${activeMenu === menu.id ? " active" : ""}`}
               aria-controls="ribbon-panel"
               aria-expanded={ribbonOpen && activeMenu === menu.id}
@@ -367,6 +382,17 @@ export default function RibbonHeader({
                 <button onClick={onPythonMacro} disabled={busy || mutationsLocked}>Python Macro</button>
               </div>
             )}
+
+            {activeMenu === "formulas" && formulas && <div className="ribbon-group" data-formula-tools aria-label="Opciones de fórmulas">
+              <button disabled={busy || mutationsLocked || !formulas.autoSumAvailable} title={formulas.autoSumAvailable ? "Proponer una suma de las celdas seleccionadas" : "Autosuma requiere una selección de celdas y una vista sin filtros ni ordenación"} onClick={formulas.onAutoSum}>Σ Autosuma</button>
+              <button disabled={busy || mutationsLocked} onClick={formulas.onInsert}>ƒx Insertar función</button>
+              <button disabled={busy || mutationsLocked} onClick={formulas.onProject}>Funciones del proyecto</button>
+              <span className="ribbon-divider" aria-hidden="true" />
+              {!formulas.enabled ? <button disabled={busy || mutationsLocked} onClick={formulas.onEnable}>Activar Python</button>
+                : formulas.running ? <button onClick={formulas.onCancel}>Cancelar cálculo</button>
+                : <button disabled={busy || mutationsLocked} onClick={formulas.onRecalculate}>Recalcular</button>}
+              <span className="formula-calculation-status" role="status">{formulas.status}</span>
+            </div>}
 
             {activeMenu === "view" && (
               <div className="ribbon-group" aria-label="View actions">

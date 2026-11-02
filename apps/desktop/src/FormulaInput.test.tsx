@@ -16,13 +16,17 @@ it("lists applied functions, filters them, and accepts a mouse selection without
   const bar = screen.getByRole("combobox") as HTMLInputElement;
   fireEvent.focus(bar);
   fireEvent.change(bar, { target: { value: "=" } });
+  expect(screen.getAllByRole("option")).toHaveLength(13);
+  fireEvent.change(bar, { target: { value: "=suma" } });
   expect(screen.getAllByRole("option")).toHaveLength(2);
-  fireEvent.change(bar, { target: { value: "=su" } });
+  fireEvent.change(bar, { target: { value: "=suma_" } });
+  expect(screen.queryByRole("listbox")).toBeNull();
+  fireEvent.change(bar, { target: { value: "=precio" } });
   expect(screen.getAllByRole("option")).toHaveLength(1);
   fireEvent.mouseDown(screen.getByRole("option"));
   fireEvent.click(screen.getByRole("option"));
-  expect(bar.value).toBe("=suma()");
-  await waitFor(() => expect(bar.selectionStart).toBe(6));
+  expect(bar.value).toBe("=precio_final()");
+  await waitFor(() => expect(bar.selectionStart).toBe(14));
   expect(screen.queryByRole("listbox")).toBeNull();
 });
 it("handles arrows and Enter before committing, and Escape dismisses suggestions", () => {
@@ -33,7 +37,7 @@ it("handles arrows and Enter before committing, and Escape dismisses suggestions
   fireEvent.change(bar, { target: { value: "=" } });
   fireEvent.keyDown(bar, { key: "ArrowDown" });
   fireEvent.keyDown(bar, { key: "Enter" });
-  expect(bar.value).toBe("=suma()");
+  expect(bar.value).toBe("=min()");
   expect(commit).not.toHaveBeenCalled();
   fireEvent.keyDown(bar, { key: "Enter" });
   expect(commit).toHaveBeenCalledOnce();
@@ -49,9 +53,19 @@ it("updates after application and hides nonmatching suggestions", () => {
   const bar = screen.getByRole("combobox");
   fireEvent.focus(bar);
   fireEvent.change(bar, { target: { value: "=" } });
-  expect(screen.queryByRole("listbox")).toBeNull();
+  expect(screen.getAllByRole("option")).toHaveLength(11);
   view.rerender(<Harness appliedCode={code} />);
-  expect(screen.getAllByRole("option")).toHaveLength(2);
+  expect(screen.getAllByRole("option")).toHaveLength(13);
   fireEvent.change(bar, { target: { value: "=missing" } });
   expect(screen.queryByRole("listbox")).toBeNull();
+});
+it("accepts Spanish labels with accents and completes the Python name with Tab", async () => {
+  render(<Harness appliedCode="" />);
+  const bar = screen.getByRole("combobox") as HTMLInputElement;
+  fireEvent.focus(bar);
+  fireEvent.change(bar, { target: { value: "=mínimo" } });
+  expect(screen.getAllByRole("option")).toHaveLength(1);
+  fireEvent.keyDown(bar, { key: "Tab" });
+  expect(bar.value).toBe("=min()");
+  await waitFor(() => expect(bar.selectionStart).toBe(5));
 });

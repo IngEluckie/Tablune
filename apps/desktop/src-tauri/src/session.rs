@@ -1,5 +1,7 @@
 #[path = "calculation.rs"]
 pub mod calculation;
+#[path = "markdown.rs"]
+pub mod markdown;
 #[path = "projects.rs"]
 pub mod projects;
 #[path = "sheet_session.rs"]
@@ -362,6 +364,7 @@ enum StoredRecoveryPayload {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceSummary {
+    pub markdown: Vec<markdown::MarkdownDocument>,
     pub projects: Vec<projects::ProjectSummary>,
     pub documents: Vec<DocumentSummary>,
 }
@@ -1615,6 +1618,7 @@ impl DocumentSession {
 pub(crate) type DocumentHandle = Arc<Mutex<DocumentSession>>;
 
 pub struct WorkspaceState {
+    markdown: Mutex<Vec<markdown::MarkdownSession>>,
     projects: Mutex<Vec<Arc<projects::ProjectHandle>>>,
     documents: Mutex<Vec<DocumentHandle>>,
     last_recovery: Mutex<Option<RecoveryFingerprint>>,
@@ -1624,6 +1628,7 @@ impl Default for WorkspaceState {
     fn default() -> Self {
         Self {
             documents: Mutex::new(Vec::new()),
+            markdown: Mutex::new(Vec::new()),
             projects: Mutex::new(Vec::new()),
             last_recovery: Mutex::new(None),
         }
@@ -1667,6 +1672,7 @@ fn workspace_summary_value(state: &WorkspaceState) -> Result<WorkspaceSummary, S
         .map(|handle| Ok(lock_document(handle)?.summary()))
         .collect::<Result<Vec<_>, String>>()?;
     Ok(WorkspaceSummary {
+        markdown: markdown::summaries(state)?,
         documents,
         projects: projects::summaries(state)?,
     })
@@ -1946,6 +1952,7 @@ fn ensure_path_available(
     document_id: u64,
 ) -> Result<(), String> {
     projects::ensure_not_project_path(state, path)?;
+    markdown::ensure_unclaimed(state, path)?;
     if find_document_by_path(state, path, Some(document_id))?.is_some() {
         Err("another open document already uses that path".to_string())
     } else {
@@ -2054,6 +2061,7 @@ pub fn session_open(
 ) -> Result<DocumentSummary, String> {
     let path_buf = PathBuf::from(&path);
     projects::ensure_not_project_path(&state, &path_buf)?;
+    markdown::ensure_unclaimed(&state, &path_buf)?;
     if let Some(handle) = find_document_by_path(&state, &path_buf, None)? {
         projects::remember(&app, &path, "csv");
         return Ok(lock_document(&handle)?.summary());
@@ -2438,7 +2446,8 @@ pub async fn workspace_write_recovery(app: AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<WorkspaceState>();
         write_workspace_recovery_internal(&app, &state, None)?;
-        projects::write_recovery(&app, &state)
+        projects::write_recovery(&app, &state)?;
+        markdown::write_recovery(&app, &state)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2446,7 +2455,9 @@ pub async fn workspace_write_recovery(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn workspace_recovery_available(app: AppHandle) -> Result<bool, String> {
-    Ok(recovery_path(&app)?.exists() || projects::recovery_path(&app)?.exists())
+    Ok(recovery_path(&app)?.exists()
+        || projects::recovery_path(&app)?.exists()
+        || markdown::recovery_path(&app)?.exists())
 }
 
 #[tauri::command]
@@ -2455,6 +2466,7 @@ pub fn workspace_restore_recovery(
     state: State<'_, WorkspaceState>,
 ) -> Result<WorkspaceSummary, String> {
     let restored_projects = projects::read_recovery(&app)?;
+    markdown::restore_recovery(&app, &state)?;
     if !recovery_path(&app)?.exists() {
         projects::restore_projects(&state, restored_projects)?;
         return workspace_summary_value(&state);
@@ -2488,6 +2500,7 @@ pub fn workspace_discard_recovery(
         .lock()
         .map_err(|_| "Recovery writer unavailable")?;
     projects::discard_recovery(&app)?;
+    markdown::discard_recovery(&app)?;
     remove_if_exists(&recovery_path(&app)?).map_err(|error| error.to_string())?;
     reset_recovery_fingerprint(&state)
 }
@@ -2959,6 +2972,7 @@ mod tests {
     #[test]
     fn workspace_documents_keep_independent_history_and_views() {
         let workspace = WorkspaceState {
+            markdown: Mutex::new(Vec::new()),
             documents: Mutex::new(Vec::new()),
             projects: Mutex::new(Vec::new()),
             last_recovery: Mutex::new(None),
@@ -3039,6 +3053,7 @@ mod tests {
     #[test]
     fn workspace_reorder_requires_the_exact_open_document_set() {
         let workspace = WorkspaceState {
+            markdown: Mutex::new(Vec::new()),
             documents: Mutex::new(Vec::new()),
             projects: Mutex::new(Vec::new()),
             last_recovery: Mutex::new(None),
@@ -3090,6 +3105,7 @@ mod tests {
         };
         let document_id = session.identity;
         let workspace = WorkspaceState {
+            markdown: Mutex::new(Vec::new()),
             documents: Mutex::new(vec![Arc::new(Mutex::new(session))]),
             projects: Mutex::new(Vec::new()),
             last_recovery: Mutex::new(None),
@@ -3142,6 +3158,7 @@ mod tests {
             )
             .unwrap();
         let state = WorkspaceState {
+            markdown: Mutex::new(Vec::new()),
             documents: Mutex::new(vec![
                 Arc::new(Mutex::new(clean)),
                 Arc::new(Mutex::new(dirty)),
@@ -3182,6 +3199,7 @@ mod tests {
             .unwrap();
         let handle = Arc::new(Mutex::new(dirty));
         let state = WorkspaceState {
+            markdown: Mutex::new(Vec::new()),
             documents: Mutex::new(vec![handle.clone()]),
             projects: Mutex::new(Vec::new()),
             last_recovery: Mutex::new(None),

@@ -1,3 +1,4 @@
+import { flushMarkdownEditors } from "./markdownPending";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -5,6 +6,8 @@ import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import * as ipc from "./ipc";
 import { flushCellEdits } from "./CsvGrid";
 import type {
+  MarkdownDocument,
+  MarkdownAction,
   DocumentSummary,
   ProjectAction,
   ProjectSummary,
@@ -13,8 +16,8 @@ import type {
   WorkspaceSummary,
 } from "./types";
 
-export type Space = "home" | "csv" | number;
-export type ProjectTab = { kind: "table" | "script" | "functions"; id: string };
+export type Space = "home" | "csv" | "markdown" | number;
+export type ProjectTab = { kind: "table" | "script" | "functions" | "markdown"; id: string };
 export type ScriptDraft = Pick<ScriptSummary, "name" | "code" | "inputTableId">;
 const basename = (path: string) => path.split(/[\\/]/).at(-1) ?? path;
 export function useWorkspace() {
@@ -26,10 +29,18 @@ export function useWorkspace() {
   workspaceRef.current = workspace;
   const [space, setSpace] = useState<Space>("home");
   const [selectedCsv, setSelectedCsv] = useState(0);
+  const [selectedMarkdown, setSelectedMarkdown] = useState<string | null>(null);
+  const [markdownDrafts, setMarkdownDrafts] = useState<Record<string, string>>({});
+  const markdownDraftsRef = useRef(markdownDrafts);
+  const editMarkdown = (projectId: number | null, id: string, content: string) => {
+    const next = { ...markdownDraftsRef.current, [`${projectId ?? "file"}:${id}`]: content };
+    markdownDraftsRef.current = next; setMarkdownDrafts(next);
+  };
   const [tabs, setTabs] = useState<Record<number, ProjectTab[]>>({});
   const [selected, setSelected] = useState<Record<number, ProjectTab | null>>(
     {},
   );
+  const [pythonEditors, setPythonEditors] = useState<Record<number, ProjectTab | null>>({});
   const [recents, setRecents] = useState<RecentFile[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -97,6 +108,11 @@ export function useWorkspace() {
     }
   };
   const openTab = useCallback((projectId: number, tab: ProjectTab) => {
+    if (tab.kind === "script" || tab.kind === "functions") {
+      setPythonEditors((current) => ({ ...current, [projectId]: tab }));
+      setSpace(projectId);
+      return;
+    }
     setTabs((current) => ({
       ...current,
       [projectId]: (current[projectId] ?? []).some(
@@ -108,7 +124,18 @@ export function useWorkspace() {
     setSelected((current) => ({ ...current, [projectId]: tab }));
     setSpace(projectId);
   }, []);
+  const closePythonEditor = (projectId: number) => {
+    setPythonEditors((current) => ({ ...current, [projectId]: null }));
+  };
   const closeTab = (projectId: number, tab: ProjectTab) => {
+    if (tab.kind === "script" || tab.kind === "functions") {
+      setPythonEditors((current) => ({
+        ...current,
+        [projectId]: current[projectId]?.kind === tab.kind && current[projectId]?.id === tab.id
+          ? null : current[projectId],
+      }));
+      return;
+    }
     const remaining = (tabs[projectId] ?? []).filter(
       (t) => t.id !== tab.id || t.kind !== tab.kind,
     );
@@ -132,11 +159,29 @@ export function useWorkspace() {
     },
     [],
   );
+  const updateMarkdown = useCallback((projectId: number | null, doc: MarkdownDocument) => {
+    const current = workspaceRef.current;
+    const merge = (docs: MarkdownDocument[] = []) => docs.some(d => d.id === doc.id) ? docs.map(d => d.id === doc.id ? doc : d) : [...docs, doc];
+    if (projectId === null) commit({ ...current, markdown: merge(current.markdown) });
+    else commit({ ...current, projects: current.projects?.map(p => p.projectId === projectId ? { ...p, markdown: merge(p.markdown), dirty: true, revision: `markdown-${doc.id}-${doc.revision}` } : p) });
+  }, [commit]);
   const flushDrafts = useCallback((): Promise<void> => {
     const run = flushChain.current
       .catch(() => {})
       .then(async () => {
         await flushCellEdits();
+        await flushMarkdownEditors();
+        for (const [key, content] of Object.entries(markdownDraftsRef.current)) {
+          const [owner, id] = key.split(":");
+          const projectId = owner === "file" ? null : Number(owner);
+          const docs = projectId === null ? workspaceRef.current.markdown : workspaceRef.current.projects?.find(p => p.projectId === projectId)?.markdown;
+          const doc = docs?.find(d => d.id === id);
+          if (!doc) continue;
+          if (content !== doc.content) updateMarkdown(projectId, await ipc.markdownAction(projectId, id, { kind: "update", content, expectedRevision: doc.revision }));
+          if (markdownDraftsRef.current[key] === content) {
+            const next = { ...markdownDraftsRef.current }; delete next[key]; markdownDraftsRef.current = next; setMarkdownDrafts(next);
+          }
+        }
         for (const [id, code] of Object.entries(functionDraftsRef.current)) {
           const project = workspaceRef.current.projects?.find(
             (p) => p.projectId === Number(id),
@@ -183,7 +228,46 @@ export function useWorkspace() {
       });
     flushChain.current = run;
     return run;
-  }, [updateProject]);
+  }, [updateProject, updateMarkdown]);
+  const actMarkdown = async (projectId: number | null, id: string | null, action: MarkdownAction) => {
+    await flushDrafts();
+    const doc = await ipc.markdownAction(projectId, id, action);
+    await refresh();
+    await refreshRecents();
+    return doc;
+  };
+  const newMarkdown = async (projectId: number | null = null) => {
+    const doc = await actMarkdown(projectId, null, { kind: "new", name: "Untitled.md" });
+    if (projectId === null) { setSelectedMarkdown(doc.id); setSpace("markdown"); }
+    else openTab(projectId, { kind: "markdown", id: doc.id });
+  };
+  const saveMarkdown = async (id: string, saveAs = false, projectId: number | null = null): Promise<boolean> => {
+    await flushDrafts();
+    const doc = (projectId === null ? workspaceRef.current.markdown : workspaceRef.current.projects?.find(p => p.projectId === projectId)?.markdown)?.find(d => d.id === id);
+    if (!doc) return false;
+    let path = !saveAs && projectId === null ? doc.path : null;
+    path ??= await save({ defaultPath: doc.name, filters: [{ name: "Markdown", extensions: ["md", "markdown"] }] });
+    if (!path) return false;
+    if (!/\.(md|markdown)$/i.test(path)) path += ".md";
+    await actMarkdown(projectId, id, { kind: "save", path });
+    await ipc.writeWorkspaceRecovery();
+    return true;
+  };
+  const closeMarkdown = async (id: string) => {
+    await flushDrafts();
+    const doc = workspaceRef.current.markdown?.find(d => d.id === id);
+    if (!doc) return;
+    if (doc.dirty) {
+      if (await ask(`Save changes to ${doc.name} before closing?`, { title: "Close document", kind: "info" })) {
+        if (!(await saveMarkdown(id))) return;
+      } else if (!(await ask(`Discard changes to ${doc.name}?`, { title: "Discard changes", kind: "warning" }))) return;
+    }
+    await actMarkdown(null, id, { kind: "delete", discard: true });
+    await ipc.writeWorkspaceRecovery();
+    const remaining = workspaceRef.current.markdown ?? [];
+    if (selectedMarkdown === id) setSelectedMarkdown(remaining.at(-1)?.id ?? null);
+    if (!remaining.length) setSpace("home");
+  };
   const perform = async (projectId: number, action: ProjectAction) => {
     await flushDrafts();
     const next = await ipc.projectAction(projectId, action);
@@ -240,12 +324,16 @@ export function useWorkspace() {
     setSpace("csv");
   };
   const openPath = async (path: string) => {
-    if (path.toLowerCase().endsWith(".tablune")) {
+    if (/\.(md|markdown)$/i.test(path)) {
+      const doc = await actMarkdown(null, null, { kind: "open", path });
+      setSelectedMarkdown(doc.id); setSpace("markdown");
+    } else if (path.toLowerCase().endsWith(".tablune")) {
       const p = await ipc.openProject(path);
       updateProject(p);
       setSpace(p.projectId);
       if (!selected[p.projectId] && p.tables[0])
         openTab(p.projectId, { kind: "table", id: p.tables[0].id });
+      else if (!selected[p.projectId] && p.markdown?.[0]) openTab(p.projectId, { kind: "markdown", id: p.markdown[0].id });
     } else {
       let d = await ipc.openSession(path);
       if (
@@ -277,7 +365,7 @@ export function useWorkspace() {
       filters: [
         {
           name: "Data files and projects",
-          extensions: ["csv", "tsv", "txt", "tablune"],
+          extensions: ["csv", "tsv", "txt", "md", "markdown", "tablune"],
         },
       ],
     });
@@ -310,6 +398,11 @@ export function useWorkspace() {
         return next;
       });
       setSelected((current) => {
+        const next = { ...current };
+        delete next[request];
+        return next;
+      });
+      setPythonEditors((current) => {
         const next = { ...current };
         delete next[request];
         return next;
@@ -347,7 +440,7 @@ export function useWorkspace() {
     const current = await refresh();
     const dirty =
       request === "app"
-        ? current.documents.some((d) => d.dirty) ||
+        ? current.documents.some((d) => d.dirty) || current.markdown?.some(d => d.dirty) ||
           current.projects?.some((p) => p.dirty)
         : current.projects?.find((p) => p.projectId === request)?.dirty;
     if (dirty) setCloseRequest(request);
@@ -358,6 +451,7 @@ export function useWorkspace() {
     if (request === null) return;
     await flushDrafts();
     if (request === "app") {
+      for (const d of workspaceRef.current.markdown?.filter(d => d.dirty) ?? []) if (!(await saveMarkdown(d.id))) return;
       for (const d of workspaceRef.current.documents.filter((d) => d.dirty)) {
         const path =
           d.path ??
@@ -408,6 +502,9 @@ export function useWorkspace() {
           setSpace(p.projectId);
           if (p.tables[0])
             openTab(p.projectId, { kind: "table", id: p.tables[0].id });
+          else if (p.markdown?.[0]) openTab(p.projectId, { kind: "markdown", id: p.markdown[0].id });
+        } else if (next.markdown?.length) {
+          setSpace("markdown"); setSelectedMarkdown(next.markdown[0].id);
         } else if (next.documents.length) {
           setSpace("csv");
           setSelectedCsv(next.documents[0].documentId);
@@ -463,7 +560,7 @@ export function useWorkspace() {
   }, [report]);
   // Debounced durable drafts, including projects with no table edits.
   useEffect(() => {
-    if (!Object.keys(drafts).length && !Object.keys(functionDrafts).length)
+    if (!Object.keys(markdownDrafts).length && !Object.keys(drafts).length && !Object.keys(functionDrafts).length)
       return;
     const timer = window.setTimeout(() => {
       if (closingRef.current) return;
@@ -472,8 +569,9 @@ export function useWorkspace() {
         .catch(report);
     }, 400);
     return () => window.clearTimeout(timer);
-  }, [drafts, functionDrafts, flushDrafts, report]);
+  }, [drafts, functionDrafts, markdownDrafts, flushDrafts, report]);
   const recoveryKey = JSON.stringify([
+    workspace.markdown?.map(d => [d.id, d.revision, d.dirty]),
     workspace.documents.map((d) => [d.documentId, d.revision, d.dirty]),
     workspace.projects?.map((p) => [p.projectId, p.revision, p.dirty]),
   ]);
@@ -558,6 +656,7 @@ export function useWorkspace() {
     updateProject(await ipc.enableCalculation(id));
   };
   return {
+    selectedMarkdown, setSelectedMarkdown, markdownDrafts, editMarkdown, actMarkdown, newMarkdown, saveMarkdown, closeMarkdown,
     functionDrafts,
     editFunctions,
     enableProjectCalculation,
@@ -572,6 +671,8 @@ export function useWorkspace() {
     setSelectedCsv,
     tabs,
     selected,
+    pythonEditors,
+    closePythonEditor,
     openTab,
     closeTab,
     recents,

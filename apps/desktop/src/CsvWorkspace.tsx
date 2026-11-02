@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CsvGrid, { normalizeSelection } from "./CsvGrid";
 import DocumentTabs from "./DocumentTabs";
 import ExplorerPanel from "./ExplorerPanel";
+import FormulaPanel, { type FormulaPanelTab } from "./FormulaPanel";
 import PythonMacroPanel from "./PythonMacroDialog";
 import SearchBar from "./SearchBar";
 import RibbonHeader, { type RibbonHeaderProps } from "./RibbonHeader";
@@ -116,6 +117,10 @@ function shortPath(path: string): string {
 }
 
 export interface CsvWorkspaceProps {
+  formulaControls?: Pick<NonNullable<RibbonHeaderProps["formulas"]>, "enabled" | "running" | "status" | "onEnable" | "onRecalculate" | "onCancel"> & {
+    draftCode: string;
+    onManage: (create: boolean) => void;
+  };
   onCreateImageProject?: (row: number, column: number) => Promise<void>;
   managed?: boolean;
   appliedFunctions?: string;
@@ -152,6 +157,8 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
   const [error, setError] = useState<string | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [explorerOpen, setExplorerOpen] = useState(false);
+  const [formulasOpen, setFormulasOpen] = useState(false);
+  const [formulaTab, setFormulaTab] = useState<FormulaPanelTab>("builtins");
   const [macroOpen, setMacroOpen] = useState(false);
   const [macroTrustAcknowledged, setMacroTrustAcknowledged] = useState(false);
   const [theme, setTheme] = useState<ThemeMode>(readThemePreference);
@@ -218,6 +225,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
       setActiveDocumentId(id);
       setSearchOpen(false);
       setExplorerOpen(false);
+      setFormulasOpen(false);
       setMacroOpen(false);
       setReveal(null);
     }
@@ -682,6 +690,8 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
   useEffect(() => {
     const handleShortcuts = (event: globalThis.KeyboardEvent) => {
       if (
+        event.defaultPrevented ||
+        (event.target instanceof Element && event.target.closest(".sidebar-editor, .formula-panel, .autosum-proposal")) ||
         propsRef.current.active === false ||
         macroOpen ||
         unsavedRequest ||
@@ -847,11 +857,11 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
     }
   };
 
-  const runGridCommand = (command: "copy" | "cut" | "paste" | "insertImage") => {
+  const runGridCommand = (command: "copy" | "cut" | "paste" | "insertImage" | "autoSum" | "insertFunction", functionName?: string) => {
     if (macroOpen && command !== "copy") return;
     document.dispatchEvent(
       new CustomEvent("tablune-grid-command", {
-        detail: { command, documentId: summary.documentId },
+        detail: { command, documentId: summary.documentId, functionName },
       }),
     );
   };
@@ -922,6 +932,13 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
 
   const ribbon = <RibbonHeader
         {...props.ribbonControls}
+        formulas={props.formulaControls && summary.projectId != null ? {
+          ...props.formulaControls,
+          autoSumAvailable: !summary.filtersActive && summary.sortCount === 0 && tabUi.selection.mode === "cells",
+          onAutoSum: () => runGridCommand("autoSum"),
+          onInsert: () => { setFormulaTab("builtins"); setFormulasOpen(true); setExplorerOpen(false); },
+          onProject: () => { setFormulaTab("project"); setFormulasOpen(true); setExplorerOpen(false); },
+        } : undefined}
         documentName={summary.displayName}
         dirty={summary.dirty}
         busy={busy || props.active === false}
@@ -965,7 +982,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
             .catch((reason) => setError(String(reason)));
         }}
         onToggleExplorer={() => {
-          if (!macroOpen) setExplorerOpen((open) => !open);
+          if (!macroOpen) { setExplorerOpen((open) => !open); setFormulasOpen(false); }
         }}
         onClearView={() => void changeView(EMPTY_VIEW)}
         onResetCellSizing={() => clearSizing(summary.documentId, "both")}
@@ -1009,7 +1026,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
           />
         )}
         <div
-          className={`workspace${explorerOpen && !macroOpen ? " explorer-open" : ""}${macroOpen ? " macro-open" : ""}`}
+          className={`workspace${explorerOpen && !macroOpen ? " explorer-open" : ""}${formulasOpen && props.formulaControls && !macroOpen ? " formulas-open" : ""}${macroOpen ? " macro-open" : ""}`}
         >
           {summary.documentId !== 0 && (
             <CsvGrid
@@ -1066,6 +1083,16 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
               }}
             />
           )}
+          {formulasOpen && props.formulaControls && !macroOpen && summary.projectId != null && <FormulaPanel
+            appliedCode={props.appliedFunctions ?? ""}
+            draftCode={props.formulaControls.draftCode}
+            tab={formulaTab}
+            onTab={setFormulaTab}
+            disabled={interactionsLocked}
+            onInsert={name => runGridCommand("insertFunction", name)}
+            onManage={create => { props.formulaControls?.onManage(create); setFormulasOpen(false); }}
+            onClose={() => setFormulasOpen(false)}
+          />}
           {explorerOpen && !macroOpen && summary.documentId !== 0 && (
             <ExplorerPanel
               key={`explorer-${summary.documentId}`}

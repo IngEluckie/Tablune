@@ -63,7 +63,7 @@ Duplicating a saved document snapshots its current in-memory rows and dialect, w
 
 ## Project spaces
 
-`useWorkspace` owns Home navigation, open spaces, recent files, script drafts, and project lifecycle. `CsvWorkspace` supplies the shared table editing experience. Its targeted grid commands include a document ID so a command cannot reach another mounted workspace. Script editors remain mounted while navigating; drafts are flushed through a serialized queue before saving or running.
+`useWorkspace` owns Home navigation, open spaces, recent files, script drafts, and project lifecycle. Table tabs and the selected sidebar Python editor are tracked independently per project. `ProjectSidebar` switches between the navigator and Python editing while keeping the table workspace visible. `CsvWorkspace` supplies the shared table editing experience. Its targeted grid commands include a document ID so a command cannot reach another mounted workspace, and its global shortcuts ignore events from the sidebar editor. Script editors remain mounted while navigating; drafts are flushed through a serialized queue before saving or running.
 
 Rust stores project ownership above `DocumentSession`. Persistent IDs identify projects, tables, and scripts in the archive; runtime IDs identify open sessions, allowing separate copies of one project to remain independent. A table directory resolves project grid queries without acquiring another project's long-lived save lock. Project save locks its scripts and tables for a coherent snapshot. Parsing, compression, large project actions, and recovery writes run on blocking workers; the frontend disables only the project being saved.
 
@@ -84,3 +84,26 @@ Calculations and macros share an async mutex covering execution and publication.
 Format 2 stores raw rows plus sparse sheet metadata in each table entry, and keeps Functions draft/applied source separately. Recovery uses the same metadata and reads older formats. Loaded caches are marked pending; no runtime process or trust authorization survives reopening. Export and transformation snapshots materialize current results and check calculation revision when accepting previews.
 
 On macOS, grid clipboard reads/writes use small NSPasteboard IPC commands to avoid WebKit's additional paste authorization prompt. Clipboard generation still guards formula-aware copies; other platforms retain the browser clipboard fallback.
+
+## Markdown sessions
+
+`markdown.rs` owns standalone Markdown sessions and project-document commands.
+Standalone summaries are separate from tabular `DocumentSummary`; project
+documents live in `ProjectData.markdown`. Revision checks protect text edits.
+Images use the shared PNG/JPEG validation and SHA-256 storage. `pulldown-cmark`
+locates real image references for export, including reference-style images,
+without rewriting code examples. Export publishes assets before atomic text
+replacement. Canonical-path checks protect other open documents.
+
+`MarkdownEditor` loads lazily. Milkdown/ProseMirror handles visual editing and
+CodeMirror handles source. A standard Markdown image node view resolves bytes
+through IPC into object URLs, never navigates the WebView or fetches remote
+images. A bounded per-editor source history survives mode changes; cursor and
+scroll state survive workspace changes because editors remain mounted. Opening
+a visual editor never publishes its initial normalized serialization. Unsupported
+AST nodes fall back to source.
+
+`useWorkspace.flushDrafts` drains editor transactions and image uploads before
+revision-checked text updates, save or close. Standalone recovery is versioned
+separately; project recovery format 4 includes Markdown alongside existing data.
+Archive format 4 stores source in `documents/<id>.md` and still reads formats 1–3.

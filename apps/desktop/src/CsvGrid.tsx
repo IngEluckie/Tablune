@@ -4,6 +4,7 @@ import { importCellImage, copyImageAssets, pasteImageAssets } from "./ipc";
 import { useImageThumbnails } from "./imageThumbnails";
 import ImagePreview from "./ImagePreview";
 import FormulaInput from "./FormulaInput";
+import { cellAddress, parseCellAddress, proposeAutoSum, rangeContains, type AutoSumProposal } from "./autoSum";
 import {
   type KeyboardEvent,
   useCallback,
@@ -96,6 +97,7 @@ interface EditingCell {
   sourceRow: number;
   column: number;
   header: boolean;
+  mode: "entry" | "edit";
 }
 
 interface GridTarget extends CellCoordinate {
@@ -344,6 +346,22 @@ export default function CsvGrid({
     end: number;
   } | null>(null);
   const pendingEdit = useRef<Promise<void> | null>(null);
+  const [autoSum, setAutoSum] = useState<(AutoSumProposal & { revision: number }) | null>(null);
+  const [sumDestination, setSumDestination] = useState("");
+  const [sumError, setSumError] = useState<string | null>(null);
+  const [sumWorking, setSumWorking] = useState(false);
+  const formulaFocus = useRef<number | null>(null);
+  const formulaOperation = useRef(0);
+  const formulaContext = useRef({ readOnly, revision: summary.revision, viewRevision: summary.viewRevision });
+  formulaContext.current = { readOnly, revision: summary.revision, viewRevision: summary.viewRevision };
+  useEffect(() => () => { formulaOperation.current++; }, []);
+  useEffect(() => { setAutoSum(null); formulaOperation.current++; }, [summary.revision, summary.viewRevision, readOnly]);
+  useLayoutEffect(() => {
+    if (formulaFocus.current === null || !barEditing || !editing) return;
+    formulaBarRef.current?.focus();
+    formulaBarRef.current?.setSelectionRange(formulaFocus.current, formulaFocus.current);
+    formulaFocus.current = null;
+  }, [barEditing, editing, draft]);
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
@@ -397,6 +415,8 @@ export default function CsvGrid({
 
   const publishSelection = useCallback(
     (next: SelectionRange) => {
+      formulaOperation.current++;
+      setAutoSum(null);
       setSelection(next);
       onSelectionChange(next);
     },
@@ -934,6 +954,7 @@ export default function CsvGrid({
         sourceRow: 0,
         column: target.column,
         header: true,
+        mode: "edit",
       });
       return;
     }
@@ -957,6 +978,7 @@ export default function CsvGrid({
       sourceRow,
       column: target.column,
       header: false,
+      mode: "edit",
     });
   };
 
@@ -965,6 +987,7 @@ export default function CsvGrid({
     if (!target) return pendingEdit.current ?? Promise.resolve();
     // Enter and blur can commit the same editor before React renders again.
     editingRef.current = null;
+    const focusedAtCommit = document.activeElement;
     setEditing(null);
     setBarEditing(false);
     if (readOnly) return Promise.resolve();
@@ -982,6 +1005,8 @@ export default function CsvGrid({
       () => {
         if (pendingEdit.current === operation) pendingEdit.current = null;
         pendingCellEdits.delete(operation);
+        if (document.activeElement === focusedAtCommit || document.activeElement === document.body)
+          viewportRef.current?.focus({ preventScroll: true });
       },
       () => {
         if (pendingEdit.current === operation) pendingEdit.current = null;
@@ -1009,6 +1034,71 @@ export default function CsvGrid({
     return fetchGridSelectionMatrix(summary.documentId, range);
   };
 
+  const insertFunction = async (name: string) => {
+    if (!isSheet || readOnly || !/^[A-Za-z_][A-Za-z_0-9]*$/.test(name)) return;
+    const token = ++formulaOperation.current;
+    await pendingEdit.current;
+    const sourceRow = await sourceRowForView(selection.focus.row);
+    if (sourceRow === null) return;
+    const info = await getSheetCell(summary.documentId, sourceRow, selection.focus.column);
+    if (token !== formulaOperation.current || formulaContext.current.readOnly) return;
+    if (info.image) throw new Error("Selecciona una celda sin imagen para insertar la fórmula.");
+    setAutoSum(null);
+    setActiveInfo(info);
+    const input = barEditing ? formulaBarRef.current : cellEditorRef.current;
+    const base = editing && draft.startsWith("=") ? draft : "=";
+    const start = base === "=" ? 1 : input?.selectionStart ?? base.length;
+    const end = base === "=" ? 1 : input?.selectionEnd ?? start;
+    setDraft(base.slice(0, start) + `${name}()` + base.slice(end));
+    formulaFocus.current = start + name.length + 1;
+    setBarEditing(true);
+    setEditing({ viewRow: selection.focus.row, sourceRow, column: selection.focus.column, header: false, mode: "edit" });
+  };
+
+  const prepareAutoSum = async () => {
+    if (!isSheet || readOnly) return;
+    if (summary.filtersActive || summary.sortCount) throw new Error("Quita los filtros y la ordenación de la vista antes de usar Autosuma.");
+    // Commit an active editor before deriving a proposal from the data.
+    if (editing || pendingEdit.current) { await commitEdit(); throw new Error("La edición se guardó. Vuelve a pulsar Autosuma para usar los datos actualizados."); }
+    const token = ++formulaOperation.current;
+    setSumWorking(true); setSumError(null); setAutoSum(null);
+    try {
+      const blocks = new Map<string, Promise<GridWindow>>();
+      const proposal = await proposeAutoSum(selection, async cell => {
+        const row = Math.floor(cell.row / 100) * 100, column = Math.floor(cell.column / 20) * 20;
+        const key = `${row},${column}`;
+        if (!blocks.has(key)) blocks.set(key, getGridWindow(summary.documentId, row, 100, column, 20));
+        const block = await blocks.get(key)!;
+        const input = block.rows.find(r => r.sourceRow === cell.row)?.inputs?.[cell.column - block.columnStart];
+        return input ?? await getSheetCell(summary.documentId, cell.row, cell.column);
+      });
+      if (token !== formulaOperation.current || formulaContext.current.readOnly) return;
+      publishSelection({ anchor: { row: proposal.range.startRow, column: proposal.range.startColumn }, focus: { row: proposal.range.endRow, column: proposal.range.endColumn }, mode: "cells" });
+      setSumDestination(cellAddress(proposal.target));
+      setAutoSum({ ...proposal, revision: summary.revision });
+    } finally { setSumWorking(false); }
+  };
+
+  const confirmAutoSum = async () => {
+    if (!autoSum || readOnly || sumWorking) return;
+    const target = parseCellAddress(sumDestination);
+    if (!target) { setSumError("Escribe un destino válido, por ejemplo D1."); return; }
+    if (rangeContains(autoSum.range, target)) { setSumError("El destino debe quedar fuera del rango para evitar una referencia circular."); return; }
+    if (target.row > rowCount || target.column > columnCount) { setSumError("Elige una celda existente o contigua a la hoja, o añade filas o columnas antes de insertar."); return; }
+    const revision = autoSum.revision;
+    const token = ++formulaOperation.current;
+    setSumWorking(true); setSumError(null);
+    try {
+      const info = await getSheetCell(summary.documentId, target.row, target.column);
+      if (token !== formulaOperation.current || formulaContext.current.readOnly || formulaContext.current.revision !== revision) return;
+      if (info.source || info.image) { setSumError(`${cellAddress(target)} ya tiene contenido. Elige una celda vacía.`); return; }
+      await onApplyEdit({ kind: "setSheetCells", cells: [{ ...target, value: autoSum.formula }] }, { documentId: summary.documentId, revision });
+      setAutoSum(null);
+      publishSelection({ anchor: target, focus: target, mode: "cells" });
+    } catch (error) { setSumError(String(error)); }
+    finally { setSumWorking(false); }
+  };
+
   const insertImage = async () => {
     await commitEdit();
     if (!isSheet) {
@@ -1029,7 +1119,7 @@ export default function CsvGrid({
     if (!imagePreview) return;
     await onApplyEdit({ kind: "setSheetCells", cells: [{ row: imagePreview.row, column: imagePreview.column, value: image?.name ?? "", image, literal: true }] }, { documentId: summary.documentId, revision: previewRevision.current });
     setImagePreview(null);
-    viewportRef.current?.focus();
+    viewportRef.current?.focus({ preventScroll: true });
   };
   const copySelection = async () => {
     const { matrix, inputs } = await fetchSelectionMatrix();
@@ -1153,7 +1243,7 @@ export default function CsvGrid({
   useEffect(() => {
     const handleCommand = (event: Event) => {
       const detail = (
-        event as CustomEvent<string | { command: string; documentId: number }>
+        event as CustomEvent<string | { command: string; documentId: number; functionName?: string }>
       ).detail;
       if (
         typeof detail !== "string" &&
@@ -1163,7 +1253,7 @@ export default function CsvGrid({
       const command = typeof detail === "string" ? detail : detail.command;
       if (readOnly && command !== "copy") return;
       const operation =
-        command === "insertImage" ? insertImage : command === "copy"
+        command === "autoSum" ? prepareAutoSum : command === "insertFunction" ? () => insertFunction(typeof detail === "string" ? "" : detail.functionName ?? "") : command === "insertImage" ? insertImage : command === "copy"
           ? copySelection
           : command === "cut"
             ? cutSelection
@@ -1200,8 +1290,55 @@ export default function CsvGrid({
     }
   }, [columnMetrics, loadVisibleWindow, publishSelection, reveal, rowMetrics]);
 
+  const keepCellVisible = (cell: CellCoordinate) => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const visibleOffset = (
+      offset: number,
+      size: number,
+      scroll: number,
+      available: number,
+    ) => {
+      if (available <= 0) return scroll;
+      if (offset < scroll || size > available) return offset;
+      if (offset + size > scroll + available) return offset + size - available;
+      return scroll;
+    };
+    // Headers stay fixed while cell coordinates include zoom and custom sizes.
+    viewport.scrollLeft = visibleOffset(
+      columnMetrics.offsetAt(cell.column),
+      columnMetrics.sizeAt(cell.column),
+      viewport.scrollLeft,
+      viewport.clientWidth - ROW_HEADER_WIDTH,
+    );
+    viewport.scrollTop = visibleOffset(
+      rowMetrics.offsetAt(cell.row),
+      rowMetrics.sizeAt(cell.row),
+      viewport.scrollTop,
+      viewport.clientHeight - COLUMN_HEADER_HEIGHT,
+    );
+  };
+
+  const moveSelection = (key: string, extend: boolean) => {
+    const next = { ...selection.focus };
+    if (key === "ArrowUp") next.row = Math.max(0, next.row - 1);
+    else if (key === "ArrowDown") next.row = Math.min(rowCount - 1, next.row + 1);
+    else if (key === "ArrowLeft") next.column = Math.max(0, next.column - 1);
+    else if (key === "ArrowRight") next.column = Math.min(columnCount - 1, next.column + 1);
+    else if (key === "Tab")
+      next.column = Math.max(0, Math.min(columnCount - 1, next.column + (extend ? -1 : 1)));
+    else return false;
+    publishSelection({
+      anchor: extend && key !== "Tab" ? selection.anchor : next,
+      focus: next,
+      mode: "cells",
+    });
+    keepCellVisible(next);
+    return true;
+  };
+
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (editing) return;
+    if (editing || event.target !== event.currentTarget) return;
     const modifier = event.metaKey || event.ctrlKey;
     if (modifier && event.key.toLowerCase() === "c") {
       event.preventDefault();
@@ -1248,15 +1385,11 @@ export default function CsvGrid({
       });
       return;
     }
-    const next = { ...selection.focus };
-    if (event.key === "ArrowUp") next.row = Math.max(0, next.row - 1);
-    else if (event.key === "ArrowDown")
-      next.row = Math.min(rowCount - 1, next.row + 1);
-    else if (event.key === "ArrowLeft")
-      next.column = Math.max(0, next.column - 1);
-    else if (event.key === "ArrowRight" || event.key === "Tab")
-      next.column = Math.min(columnCount - 1, next.column + 1);
-    else if (event.key === "Enter" || event.key === "F2") {
+    if (moveSelection(event.key, event.shiftKey)) {
+      event.preventDefault();
+      return;
+    }
+    if (event.key === "Enter" || event.key === "F2") {
       event.preventDefault();
       void beginEditing({ ...selection.focus, mode: "cells" });
       return;
@@ -1274,6 +1407,7 @@ export default function CsvGrid({
           sourceRow,
           column: selection.focus.column,
           header: false,
+          mode: "entry",
         });
       };
       const sourceRow = knownSourceRowForView(selection.focus.row);
@@ -1282,13 +1416,7 @@ export default function CsvGrid({
         .then(startTyping)
         .catch((reason) => onError(String(reason)));
       return;
-    } else return;
-    event.preventDefault();
-    publishSelection({
-      anchor: event.shiftKey ? selection.anchor : next,
-      focus: next,
-      mode: "cells",
-    });
+    }
   };
 
   const runContextOperation = async (
@@ -1383,8 +1511,16 @@ export default function CsvGrid({
   return (
     <div className="sheet-grid">
       {imagePreview?.image && <ImagePreview info={imagePreview} documentId={summary.documentId} readOnly={readOnly}
-        onClose={() => { setImagePreview(null); viewportRef.current?.focus(); }}
+        onClose={() => { setImagePreview(null); viewportRef.current?.focus({ preventScroll: true }); }}
         onSave={updatePreviewImage} onError={onError} />}
+      {autoSum && <section className="autosum-proposal" aria-label="Propuesta de Autosuma">
+        <strong>Autosuma</strong><code>{autoSum.formula}</code>
+        <label>Destino <input aria-label="Destino de Autosuma" value={sumDestination} disabled={sumWorking} onChange={e => { setSumDestination(e.target.value); setSumError(null); }} /></label>
+        <button disabled={readOnly || sumWorking} onClick={() => void confirmAutoSum()}>Insertar suma</button>
+        <button disabled={sumWorking} onClick={() => setAutoSum(null)}>Cancelar</button>
+        <span className="autosum-hint">Revisa el rango resaltado. El texto y las celdas vacías pueden producir un error.</span>
+        {sumError && <span role="alert">{sumError}</span>}
+      </section>}
       {isSheet && (
         <div className="formula-toolbar">
           <output className="cell-address" aria-label="Cell address">
@@ -1409,12 +1545,14 @@ export default function CsvGrid({
                   sourceRow: activeInfo?.row ?? selection.focus.row,
                   column: selection.focus.column,
                   header: false,
+                  mode: "edit",
                 });
-              }
+              } else setEditing({ ...editing, mode: "edit" });
               setBarEditing(true);
             }}
             onChange={(event) => setDraft(event.target.value)}
-            onBlur={() => {
+            onBlur={(event) => {
+              if ((event.relatedTarget as HTMLElement | null)?.closest?.("[data-formula-tools]")) return;
               if (!referenceDrag.current)
                 void commitEdit().catch((reason) => onError(String(reason)));
             }}
@@ -1427,7 +1565,7 @@ export default function CsvGrid({
               if (event.key === "Escape") {
                 setEditing(null);
                 setBarEditing(false);
-                viewportRef.current?.focus();
+                viewportRef.current?.focus({ preventScroll: true });
               }
             }}
           />
@@ -1503,6 +1641,12 @@ export default function CsvGrid({
         }}
         onPointerDown={(event) => {
           if (event.button !== 0) return;
+          if ((event.target as HTMLElement).closest("input, button, [role='menu']")) return;
+          const bounds = event.currentTarget.getBoundingClientRect();
+          if (
+            event.clientX - bounds.left >= event.currentTarget.clientWidth ||
+            event.clientY - bounds.top >= event.currentTarget.clientHeight
+          ) return; // Leave native scrollbar interaction to the browser.
           setContextMenu(null);
           if (isSheet && editing && draft.startsWith("=")) {
             const target = targetFromPointer(event);
@@ -1562,6 +1706,10 @@ export default function CsvGrid({
           }
           const target = targetFromPointer(event);
           if (!target) return;
+          // Own keyboard focus after a canvas/spacer click, without letting the
+          // browser reposition the scroller around its large content element.
+          event.preventDefault();
+          event.currentTarget.focus({ preventScroll: true });
           dragAnchor.current = target;
           publishSelection(rangeForTarget(target, event.shiftKey));
         }}
@@ -1651,6 +1799,7 @@ export default function CsvGrid({
           if (!resizeState) setResizeHover(null);
         }}
         onDoubleClick={(event) => {
+          if ((event.target as HTMLElement).closest("input, button, [role='menu']")) return;
           const resizeTarget = resizeTargetFromPointer(event);
           if (resizeTarget) {
             event.preventDefault();
@@ -1704,11 +1853,29 @@ export default function CsvGrid({
                   : rowMetrics.sizeAt(editing.viewRow)) - 2,
             }}
             onChange={(event) => setDraft(event.target.value)}
-            onBlur={() => {
+            onDoubleClick={() => setEditing({ ...editing, mode: "edit" })}
+            onBlur={(event) => {
+              if ((event.relatedTarget as HTMLElement | null)?.closest?.("[data-formula-tools]")) return;
               if (!referenceDrag.current)
                 void commitEdit().catch((reason) => onError(String(reason)));
             }}
             onKeyDown={(event) => {
+              if (event.nativeEvent.isComposing) return;
+              if (event.key === "F2") {
+                event.preventDefault();
+                setEditing({ ...editing, mode: "edit" });
+                return;
+              }
+              if (editing.mode === "entry" && event.key.startsWith("Arrow")) {
+                // Typing replaces the cell; arrows accept the value and resume
+                // navigation. F2/double-click retain normal text-cursor editing.
+                event.preventDefault();
+                event.stopPropagation();
+                void commitEdit().catch((reason) => onError(String(reason)));
+                viewportRef.current?.focus({ preventScroll: true });
+                moveSelection(event.key, event.shiftKey);
+                return;
+              }
               if (event.key === "Enter") {
                 event.preventDefault();
                 void commitEdit().catch((reason) => onError(String(reason)));
@@ -1716,7 +1883,7 @@ export default function CsvGrid({
               }
               if (event.key === "Escape") {
                 setEditing(null);
-                viewportRef.current?.focus();
+                viewportRef.current?.focus({ preventScroll: true });
               }
             }}
           />

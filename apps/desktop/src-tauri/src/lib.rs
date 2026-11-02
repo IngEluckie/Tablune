@@ -79,6 +79,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             exit_application,
+            session::markdown::markdown_action,
+            session::markdown::markdown_image_import,
+            session::markdown::markdown_image_read,
             images::image_import,
             images::image_read,
             images::image_clipboard_copy,

@@ -19,7 +19,7 @@ struct StoredTableRef<'a> {
 }
 const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(super) fn validate(data: &ProjectData) -> Result<(), String> {
-    if !matches!(data.version, 1..=3) {
+    if !matches!(data.version, 1..=4) {
         return Err(format!("Unsupported .tablune version {}", data.version));
     }
     if data.functions.draft.len() > 1024 * 1024 || data.functions.applied.len() > 1024 * 1024 {
@@ -33,6 +33,7 @@ pub(super) fn validate(data: &ProjectData) -> Result<(), String> {
     for id in std::iter::once(&data.id)
         .chain(data.tables.iter().map(|t| &t.id))
         .chain(data.scripts.iter().map(|s| &s.id))
+        .chain(data.markdown.iter().map(|d| &d.id))
     {
         if id.is_empty()
             || id.len() > 120
@@ -47,6 +48,12 @@ pub(super) fn validate(data: &ProjectData) -> Result<(), String> {
             return Err("Invalid image asset version or identifier".into());
         }
         crate::images::validate_asset(id, asset)?;
+    }
+    for doc in &data.markdown {
+        if data.version < 4 || doc.path.is_some() {
+            return Err("Invalid project Markdown metadata".into());
+        }
+        super::markdown::validate(doc, &data.assets)?;
     }
     let mut names = HashSet::new();
     for t in &data.tables {
@@ -124,8 +131,16 @@ pub(super) fn read(path: &Path) -> Result<ProjectData, String> {
     let mut data: ProjectData =
         serde_json::from_slice(&entry(&mut zip, "manifest.json", 16 * 1024 * 1024)?)
             .map_err(|e| e.to_string())?;
-    if !matches!(data.version, 1..=3) {
+    if !matches!(data.version, 1..=4) {
         return Err(format!("Unsupported .tablune version {}", data.version));
+    }
+    for doc in &mut data.markdown {
+        doc.content = String::from_utf8(entry(
+            &mut zip,
+            &format!("documents/{}.md", doc.id),
+            super::markdown::MAX_TEXT,
+        )?)
+        .map_err(|e| e.to_string())?;
     }
     for t in &mut data.tables {
         let bytes = entry(
@@ -202,15 +217,19 @@ pub(super) fn write(path: &Path, data: &ProjectData) -> Result<(), String> {
         zip.start_file("manifest.json", options)
             .map_err(|e| e.to_string())?;
         let mut manifest = ProjectData {
+            markdown: data.markdown.clone(),
             assets: data.assets.clone(),
             functions: data.functions.clone(),
-            version: 3,
+            version: 4,
             id: data.id.clone(),
             name: data.name.clone(),
             tables: data.tables.clone(),
             scripts: data.scripts.clone(),
             rows: Vec::new(),
         };
+        for doc in &mut manifest.markdown {
+            doc.content.clear();
+        }
         for s in &mut manifest.scripts {
             s.code.clear();
         }
@@ -250,6 +269,12 @@ pub(super) fn write(path: &Path, data: &ProjectData) -> Result<(), String> {
             zip.start_file(format!("assets/{id}"), options)
                 .map_err(|e| e.to_string())?;
             zip.write_all(&asset.bytes).map_err(|e| e.to_string())?;
+        }
+        for doc in &data.markdown {
+            zip.start_file(format!("documents/{}.md", doc.id), options)
+                .map_err(|e| e.to_string())?;
+            zip.write_all(doc.content.as_bytes())
+                .map_err(|e| e.to_string())?;
         }
         for s in &data.scripts {
             zip.start_file(format!("scripts/{}.py", s.id), options)

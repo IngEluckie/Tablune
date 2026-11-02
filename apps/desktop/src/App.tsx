@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import CsvWorkspace from "./CsvWorkspace";
+import { flushCellEdits } from "./CsvGrid";
+import { newFunctionDraft } from "./formulaCatalog";
 import RibbonHeader from "./RibbonHeader";
 import ProjectSidebar from "./ProjectSidebar";
 import ProjectTabs from "./ProjectTabs";
@@ -9,7 +11,9 @@ import ProjectScriptEditor from "./ProjectScriptEditor";
 import { useWorkspace, type ProjectTab } from "./useWorkspace";
 import { readThemePreference, writeThemePreference } from "./theme";
 import * as ipc from "./ipc";
-import type { DocumentSummary, ProjectSummary } from "./types";
+import type { DocumentSummary, MarkdownDocument, ProjectSummary } from "./types";
+
+const MarkdownEditor = lazy(() => import("./MarkdownEditor"));
 
 export default function App() {
   const w = useWorkspace();
@@ -70,8 +74,18 @@ export default function App() {
   const newScript = (p: ProjectSummary) =>
     w.guard(async () => {
       const next = await w.perform(p.projectId, { kind: "newScript" });
-      w.openTab(p.projectId, { kind: "script", id: next.scripts.at(-1)!.id });
+      openNewScript(next);
     });
+  const openNewScript = (p: ProjectSummary) => {
+    const script = p.scripts.at(-1)!;
+    const selected = w.selected[p.projectId];
+    const inputTableId = selected?.kind === "table"
+      ? p.tables.find((t) => t.id === selected.id)?.id ?? script.inputTableId
+      : script.inputTableId;
+    if (inputTableId !== script.inputTableId)
+      w.editScript(p.projectId, script.id, { ...script, inputTableId });
+    w.openTab(p.projectId, { kind: "script", id: script.id });
+  };
   const importTables = (p: ProjectSummary) =>
     w.guard(async () => {
       const paths = await open({
@@ -106,7 +120,7 @@ export default function App() {
         name: path.split(/[\\/]/).at(-1) ?? "Script.py",
         code: await ipc.readMacroScript(path),
       });
-      w.openTab(p.projectId, { kind: "script", id: next.scripts.at(-1)!.id });
+      openNewScript(next);
     });
   const renameTable = async (
     p: ProjectSummary,
@@ -139,6 +153,12 @@ export default function App() {
     w.guard(async () => {
       const table = p.tables.find((t) => t.id === tab.id);
       const script = p.scripts.find((s) => s.id === tab.id);
+      if (tab.kind === "markdown") {
+        const doc = p.markdown?.find(d => d.id === tab.id);
+        const name = await requestName("Rename document", doc?.name ?? "");
+        if (name) await w.actMarkdown(p.projectId, tab.id, { kind: "rename", name });
+        return;
+      }
       const name = await requestName(
         tab.kind === "table" ? "Rename table" : "Rename script",
         table?.document.displayName ?? script?.name ?? "",
@@ -167,6 +187,10 @@ export default function App() {
         ))
       )
         return;
+      if (tab.kind === "markdown") {
+        await w.actMarkdown(p.projectId, tab.id, { kind: "delete", discard: true });
+        w.closeTab(p.projectId, tab); return;
+      }
       await w.perform(
         p.projectId,
         tab.kind === "table"
@@ -177,6 +201,7 @@ export default function App() {
     });
   const exportItem = (p: ProjectSummary, tab: ProjectTab) =>
     w.guard(async () => {
+      if (tab.kind === "markdown") { await w.saveMarkdown(tab.id, true, p.projectId); return; }
       await w.flushDrafts();
       const current = w.workspaceRef.current.projects?.find(
         (c) => c.projectId === p.projectId,
@@ -200,15 +225,16 @@ export default function App() {
       else if (script) await ipc.writeMacroScript(path, script.code);
     });
   const tabName = (p: ProjectSummary, t: ProjectTab) =>
-    t.kind === "functions"
+    t.kind === "markdown" ? p.markdown?.find(d => d.id === t.id)?.name : t.kind === "functions"
       ? "Functions"
       : t.kind === "table"
         ? p.tables.find((x) => x.id === t.id)?.document.displayName
         : p.scripts.find((x) => x.id === t.id)?.name;
   const hasDrafts = (id: number) =>
     Object.keys(w.drafts).some((key) => key.startsWith(`${id}:`)) ||
-    w.functionDrafts[id] !== undefined;
+    w.functionDrafts[id] !== undefined || Object.keys(w.markdownDrafts).some(key => key.startsWith(`${id}:`));
   const dirtyItems = [
+    ...(w.workspace.markdown ?? []).filter(d => d.dirty || w.markdownDrafts[`file:${d.id}`] !== undefined).map(d => ({ key: `md-${d.id}`, name: d.name })),
     ...w.workspace.documents
       .filter((d) => d.dirty)
       .map((d) => ({ key: `csv-${d.documentId}`, name: d.displayName })),
@@ -236,7 +262,7 @@ export default function App() {
             value={String(w.space)}
             onChange={(e) =>
               w.setSpace(
-                e.target.value === "home" || e.target.value === "csv"
+                e.target.value === "home" || e.target.value === "csv" || e.target.value === "markdown"
                   ? e.target.value
                   : Number(e.target.value),
               )
@@ -246,6 +272,7 @@ export default function App() {
             <option value="csv">
               CSV files ({w.workspace.documents.length})
             </option>
+            <option value="markdown">Documents ({w.workspace.markdown?.length ?? 0})</option>
             {w.workspace.projects?.map((p) => (
               <option key={p.projectId} value={p.projectId}>
                 {p.name}
@@ -287,6 +314,41 @@ export default function App() {
           </>
         )}
       </>);
+  const importMarkdown = (projectId: number) => w.guard(async () => {
+    const path = await open({ filters: [{ name: "Markdown", extensions: ["md", "markdown"] }] });
+    if (typeof path !== "string") return;
+    const doc = await w.actMarkdown(projectId, null, { kind: "open", path });
+    w.openTab(projectId, { kind: "markdown", id: doc.id });
+  });
+  const markdownPane = (doc: MarkdownDocument, projectId: number | null, active: boolean) => {
+    const key = `${projectId ?? "file"}:${doc.id}`;
+    const locked = w.busy || w.closeRequest !== null || (projectId !== null && w.savingProjects.includes(projectId));
+    return <div key={key} className="markdown-workspace" hidden={!active}>
+      <div className="markdown-file-actions">
+        <strong>{doc.name}{doc.dirty && projectId === null || w.markdownDrafts[key] !== undefined ? " •" : ""}</strong>
+        <button disabled={locked} onClick={() => void w.guard(() => projectId === null ? w.saveMarkdown(doc.id) : w.saveProjectById(projectId))}>{projectId === null ? "Save" : "Save project"}</button>
+        <button disabled={locked} onClick={() => void w.guard(() => w.saveMarkdown(doc.id, true, projectId))}>{projectId === null ? "Save as…" : "Export Markdown…"}</button>
+        {projectId === null && <>
+          <button disabled={locked} onClick={() => void w.guard(async () => {
+            const name = await requestName("Create project from document", doc.name.replace(/\.(md|markdown)$/i, ""));
+            if (!name) return;
+            const p = await w.createProject(name);
+            const copy = await w.actMarkdown(null, doc.id, { kind: "copyToProject", targetProjectId: p.projectId });
+            w.openTab(p.projectId, { kind: "markdown", id: copy.id });
+          })}>Create project…</button>
+          {!!w.workspace.projects?.length && <select aria-label="Copy document to project" value="" disabled={locked} onChange={event => {
+            const targetProjectId = Number(event.target.value);
+            void w.guard(async () => { const copy = await w.actMarkdown(null, doc.id, { kind: "copyToProject", targetProjectId }); w.openTab(targetProjectId, { kind: "markdown", id: copy.id }); });
+          }}><option value="" disabled>Add to project…</option>{w.workspace.projects.map(p => <option key={p.projectId} value={p.projectId}>{p.name}</option>)}</select>}
+          <button disabled={locked} onClick={() => void w.guard(() => w.closeMarkdown(doc.id))}>Close document</button>
+        </>}
+      </div>
+      <Suspense fallback={<p>Loading document editor…</p>}><MarkdownEditor documentId={doc.id} projectId={projectId}
+        value={w.markdownDrafts[key] ?? doc.content} disabled={locked}
+        onChange={content => w.editMarkdown(projectId, doc.id, content)} onError={w.report}
+        onSave={() => { if (!locked) void w.guard(() => projectId === null ? w.saveMarkdown(doc.id) : w.saveProjectById(projectId)); }} /></Suspense>
+    </div>;
+  };
   return (
     <main className="app-shell product-shell" data-theme={theme}>
       <div className="application-ribbon" ref={setRibbonTarget} hidden={w.space === "home"}>
@@ -318,6 +380,7 @@ export default function App() {
               </div>
             </div>
             <div className="home-start">
+              <button disabled={!w.ready || w.busy} onClick={() => void w.guard(() => w.newMarkdown())}><strong>New document</strong><span>Write a Markdown document with images</span></button>
               <button
                 disabled={!w.ready || w.busy}
                 onClick={() => void w.guard(w.newCsv)}
@@ -330,21 +393,22 @@ export default function App() {
                 onClick={() => void createProject()}
               >
                 <strong>New project</strong>
-                <span>Keep your tables and Python scripts together</span>
+                <span>Keep tables, documents and Python scripts together</span>
               </button>
               <button
                 disabled={!w.ready || w.busy}
                 onClick={() => void w.guard(w.openFiles)}
               >
                 <strong>Open…</strong>
-                <span>CSV, TSV or a .tablune project</span>
+                <span>CSV, TSV, Markdown or a .tablune project</span>
               </button>
             </div>
             {(w.workspace.documents.length > 0 ||
-              Boolean(w.workspace.projects?.length)) && (
+              Boolean(w.workspace.projects?.length) || Boolean(w.workspace.markdown?.length)) && (
               <section>
                 <h2>Open workspaces</h2>
                 <div className="open-spaces">
+                  {!!w.workspace.markdown?.length && <button onClick={() => w.setSpace("markdown")}>Documents · {w.workspace.markdown.length} open</button>}
                   {w.workspace.documents.length > 0 && (
                     <button onClick={() => w.setSpace("csv")}>
                       CSV files · {w.workspace.documents.length} open
@@ -384,7 +448,7 @@ export default function App() {
                           <small>
                             {r.kind === "project"
                               ? "Tablune project"
-                              : "CSV file"}{" "}
+                              : r.kind === "markdown" ? "Markdown document" : "CSV file"}{" "}
                             · {r.path}
                           </small>
                         </span>
@@ -410,6 +474,14 @@ export default function App() {
             </p>
           </section>
         )}
+        <section className="markdown-workspace space-pane" hidden={w.space !== "markdown"}>
+          <nav className="document-tabs" aria-label="Markdown documents">
+            {w.workspace.markdown?.map(doc => <button key={doc.id} aria-pressed={w.selectedMarkdown === doc.id} onClick={() => w.setSelectedMarkdown(doc.id)}>{doc.name}{doc.dirty || w.markdownDrafts[`file:${doc.id}`] !== undefined ? " •" : ""}</button>)}
+            <button disabled={w.busy} onClick={() => void w.guard(() => w.newMarkdown())}>New document</button>
+            <button disabled={w.busy} onClick={() => void w.guard(w.openFiles)}>Open…</button>
+          </nav>
+          {w.workspace.markdown?.map(doc => markdownPane(doc, null, doc.id === w.selectedMarkdown))}
+        </section>
         <div className="csv-space space-pane" hidden={w.space !== "csv"}>
           {w.workspace.documents.length > 0 ? (
             <>
@@ -477,6 +549,8 @@ export default function App() {
         {w.workspace.projects?.map((p) => {
           const locked = w.busy || w.savingProjects.includes(p.projectId);
           const active = w.selected[p.projectId];
+          const pythonEditor = w.pythonEditors[p.projectId];
+          const actionItem = pythonEditor ?? active;
           const table = p.tables.find(
             (t) => t.id === active?.id && active.kind === "table",
           );
@@ -489,7 +563,110 @@ export default function App() {
               className="project-space space-pane"
               hidden={w.space !== p.projectId}
             >
-              <ProjectSidebar label={`${p.name} items`}>
+              <ProjectSidebar
+                label={`${p.name} items`}
+                editorTitle={pythonEditor ? tabName(p, pythonEditor) : undefined}
+                onCloseEditor={() => w.closePythonEditor(p.projectId)}
+                editor={
+                  <>
+                    <div
+                      className="script-host"
+                      hidden={pythonEditor?.kind !== "functions"}
+                    >
+                      <ProjectFunctionsEditor
+                        project={p}
+                        code={
+                          w.functionDrafts[p.projectId] ?? p.functions?.draft ?? ""
+                        }
+                        disabled={locked || w.closeRequest !== null}
+                        onEdit={(code) => w.editFunctions(p.projectId, code)}
+                        onFlush={w.flushDrafts}
+                        onUpdate={w.updateProject}
+                        onEnable={() => w.enableProjectCalculation(p.projectId)}
+                        onError={w.report}
+                      />
+                    </div>
+                    {p.scripts.map((s) => (
+                      <div
+                        key={s.id}
+                        className="script-host"
+                        hidden={pythonEditor?.kind !== "script" || pythonEditor.id !== s.id}
+                      >
+                        <ProjectScriptEditor
+                          project={p}
+                          script={s}
+                          draft={w.drafts[`${p.projectId}:${s.id}`]}
+                          disabled={locked || w.closeRequest !== null}
+                          runningProject={w.runningProject}
+                          onEdit={(draft) => w.editScript(p.projectId, s.id, draft)}
+                          onFlush={w.flushDrafts}
+                          onRunning={w.setRunningProject}
+                          onError={w.report}
+                          onResult={(next) => {
+                            w.updateProject(next);
+                            w.openTab(p.projectId, {
+                              kind: "table",
+                              id: next.tables.at(-1)!.id,
+                            });
+                          }}
+                        />
+                      </div>
+                    ))}
+                  </>
+                }
+                footer={
+                  actionItem && actionItem.kind !== "functions" && (
+                    <div className="item-actions">
+                      <button
+                        disabled={locked}
+                        title="Rename…"
+                        aria-label="Rename…"
+                        onClick={() => void renameItem(p, actionItem)}
+                      >
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5 4 4M4 20l4-1L20 7a2.8 2.8 0 0 0-4-4L4 15z" /></svg>
+                      </button>
+                      <button
+                        disabled={locked}
+                        title={`Export ${actionItem.kind === "table" ? "CSV" : actionItem.kind === "markdown" ? "Markdown" : ".py"}…`}
+                        aria-label={`Export ${actionItem.kind === "table" ? "CSV" : actionItem.kind === "markdown" ? "Markdown" : ".py"}…`}
+                        onClick={() => void exportItem(p, actionItem)}
+                      >
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M4 15v5h16v-5" /></svg>
+                      </button>
+                      {table && actionItem.kind === "table" && (
+                        <button
+                          disabled={locked}
+                          title="Duplicate table"
+                          aria-label="Duplicate table"
+                          onClick={() =>
+                            void w.guard(async () => {
+                              const next = await w.perform(p.projectId, {
+                                kind: "duplicateTable",
+                                tableId: table.id,
+                              });
+                              w.openTab(p.projectId, {
+                                kind: "table",
+                                id: next.tables.at(-1)!.id,
+                              });
+                            })
+                          }
+                        >
+                          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2" /><path d="M16 8V4H4v12h4" /></svg>
+                        </button>
+                      )}
+                      <button
+                        disabled={locked || w.runningProject === p.projectId}
+                        className="danger"
+                        title={`Delete ${actionItem.kind}…`}
+                        aria-label={`Delete ${actionItem.kind}…`}
+                        onClick={() => void deleteItem(p, actionItem)}
+                      >
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7" /></svg>
+                      </button>
+                    </div>
+                  )
+                }
+              >
                 <div className="calculation-toolbar">
                   {!p.calculation?.enabled ? (
                     <button
@@ -569,10 +746,14 @@ export default function App() {
                     ▤ {t.document.displayName}
                   </button>
                 ))}
+                <h2>Documents</h2>
+                <button disabled={locked} onClick={() => void w.guard(() => w.newMarkdown(p.projectId))}>New document</button>
+                <button disabled={locked} onClick={() => void importMarkdown(p.projectId)}>Import Markdown…</button>
+                {p.markdown?.map(doc => <button key={doc.id} className="navigator-item" aria-pressed={active?.kind === "markdown" && active.id === doc.id} onClick={() => w.openTab(p.projectId, { kind: "markdown", id: doc.id })}>▧ {doc.name}</button>)}
                 <h2>Python</h2>
                 <button
                   className="navigator-item"
-                  aria-pressed={active?.kind === "functions"}
+                  aria-pressed={pythonEditor?.kind === "functions"}
                   onClick={() =>
                     w.openTab(p.projectId, {
                       kind: "functions",
@@ -598,7 +779,7 @@ export default function App() {
                   <button
                     key={s.id}
                     className="navigator-item"
-                    aria-pressed={active?.id === s.id}
+                    aria-pressed={pythonEditor?.kind === "script" && pythonEditor.id === s.id}
                     onClick={() =>
                       w.openTab(p.projectId, { kind: "script", id: s.id })
                     }
@@ -606,48 +787,6 @@ export default function App() {
                     ⌘ {s.name}
                   </button>
                 ))}
-                {active && active.kind !== "functions" && (
-                  <div className="item-actions">
-                    <button
-                      disabled={locked}
-                      onClick={() => void renameItem(p, active)}
-                    >
-                      Rename…
-                    </button>
-                    <button
-                      disabled={locked}
-                      onClick={() => void exportItem(p, active)}
-                    >
-                      Export {active.kind === "table" ? "CSV" : ".py"}…
-                    </button>
-                    {table && (
-                      <button
-                        disabled={locked}
-                        onClick={() =>
-                          void w.guard(async () => {
-                            const next = await w.perform(p.projectId, {
-                              kind: "duplicateTable",
-                              tableId: table.id,
-                            });
-                            w.openTab(p.projectId, {
-                              kind: "table",
-                              id: next.tables.at(-1)!.id,
-                            });
-                          })
-                        }
-                      >
-                        Duplicate table
-                      </button>
-                    )}
-                    <button
-                      disabled={locked || w.runningProject === p.projectId}
-                      className="danger"
-                      onClick={() => void deleteItem(p, active)}
-                    >
-                      Delete {active.kind}…
-                    </button>
-                  </div>
-                )}
               </ProjectSidebar>
               <div className="project-main">
                 <ProjectTabs
@@ -663,7 +802,7 @@ export default function App() {
                     <h1>{p.name}</h1>
                     <p>
                       {p.tables.length || p.scripts.length
-                        ? "Choose a table or script to continue."
+                        ? "Choose a table to continue."
                         : "Add your first table to get started."}
                     </p>
                     <div>
@@ -682,10 +821,24 @@ export default function App() {
                     </div>
                   </div>
                 )}
+                {p.markdown?.map(doc => markdownPane(doc, p.projectId, active?.kind === "markdown" && active.id === doc.id))}
                 <div className="grid-host" hidden={!table}>
                   <CsvWorkspace
                     managed
                     appliedFunctions={p.functions?.applied ?? ""}
+                    formulaControls={{
+                      enabled: p.calculation?.enabled ?? false,
+                      running: p.calculation?.running ?? false,
+                      status: p.calculation?.error ?? (!p.calculation?.enabled ? "Python desactivado" : p.calculation.running ? "Calculando…" : p.calculation.paused ? "Cálculo en pausa" : p.tables.some(t => (t.document.pendingCells ?? 0) > 0) ? "Cálculo pendiente" : "Python activo · Al día"),
+                      draftCode: w.functionDrafts[p.projectId] ?? p.functions?.draft ?? "",
+                      onManage: create => {
+                        if (create) w.editFunctions(p.projectId, newFunctionDraft(w.functionDrafts[p.projectId] ?? p.functions?.draft ?? ""));
+                        w.openTab(p.projectId, { kind: "functions", id: "functions" });
+                      },
+                      onEnable: () => void w.enableProjectCalculation(p.projectId).catch(w.report),
+                      onRecalculate: () => void (async () => { await flushCellEdits(); await w.flushDrafts(); w.updateProject(await ipc.recalculateProject(p.projectId, true)); })().catch(w.report),
+                      onCancel: () => void ipc.cancelCalculation(p.projectId).then(w.updateProject).catch(w.report),
+                    }}
                     ribbonTarget={ribbonTarget}
                     ribbonVisible={w.space === p.projectId && Boolean(table)}
                     ribbonControls={{ navigation, fileActions }}
@@ -735,49 +888,6 @@ export default function App() {
                     }}
                   />
                 </div>
-                <div
-                  className="script-host"
-                  hidden={active?.kind !== "functions"}
-                >
-                  <ProjectFunctionsEditor
-                    project={p}
-                    code={
-                      w.functionDrafts[p.projectId] ?? p.functions?.draft ?? ""
-                    }
-                    disabled={locked || w.closeRequest !== null}
-                    onEdit={(code) => w.editFunctions(p.projectId, code)}
-                    onFlush={w.flushDrafts}
-                    onUpdate={w.updateProject}
-                    onEnable={() => w.enableProjectCalculation(p.projectId)}
-                    onError={w.report}
-                  />
-                </div>
-                {p.scripts.map((s) => (
-                  <div
-                    key={s.id}
-                    className="script-host"
-                    hidden={active?.kind !== "script" || active.id !== s.id}
-                  >
-                    <ProjectScriptEditor
-                      project={p}
-                      script={s}
-                      draft={w.drafts[`${p.projectId}:${s.id}`]}
-                      disabled={locked || w.closeRequest !== null}
-                      runningProject={w.runningProject}
-                      onEdit={(draft) => w.editScript(p.projectId, s.id, draft)}
-                      onFlush={w.flushDrafts}
-                      onRunning={w.setRunningProject}
-                      onError={w.report}
-                      onResult={(next) => {
-                        w.updateProject(next);
-                        w.openTab(p.projectId, {
-                          kind: "table",
-                          id: next.tables.at(-1)!.id,
-                        });
-                      }}
-                    />
-                  </div>
-                ))}
               </div>
             </section>
           );

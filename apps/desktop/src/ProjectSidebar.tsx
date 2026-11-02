@@ -21,19 +21,32 @@ function persist(key: string, value: number | boolean) {
   catch { /* Keep the preference for this session when storage is unavailable. */ }
 }
 
-export default function ProjectSidebar({ label, children }: { label: string; children: ReactNode }) {
+export default function ProjectSidebar({ label, children, footer, editor, editorTitle, onCloseEditor }: {
+  label: string;
+  children: ReactNode;
+  footer?: ReactNode;
+  editor?: ReactNode;
+  editorTitle?: string;
+  onCloseEditor?: () => void;
+}) {
   const [width, setWidth] = useState(readWidth);
   const [collapsed, setCollapsed] = useState(readCollapsed);
   const contentId = useId();
   const drag = useRef<{ pointerId: number; x: number; width: number } | null>(null);
+  const minWidth = editorTitle ? 360 : MIN_WIDTH;
+  const displayWidth = Math.max(minWidth, width);
   const resize = (next: number) => {
-    const value = clamp(next);
+    const value = Math.max(minWidth, clamp(next));
     setWidth(value);
     persist(WIDTH_KEY, value);
   };
   return (
-    <div className={`project-sidebar${collapsed ? " collapsed" : ""}`} style={{ width: collapsed ? 30 : `min(${width}px, 45vw)` }}>
+    <div className={`project-sidebar${collapsed ? " collapsed" : ""}${editorTitle ? " editing-python" : ""}`} style={{ width: collapsed ? 30 : `min(${displayWidth}px, 45vw)` }}>
       <div className="sidebar-heading">
+        {!collapsed && editorTitle && <>
+          <button className="sidebar-back" onClick={onCloseEditor} title="Back to project items" aria-label="Back to project items">←</button>
+          <strong className="sidebar-editor-title" title={editorTitle}>{editorTitle}</strong>
+        </>}
         <button
           className="sidebar-toggle"
           title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
@@ -47,16 +60,18 @@ export default function ProjectSidebar({ label, children }: { label: string; chi
         >{collapsed ? "›" : "‹"}</button>
       </div>
       <aside id={contentId} className="project-navigator" aria-label={label} hidden={collapsed}>
-        {children}
+        <div className="project-navigator-content" hidden={Boolean(editorTitle)}>{children}</div>
+        <div className="sidebar-editor" hidden={!editorTitle}>{editor}</div>
+        {footer}
       </aside>
       {!collapsed && <div
         className="sidebar-resizer"
         role="separator"
         aria-label="Sidebar width"
         aria-orientation="vertical"
-        aria-valuemin={MIN_WIDTH}
+        aria-valuemin={minWidth}
         aria-valuemax={MAX_WIDTH}
-        aria-valuenow={width}
+        aria-valuenow={displayWidth}
         aria-controls={contentId}
         tabIndex={0}
         onPointerDown={(event) => {
@@ -82,9 +97,9 @@ export default function ProjectSidebar({ label, children }: { label: string; chi
         onPointerCancel={() => { drag.current = null; }}
         onLostPointerCapture={() => { drag.current = null; }}
         onKeyDown={(event) => {
-          const next = event.key === "ArrowLeft" ? width - 10
-            : event.key === "ArrowRight" ? width + 10
-            : event.key === "Home" ? MIN_WIDTH
+          const next = event.key === "ArrowLeft" ? displayWidth - 10
+            : event.key === "ArrowRight" ? displayWidth + 10
+            : event.key === "Home" ? minWidth
             : event.key === "End" ? MAX_WIDTH : null;
           if (next === null) return;
           event.preventDefault();

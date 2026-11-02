@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import * as ipc from "./ipc";
 import type { ProjectSummary, PythonStatus } from "./types";
+import { newFunctionDraft } from "./formulaCatalog";
 const Editor = lazy(() => import("./PythonMacroEditor"));
 export default function ProjectFunctionsEditor({
   project,
@@ -66,6 +67,7 @@ export default function ProjectFunctionsEditor({
     >
       <div className="script-toolbar">
         <strong>Functions</strong>
+        <button disabled={disabled || applying} onClick={() => onEdit(newFunctionDraft(code))}>Nueva función</button>
         <button
           disabled={disabled || applying}
           onClick={() => void interpreter()}
@@ -104,6 +106,7 @@ export default function ProjectFunctionsEditor({
         Define functions here and call them from a cell, for example{" "}
         <code>=precio_final(B2, C2)</code>. Drafts are saved with the project.
         Apply functions activates your changes.
+        {" "}Al cambiar o eliminar un nombre, actualiza también las fórmulas que lo utilizan.
       </p>
       <div className="project-code">
         <Suspense fallback={<p>Loading editor…</p>}>

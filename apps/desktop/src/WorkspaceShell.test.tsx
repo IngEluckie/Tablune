@@ -12,13 +12,14 @@ import {
   renderHook,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ask, save } from "@tauri-apps/plugin-dialog";
+import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import App from "./App";
 import { useWorkspace } from "./useWorkspace";
 import * as ipc from "./ipc";
-import type { ProjectSummary, WorkspaceSummary } from "./types";
+import type { DocumentSummary, ProjectSummary, WorkspaceSummary } from "./types";
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
     setTheme: vi.fn().mockResolvedValue(undefined),
@@ -48,8 +49,13 @@ vi.mock("./ipc", async (original) => ({
   enableCalculation: vi.fn(),
   recalculateProject: vi.fn(),
   applyFunctions: vi.fn(),
+  previewProjectScript: vi.fn(),
+  createProjectResult: vi.fn(),
+  readMacroScript: vi.fn(),
 }));
-vi.mock("./CsvWorkspace", () => ({ default: () => <div>Grid workspace</div> }));
+vi.mock("./CsvWorkspace", () => ({
+  default: ({ selectedId }: { selectedId: number }) => <div data-testid={`grid-${selectedId}`}>Grid workspace</div>,
+}));
 vi.mock("./PythonMacroEditor", () => ({
   default: ({
     value,
@@ -78,6 +84,7 @@ const project = (id: number): ProjectSummary => ({
 let backend: WorkspaceSummary;
 beforeEach(() => {
   vi.resetAllMocks();
+  localStorage.clear();
   vi.mocked(listen).mockResolvedValue(vi.fn());
   backend = { documents: [], projects: [] };
   vi.mocked(ipc.getWorkspaceSummary).mockImplementation(async () =>
@@ -100,6 +107,18 @@ beforeEach(() => {
   });
   vi.mocked(ipc.projectAction).mockImplementation(async (id, action) => {
     const p = backend.projects!.find((p) => p.projectId === id)!;
+    if (action.kind === "newScript" || action.kind === "importScript") {
+      p.scripts.push({
+        id: `script-${p.scripts.length + 1}`,
+        name: action.kind === "importScript" ? action.name : "Script.py",
+        code: action.kind === "importScript" ? action.code : "def run(rows, context):\n    return rows\n",
+        inputTableId: p.tables[0]?.id ?? null,
+        revision: 0,
+      });
+    }
+    if (action.kind === "deleteScript") {
+      p.scripts = p.scripts.filter((s) => s.id !== action.scriptId);
+    }
     if (action.kind === "updateFunctions") {
       p.functions ??= { draft: "", applied: "", revision: 0, draftRevision: 0 };
       p.functions.draft = action.code;
@@ -127,6 +146,112 @@ beforeEach(() => {
   });
 });
 afterEach(cleanup);
+const sheet = (id: number, name: string) => ({
+  id: `sheet-${id}`,
+  document: {
+    documentId: id, projectId: 1, path: null, displayName: name,
+    delimiter: ",", lineEnding: "lf", revision: 0, viewRevision: 0,
+    dirty: false, rowCount: 2, columnCount: 2, visibleRowCount: 2,
+    headerEnabled: false, headerSuggested: false, headerNames: ["A", "B"],
+    headerValues: [], canUndo: false, canRedo: false, filtersActive: false, sortCount: 0,
+  } satisfies DocumentSummary,
+});
+const scriptProject = (): ProjectSummary => ({
+  ...project(1),
+  tables: [sheet(10, "Orders"), sheet(20, "Prices")],
+  scripts: [
+    { id: "clean", name: "Clean.py", code: "def run(rows, context):\n    return rows\n", revision: 0, inputTableId: "sheet-10" },
+    { id: "totals", name: "Totals.py", code: "print('totals')", revision: 0, inputTableId: "sheet-20" },
+  ],
+});
+describe("Python editing beside project tables", () => {
+  it("edits scripts and Functions in the sidebar while retaining the table and drafts", async () => {
+    backend.projects = [scriptProject()];
+    render(<App />);
+    await screen.findByRole("tab", { name: "Orders" });
+    const grid = screen.getByTestId("grid-10");
+    fireEvent.click(screen.getByRole("button", { name: /⌘ Clean.py/ }));
+    const sidebar = screen.getByRole("complementary", { name: "Project 1 items" });
+    expect(within(sidebar).getByRole("region", { name: "Script Clean.py" })).toBeTruthy();
+    expect(screen.queryByRole("tab", { name: "Clean.py" })).toBeNull();
+    expect(grid.closest(".grid-host")?.hasAttribute("hidden")).toBe(false);
+    fireEvent.change(await screen.findByRole("textbox", { name: "Python code" }), { target: { value: "print('draft')" } });
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    expect(screen.queryByRole("textbox", { name: "Python code" })).toBeNull();
+    expect(screen.getByTestId("grid-10")).toBe(grid);
+    fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    expect(screen.getByRole("textbox", { name: "Python code" })).toHaveProperty("value", "print('draft')");
+    fireEvent.click(screen.getByRole("button", { name: "Back to project items" }));
+    fireEvent.click(screen.getByRole("button", { name: /▤ Prices/ }));
+    fireEvent.click(screen.getByRole("button", { name: /ƒ Functions/ }));
+    expect(within(sidebar).getByRole("region", { name: "Project functions" })).toBeTruthy();
+    expect(screen.queryByRole("tab", { name: "Functions" })).toBeNull();
+    expect(screen.getByRole("tab", { name: "Prices" }).getAttribute("aria-selected")).toBe("true");
+    fireEvent.click(screen.getByRole("tab", { name: "Orders" }));
+    expect(within(sidebar).getByRole("region", { name: "Project functions" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Back to project items" }));
+    fireEvent.click(screen.getByRole("button", { name: /⌘ Clean.py/ }));
+    expect(await screen.findByRole("textbox", { name: "Python code" })).toHaveProperty("value", "print('draft')");
+    expect(screen.getByTestId("grid-10")).toBe(grid);
+  });
+  it("opens newly created and imported scripts in the sidebar without replacing the table", async () => {
+    backend.projects = [scriptProject()];
+    render(<App />);
+    await screen.findByRole("tab", { name: "Orders" });
+    fireEvent.click(screen.getByRole("button", { name: /▤ Prices/ }));
+    fireEvent.click(screen.getByRole("button", { name: "+ Script" }));
+    expect(await screen.findByRole("region", { name: "Script Script.py" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "Prices" }).getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByRole("combobox", { name: "Input table" })).toHaveProperty("value", "sheet-20");
+    expect(screen.queryByRole("tab", { name: "Script.py" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Back to project items" }));
+    vi.mocked(open).mockResolvedValue("/tmp/Imported.py");
+    vi.mocked(ipc.readMacroScript).mockResolvedValue("print('imported')");
+    fireEvent.click(screen.getByRole("button", { name: "Import .py…" }));
+    expect(await screen.findByRole("region", { name: "Script Imported.py" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "Prices" }).getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByRole("combobox", { name: "Input table" })).toHaveProperty("value", "sheet-20");
+    expect(screen.queryByRole("tab", { name: "Imported.py" })).toBeNull();
+  });
+  it("flushes a sidebar draft before preview and opens its result while retaining the editor", async () => {
+    backend.projects = [scriptProject()];
+    vi.mocked(ask).mockResolvedValue(true);
+    vi.mocked(ipc.getPythonStatus).mockResolvedValue({ available: true, path: "/usr/bin/python3", version: "3.12", error: null });
+    vi.mocked(ipc.previewProjectScript).mockImplementation(async () => {
+      expect(backend.projects![0].scripts[0].code).toBe("print('latest')");
+      return { id: "preview", baseRevision: 0, rowsBefore: 2, rowsAfter: 2, columnsBefore: 2, columnsAfter: 2, changedCells: 1, headerChanged: false, estimatedUndoBytes: 0, canApply: true, blockedReason: null, stdout: "latest", stderr: "", samples: [] };
+    });
+    vi.mocked(ipc.createProjectResult).mockImplementation(async () => {
+      backend.projects![0].tables.push(sheet(30, "Result"));
+      return structuredClone(backend.projects![0]);
+    });
+    render(<App />);
+    await screen.findByRole("tab", { name: "Orders" });
+    fireEvent.click(screen.getByRole("button", { name: /⌘ Clean.py/ }));
+    fireEvent.change(await screen.findByRole("textbox", { name: "Python code" }), { target: { value: "print('latest')" } });
+    fireEvent.click(screen.getByRole("button", { name: "Run Preview" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Create result table" }).hasAttribute("disabled")).toBe(false));
+    expect(screen.getByRole("tab", { name: "Orders" }).getAttribute("aria-selected")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Create result table" }));
+    expect(await screen.findByRole("tab", { name: "Result" })).toHaveProperty("ariaSelected", "true");
+    expect(screen.getByRole("region", { name: "Script Clean.py" })).toBeTruthy();
+    expect(screen.getByRole("textbox", { name: "Python code" })).toHaveProperty("value", "print('latest')");
+    expect(ipc.createProjectResult).toHaveBeenCalledWith(1, "clean", "preview");
+  });
+  it("deletes the edited script without deleting or closing the visible table", async () => {
+    backend.projects = [scriptProject()];
+    vi.mocked(ask).mockResolvedValue(true);
+    render(<App />);
+    await screen.findByRole("tab", { name: "Orders" });
+    fireEvent.click(screen.getByRole("button", { name: /⌘ Clean.py/ }));
+    expect(screen.queryByRole("button", { name: "Duplicate table" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Delete script…" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Back to project items" })).toBeNull());
+    expect(ipc.projectAction).toHaveBeenCalledWith(1, { kind: "deleteScript", scriptId: "clean" });
+    expect(screen.getByRole("tab", { name: "Orders" }).getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByRole("button", { name: "Duplicate table" })).toBeTruthy();
+  });
+});
 describe("Home and project lifecycle", () => {
   it("starts at Home without silently creating a CSV", async () => {
     render(<App />);
