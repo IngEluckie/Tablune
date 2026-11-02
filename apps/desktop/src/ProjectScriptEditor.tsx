@@ -9,6 +9,7 @@ import type {
 } from "./types";
 import type { ScriptDraft } from "./useWorkspace";
 import MacroPreviewResults from "./MacroPreviewResults";
+import { projectItemPath } from "./projectTree";
 const Editor = lazy(() => import("./PythonMacroEditor"));
 export default function ProjectScriptEditor({
   project,
@@ -125,7 +126,7 @@ export default function ProjectScriptEditor({
             <option value="">Choose a table…</option>
             {project.tables.map((t) => (
               <option key={t.id} value={t.id}>
-                {t.document.displayName}
+                {projectItemPath(project, t.id)}
               </option>
             ))}
           </select>

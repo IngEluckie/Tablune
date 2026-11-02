@@ -82,6 +82,7 @@ pub struct CellMeta {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SheetData {
+    pub styles: BTreeMap<String, crate::session::styles::CellStyle>,
     pub cells: BTreeMap<String, CellMeta>,
     pub functions_revision: u64,
 }

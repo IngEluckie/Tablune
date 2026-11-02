@@ -80,7 +80,7 @@ describe("RibbonHeader", () => {
   });
 
   it("exposes project formula tools and calculation state only when supported", () => {
-    const formulas = { enabled: false, running: false, status: "Python desactivado", autoSumAvailable: true, onAutoSum: vi.fn(), onInsert: vi.fn(), onProject: vi.fn(), onEnable: vi.fn(), onRecalculate: vi.fn(), onCancel: vi.fn() };
+    const formulas = { running: false, status: "Resultados al día", autoSumAvailable: true, onAutoSum: vi.fn(), onInsert: vi.fn(), onProject: vi.fn(), onRecalculate: vi.fn(), onCancel: vi.fn() };
     const { rerender } = render(<RibbonHeader {...defaultProps} />);
     expect(screen.queryByRole("button", { name: "Fórmulas" })).toBeNull();
     rerender(<RibbonHeader {...defaultProps} formulas={formulas} />);
@@ -88,14 +88,14 @@ describe("RibbonHeader", () => {
     fireEvent.click(screen.getByRole("button", { name: "Σ Autosuma" }));
     fireEvent.click(screen.getByRole("button", { name: "ƒx Insertar función" }));
     fireEvent.click(screen.getByRole("button", { name: "Funciones del proyecto" }));
-    fireEvent.click(screen.getByRole("button", { name: "Activar Python" }));
-    for (const action of [formulas.onAutoSum, formulas.onInsert, formulas.onProject, formulas.onEnable]) expect(action).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: "Activar Python" })).toBeNull();
+    for (const action of [formulas.onAutoSum, formulas.onInsert, formulas.onProject]) expect(action).toHaveBeenCalledOnce();
     expect(formulas.onRecalculate).not.toHaveBeenCalled();
-    rerender(<RibbonHeader {...defaultProps} formulas={{ ...formulas, enabled: true, autoSumAvailable: false, status: "Al día" }} />);
+    rerender(<RibbonHeader {...defaultProps} formulas={{ ...formulas, autoSumAvailable: false, status: "Al día" }} />);
     expect(screen.getByRole("button", { name: "Σ Autosuma" })).toHaveProperty("disabled", true);
-    fireEvent.click(screen.getByRole("button", { name: "Recalcular" }));
+    fireEvent.click(screen.getByRole("button", { name: "Recalcular todo" }));
     expect(formulas.onRecalculate).toHaveBeenCalledOnce();
-    rerender(<RibbonHeader {...defaultProps} formulas={{ ...formulas, enabled: true, running: true }} />);
+    rerender(<RibbonHeader {...defaultProps} formulas={{ ...formulas, running: true }} />);
     fireEvent.click(screen.getByRole("button", { name: "Cancelar cálculo" }));
     expect(formulas.onCancel).toHaveBeenCalledOnce();
   });

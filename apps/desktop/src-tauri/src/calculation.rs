@@ -70,7 +70,7 @@ fn snapshot_sheet(s: &DocumentSession) -> Result<Option<Value>, String> {
         }
     }
     Ok(Some(
-        json!({"documentId":s.identity,"revision":s.revision,"values":values,"formulas":formulas,"errors":errors}),
+        json!({"documentId":s.identity,"revision":s.revision,"inputRevision":s.calculation_input_revision,"values":values,"formulas":formulas,"errors":errors}),
     ))
 }
 fn emit_project(app: &AppHandle, p: &projects::ProjectSession) {
@@ -112,19 +112,6 @@ pub(crate) fn interpreter_changed(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 #[tauri::command]
-pub fn project_enable_calculation(
-    app: AppHandle,
-    project_id: u64,
-) -> Result<projects::ProjectSummary, String> {
-    let state = app.state::<WorkspaceState>();
-    let handle = projects::handle(&state, project_id)?;
-    let mut p = projects::lock_project(&handle)?;
-    p.calculation.enabled = true;
-    p.calculation.paused = false;
-    p.calculation.error = None;
-    p.summary()
-}
-#[tauri::command]
 pub async fn project_recalculate(
     app: AppHandle,
     project_id: u64,
@@ -134,24 +121,9 @@ pub async fn project_recalculate(
         let state = app.state::<WorkspaceState>();
         let handle = projects::handle(&state, project_id)?;
         let mut p = projects::lock_project(&handle)?;
-        if !p.calculation.enabled {
-            return Err("Enable Python calculation for this project first".into());
-        }
-        if p.calculation.running {
+        if !p.begin_calculation(force)? {
             return p.summary();
         }
-        if force {
-            for table in &p.tables {
-                lock_document(table)?.sheet.invalidate_all();
-            }
-            p.calculation.paused = false;
-        }
-        if p.calculation.paused {
-            return p.summary();
-        }
-        p.calculation.running = true;
-        p.calculation.error = None;
-        p.calculation_generation += 1;
         emit_project(&app, &p);
         p.calculation_generation
     };
@@ -265,8 +237,8 @@ fn publish_sheet(
 ) -> Result<bool, String> {
     if request["documentId"] != s.identity
         || result["documentId"] != s.identity
-        || result["revision"] != s.revision
-        || request["revision"] != s.revision
+        || result["revision"] != request["revision"]
+        || request["inputRevision"] != s.calculation_input_revision
     {
         return Ok(false);
     }
@@ -313,15 +285,13 @@ pub async fn project_apply_functions(
         let state = app.state::<WorkspaceState>();
         let handle = projects::handle(&state, project_id)?;
         let mut p = projects::lock_project(&handle)?;
-        if !p.calculation.enabled {
-            return Err("Enable Python calculation before applying functions".into());
-        }
         if p.calculation.running {
             return Err("Wait for calculation or cancel it before applying functions".into());
         }
         if p.data.functions.draft_revision != expected_revision {
             return Err("Functions draft changed".into());
         }
+        p.checkpoint_calculation()?;
         p.calculation_generation += 1;
         p.calculation.running = true;
         p.calculation.error = None;
@@ -384,6 +354,7 @@ pub fn project_cancel_calculation(
     let state = app.state::<WorkspaceState>();
     let handle = projects::handle(&state, project_id)?;
     let mut p = projects::lock_project(&handle)?;
+    p.checkpoint_calculation()?;
     p.calculation_generation += 1;
     p.calculation.paused = true;
     p.calculation.error = Some("Calculation cancelled. Recalculate when ready.".into());
@@ -419,12 +390,39 @@ pub(super) fn calculate_with_test_worker(
 mod tests {
     use super::*;
     #[test]
+    fn view_changes_during_calculation_do_not_discard_current_results() {
+        let mut s = DocumentSession {
+            project_id: Some(1),
+            ..DocumentSession::default()
+        };
+        s.edit_sheet_cells(vec![sheets::SheetCellInput {
+            style: None,
+            image: None,
+            row: 0,
+            column: 0,
+            value: "=1+2".into(),
+            literal: false,
+            cell_type: None,
+        }])
+        .unwrap();
+        let request = snapshot_sheet(&s).unwrap().unwrap();
+        let output = crate::python_macros::calculation_worker::test_request(
+            json!({"protocolVersion":1,"code":"","sheets":[request.clone()]}),
+        );
+        s.revision += 1; // Sorting/filtering changes the view, not formula inputs.
+        s.rebuild_view();
+        assert!(publish_sheet(&mut s, &request, &output["results"][0], 0).unwrap());
+        assert_eq!(s.cell_value(0, 0), "3");
+        assert!(!s.sheet.cells["0,0"].pending);
+    }
+    #[test]
     fn old_results_cannot_overwrite_new_edits_or_another_sheet() {
         let mut s = DocumentSession {
             project_id: Some(1),
             ..DocumentSession::default()
         };
         s.edit_sheet_cells(vec![sheets::SheetCellInput {
+            style: None,
             image: None,
             row: 0,
             column: 0,
@@ -443,6 +441,7 @@ mod tests {
         };
         assert_ne!(other.identity, s.identity);
         s.edit_sheet_cells(vec![sheets::SheetCellInput {
+            style: None,
             image: None,
             row: 0,
             column: 0,

@@ -148,7 +148,9 @@ pub(crate) fn request(
     let runtime = app.state::<PythonRuntimeState>();
     session::calculation::reserve_calculation(app, project_id, generation)?;
     let result = (|| {
-        let interpreter = resolve_interpreter(app)?;
+        let interpreter = resolve_interpreter(app).map_err(|error| {
+            format!("No se pudo iniciar el cálculo: {error}. Configura Python 3.10+ en Funciones del proyecto → Python interpreter… Los resultados guardados se conservan.")
+        })?;
         if lock_runtime(&runtime.inner)?.cancel_requested {
             return Err("Calculation cancelled".into());
         }

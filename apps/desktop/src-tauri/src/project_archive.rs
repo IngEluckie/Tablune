@@ -19,7 +19,7 @@ struct StoredTableRef<'a> {
 }
 const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(super) fn validate(data: &ProjectData) -> Result<(), String> {
-    if !matches!(data.version, 1..=4) {
+    if !matches!(data.version, 1..=6) {
         return Err(format!("Unsupported .tablune version {}", data.version));
     }
     if data.functions.draft.len() > 1024 * 1024 || data.functions.applied.len() > 1024 * 1024 {
@@ -29,6 +29,10 @@ pub(super) fn validate(data: &ProjectData) -> Result<(), String> {
         return Err("Missing table data".into());
     }
     super::name(&data.name)?;
+    if data.version < 5 && data.organization != super::ProjectOrganization::default() {
+        return Err("Folder organization requires project format 5".into());
+    }
+    super::tree::validate(&data.organization, data)?;
     let mut ids = HashSet::new();
     for id in std::iter::once(&data.id)
         .chain(data.tables.iter().map(|t| &t.id))
@@ -57,6 +61,16 @@ pub(super) fn validate(data: &ProjectData) -> Result<(), String> {
     }
     let mut names = HashSet::new();
     for t in &data.tables {
+        if data.version < 6 && !t.sheet.styles.is_empty() {
+            return Err("Cell styles require project format 6".into());
+        }
+        for (key, style) in &t.sheet.styles {
+            let (row, col) = crate::formulas::position(key).ok_or("Invalid styled cell address")?;
+            if row > 9_999_999 || col >= 100_000 {
+                return Err("Styled cell exceeds sheet limits".into());
+            }
+            style.validate()?;
+        }
         super::name(&t.name)?;
         for (key, meta) in &t.sheet.cells {
             if let Some(image) = &meta.image {
@@ -131,7 +145,7 @@ pub(super) fn read(path: &Path) -> Result<ProjectData, String> {
     let mut data: ProjectData =
         serde_json::from_slice(&entry(&mut zip, "manifest.json", 16 * 1024 * 1024)?)
             .map_err(|e| e.to_string())?;
-    if !matches!(data.version, 1..=4) {
+    if !matches!(data.version, 1..=6) {
         return Err(format!("Unsupported .tablune version {}", data.version));
     }
     for doc in &mut data.markdown {
@@ -217,10 +231,11 @@ pub(super) fn write(path: &Path, data: &ProjectData) -> Result<(), String> {
         zip.start_file("manifest.json", options)
             .map_err(|e| e.to_string())?;
         let mut manifest = ProjectData {
+            organization: data.organization.clone(),
             markdown: data.markdown.clone(),
             assets: data.assets.clone(),
             functions: data.functions.clone(),
-            version: 4,
+            version: 6,
             id: data.id.clone(),
             name: data.name.clone(),
             tables: data.tables.clone(),

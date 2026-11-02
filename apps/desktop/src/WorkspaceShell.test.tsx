@@ -46,7 +46,6 @@ vi.mock("./ipc", async (original) => ({
   closeProject: vi.fn(),
   getPythonStatus: vi.fn(),
   exitApplication: vi.fn(),
-  enableCalculation: vi.fn(),
   recalculateProject: vi.fn(),
   applyFunctions: vi.fn(),
   previewProjectScript: vi.fn(),
@@ -55,6 +54,11 @@ vi.mock("./ipc", async (original) => ({
 }));
 vi.mock("./CsvWorkspace", () => ({
   default: ({ selectedId }: { selectedId: number }) => <div data-testid={`grid-${selectedId}`}>Grid workspace</div>,
+}));
+vi.mock("./MarkdownEditor", () => ({
+  default: ({ linkTargets, onOpenLink }: { linkTargets: { id: string; name: string }[]; onOpenLink: (link: { kind: "project"; value: string }) => void }) => <div>
+    {linkTargets.map(target => <button key={target.id} onClick={() => onOpenLink({ kind: "project", value: target.id })}>Referencia {target.name}</button>)}
+  </div>,
 }));
 vi.mock("./PythonMacroEditor", () => ({
   default: ({
@@ -165,12 +169,36 @@ const scriptProject = (): ProjectSummary => ({
   ],
 });
 describe("Python editing beside project tables", () => {
+  it("opens referenced tables and scripts in tabs, retains the source, and only activates existing tabs", async () => {
+    backend.projects = [{ ...scriptProject(), markdown: [{ id: "notes", name: "Notas.md", content: "", revision: 0, path: null, dirty: false, images: {} }] }];
+    render(<App />);
+    await screen.findByRole("tab", { name: "Orders" });
+    fireEvent.click(screen.getByRole("treeitem", { name: "Documento Notas.md" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Referencia Prices" }));
+    await waitFor(() => expect(screen.getByRole("tab", { name: "Prices" }).getAttribute("aria-selected")).toBe("true"));
+    expect(screen.getByRole("tab", { name: "Notas.md" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("tab", { name: "Notas.md" }));
+    fireEvent.click(screen.getByRole("button", { name: "Referencia Clean.py" }));
+    await waitFor(() => expect(screen.getByRole("tab", { name: "Clean.py" }).getAttribute("aria-selected")).toBe("true"));
+    const code = await screen.findByRole("textbox", { name: "Python code" });
+    expect(code.closest(".project-main")).toBeTruthy();
+    fireEvent.change(code, { target: { value: "print('draft')" } });
+    fireEvent.click(screen.getByRole("tab", { name: "Notas.md" }));
+    fireEvent.click(screen.getByRole("button", { name: "Referencia Clean.py" }));
+    await waitFor(() => expect(screen.getAllByRole("tab", { name: "Clean.py" })).toHaveLength(1));
+    expect(screen.getByRole("textbox", { name: "Python code" })).toHaveProperty("value", "print('draft')");
+    expect(ipc.previewProjectScript).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Close Clean.py editor" }));
+    expect(screen.queryByRole("tab", { name: "Clean.py" })).toBeNull();
+    expect(screen.getByRole("tab", { name: "Prices" }).getAttribute("aria-selected")).toBe("true");
+  });
   it("edits scripts and Functions in the sidebar while retaining the table and drafts", async () => {
     backend.projects = [scriptProject()];
     render(<App />);
     await screen.findByRole("tab", { name: "Orders" });
     const grid = screen.getByTestId("grid-10");
-    fireEvent.click(screen.getByRole("button", { name: /⌘ Clean.py/ }));
+    expect(screen.queryByRole("button", { name: "Delete table…" })).toBeNull();
+    fireEvent.click(screen.getByRole("treeitem", { name: "Script Clean.py" }));
     const sidebar = screen.getByRole("complementary", { name: "Project 1 items" });
     expect(within(sidebar).getByRole("region", { name: "Script Clean.py" })).toBeTruthy();
     expect(screen.queryByRole("tab", { name: "Clean.py" })).toBeNull();
@@ -182,15 +210,15 @@ describe("Python editing beside project tables", () => {
     fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
     expect(screen.getByRole("textbox", { name: "Python code" })).toHaveProperty("value", "print('draft')");
     fireEvent.click(screen.getByRole("button", { name: "Back to project items" }));
-    fireEvent.click(screen.getByRole("button", { name: /▤ Prices/ }));
-    fireEvent.click(screen.getByRole("button", { name: /ƒ Functions/ }));
+    fireEvent.click(screen.getByRole("treeitem", { name: "Tabla Prices" }));
+    fireEvent.click(screen.getByRole("button", { name: /ƒ Funciones del proyecto/ }));
     expect(within(sidebar).getByRole("region", { name: "Project functions" })).toBeTruthy();
     expect(screen.queryByRole("tab", { name: "Functions" })).toBeNull();
     expect(screen.getByRole("tab", { name: "Prices" }).getAttribute("aria-selected")).toBe("true");
     fireEvent.click(screen.getByRole("tab", { name: "Orders" }));
     expect(within(sidebar).getByRole("region", { name: "Project functions" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Back to project items" }));
-    fireEvent.click(screen.getByRole("button", { name: /⌘ Clean.py/ }));
+    fireEvent.click(screen.getByRole("treeitem", { name: "Script Clean.py" }));
     expect(await screen.findByRole("textbox", { name: "Python code" })).toHaveProperty("value", "print('draft')");
     expect(screen.getByTestId("grid-10")).toBe(grid);
   });
@@ -198,8 +226,9 @@ describe("Python editing beside project tables", () => {
     backend.projects = [scriptProject()];
     render(<App />);
     await screen.findByRole("tab", { name: "Orders" });
-    fireEvent.click(screen.getByRole("button", { name: /▤ Prices/ }));
-    fireEvent.click(screen.getByRole("button", { name: "+ Script" }));
+    fireEvent.click(screen.getByRole("treeitem", { name: "Tabla Prices" }));
+    fireEvent.click(screen.getByRole("button", { name: "Nuevo elemento" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Nuevo script" }));
     expect(await screen.findByRole("region", { name: "Script Script.py" })).toBeTruthy();
     expect(screen.getByRole("tab", { name: "Prices" }).getAttribute("aria-selected")).toBe("true");
     expect(screen.getByRole("combobox", { name: "Input table" })).toHaveProperty("value", "sheet-20");
@@ -207,7 +236,8 @@ describe("Python editing beside project tables", () => {
     fireEvent.click(screen.getByRole("button", { name: "Back to project items" }));
     vi.mocked(open).mockResolvedValue("/tmp/Imported.py");
     vi.mocked(ipc.readMacroScript).mockResolvedValue("print('imported')");
-    fireEvent.click(screen.getByRole("button", { name: "Import .py…" }));
+    fireEvent.click(screen.getByRole("button", { name: "Nuevo elemento" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Importar .py…" }));
     expect(await screen.findByRole("region", { name: "Script Imported.py" })).toBeTruthy();
     expect(screen.getByRole("tab", { name: "Prices" }).getAttribute("aria-selected")).toBe("true");
     expect(screen.getByRole("combobox", { name: "Input table" })).toHaveProperty("value", "sheet-20");
@@ -227,7 +257,7 @@ describe("Python editing beside project tables", () => {
     });
     render(<App />);
     await screen.findByRole("tab", { name: "Orders" });
-    fireEvent.click(screen.getByRole("button", { name: /⌘ Clean.py/ }));
+    fireEvent.click(screen.getByRole("treeitem", { name: "Script Clean.py" }));
     fireEvent.change(await screen.findByRole("textbox", { name: "Python code" }), { target: { value: "print('latest')" } });
     fireEvent.click(screen.getByRole("button", { name: "Run Preview" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Create result table" }).hasAttribute("disabled")).toBe(false));
@@ -243,13 +273,14 @@ describe("Python editing beside project tables", () => {
     vi.mocked(ask).mockResolvedValue(true);
     render(<App />);
     await screen.findByRole("tab", { name: "Orders" });
-    fireEvent.click(screen.getByRole("button", { name: /⌘ Clean.py/ }));
+    fireEvent.click(screen.getByRole("treeitem", { name: "Script Clean.py" }));
     expect(screen.queryByRole("button", { name: "Duplicate table" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Delete script…" }));
     await waitFor(() => expect(screen.queryByRole("button", { name: "Back to project items" })).toBeNull());
     expect(ipc.projectAction).toHaveBeenCalledWith(1, { kind: "deleteScript", scriptId: "clean" });
     expect(screen.getByRole("tab", { name: "Orders" }).getAttribute("aria-selected")).toBe("true");
-    expect(screen.getByRole("button", { name: "Duplicate table" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Opciones de Orders" }));
+    expect(screen.getByRole("menuitem", { name: "Duplicar tabla" })).toBeTruthy();
   });
 });
 describe("Home and project lifecycle", () => {
@@ -478,12 +509,11 @@ describe("Home and project lifecycle", () => {
     expect(backend.projects[0].functions.applied).toBe("def old(): return 1");
     expect(ipc.applyFunctions).not.toHaveBeenCalled();
   });
-  it("requires session authorization before automatically calculating pending formulas", async () => {
+  it("automatically requests calculation after an edit without an activation dialog", async () => {
     backend.projects = [
       {
         ...project(1),
         calculation: {
-          enabled: false,
           running: false,
           paused: false,
           error: null,
@@ -494,17 +524,12 @@ describe("Home and project lifecycle", () => {
             document: {
               documentId: 10,
               revision: 1,
-              pendingCells: 1,
+              pendingCells: 0,
             } as import("./types").DocumentSummary,
           },
         ],
       },
     ];
-    vi.mocked(ask).mockResolvedValue(true);
-    vi.mocked(ipc.enableCalculation).mockImplementation(async () => {
-      backend.projects![0].calculation!.enabled = true;
-      return structuredClone(backend.projects![0]);
-    });
     vi.mocked(ipc.recalculateProject).mockImplementation(async () => {
       backend.projects![0].tables[0].document.pendingCells = 0;
       return structuredClone(backend.projects![0]);
@@ -513,17 +538,18 @@ describe("Home and project lifecycle", () => {
     await waitFor(() => expect(result.current.ready).toBe(true));
     expect(ipc.recalculateProject).not.toHaveBeenCalled();
     await act(async () => {
-      await result.current.enableProjectCalculation(1);
+      backend.projects![0].tables[0].document.pendingCells = 1;
+      backend.projects![0].tables[0].document.revision += 1;
+      result.current.updateProject(structuredClone(backend.projects![0]));
     });
     await waitFor(() => expect(ipc.recalculateProject).toHaveBeenCalledWith(1));
-    expect(ask).toHaveBeenCalledTimes(1);
+    expect(ask).not.toHaveBeenCalled();
   });
   it("requires cancelling calculations before closing their project", async () => {
     backend.projects = [
       {
         ...project(1),
         calculation: {
-          enabled: true,
           running: true,
           paused: false,
           error: null,

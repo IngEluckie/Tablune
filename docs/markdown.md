@@ -14,8 +14,16 @@ images and GFM tables. Markdown tables are text, not calculable sheets.
 - Markdown code uses CodeMirror. Undo/redo spans mode changes (up to 100 grouped
   text snapshots, with a 64 MiB target budget; a single prior document is retained).
 - Opening and mode changes alone preserve source text. An actual visual edit can
-  normalize Markdown spelling. HTML/unsupported nodes, YAML-style front matter
+  normalize Markdown spelling. Attribute-free `<br>`, `<br/>` and `<br />` markers
+  render in visual mode, including the empty-paragraph markers written by the
+  editor itself. Inline markers render as line breaks while retaining their raw
+  value for serialization. Other HTML/unsupported nodes, YAML-style front matter
   and footnotes use source mode so they are not discarded by the visual schema.
+  The compatibility notice clears when corrected source opens in visual mode.
+- Project documents use the existing tab and breadcrumb for their title; save
+  remains available through File or Ctrl/Cmd+S and export through the item menu.
+  The document toolbar has no permanent second hint row, and both editors use
+  compact page margins instead of stacked outer/inner padding.
 - Save flushes pending transactions, uploads and revision-checked drafts. A failed
   draft update blocks save and retains the source for retry. Cancelled Save As or
   cancelled discard keeps the document open.
@@ -44,7 +52,7 @@ allows choosing a PNG/JPEG anywhere through the file picker. No remote image
 fetching is required for document rendering.
 
 The project archive shares image resources with cells. Markdown sources live in
-`documents/<persistent-id>.md`; image mappings live in the format-4 manifest.
+`documents/<persistent-id>.md`; image mappings live in the format-6 manifest.
 Export resolves real image nodes, including reference syntax, without rewriting
 image examples in code fences. Export never clears project dirty state.
 
@@ -57,6 +65,14 @@ missing/remote images, failed-write preservation, project archive persistence an
 recovery serialization. Existing CSV, formulas, Python, image and grid suites
 remain part of the required workspace checks.
 
+The visual-compatibility regression suite accepts editor-generated blank lines
+and rejects attributed HTML or executable markup. Browser checks additionally
+cover the heading/separator/`<br />`/blockquote case, exact unedited source across
+mode changes, inline break rendering, generated empty paragraphs, cross-mode
+undo/redo, clearing a stale fallback notice, tab switching and save. In a desktop
+test with the ribbon pinned, the document surface starts at approximately 185 px
+instead of 290 px; this varies with window width and toolbar wrapping.
+
 Browser validation exercises real Milkdown/CodeMirror editing against simulated
 Tauri IPC. Native file dialogs, OS clipboard integration and WebKit-specific
 interaction still require validation in the packaged application on each target OS.
@@ -68,3 +84,11 @@ the lazily loaded editor and shared code. Production Chromium validation with
 simulated IPC passed typing, source/visual switching, save, local image display,
 alt-text preservation, cross-mode undo/redo, search and HTML-source fallback,
 without browser console errors.
+
+### Vínculos a documentos
+
+En el editor visual o en código Markdown, escribe `[[` y parte del nombre para elegir una tabla, documento o script del proyecto. También puedes elegir **Buscar archivo…** para vincular un archivo compatible del sistema. En el editor visual, pulsa el vínculo para abrir el destino en Tablune.
+
+Las referencias internas abren el destino en una pestaña del área principal, incluidos los scripts, conservando la pestaña de origen. Si el destino ya tiene una pestaña, se activa sin duplicarla. Abrir un script por referencia no lo ejecuta.
+
+Los vínculos de proyecto guardan el identificador del elemento, por lo que siguen funcionando si se mueve o cambia de nombre dentro del proyecto. El texto visible conserva el nombre que tenía al crear el vínculo. Los vínculos a archivos externos guardan su ruta absoluta y dejan de funcionar si el archivo se mueve o cambia de nombre. Los vínculos se guardan como enlaces Markdown con rutas reservadas para Tablune; necesitan Tablune para abrir sus destinos.

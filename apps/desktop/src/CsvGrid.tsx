@@ -1,3 +1,5 @@
+import { writeMarkedClipboard, clipboardHasMarker } from "./clipboardMarker";
+import { cellFont, cellTextColor, sharedBorder, drawBorder } from "./cellStyles";
 import { clampSheetZoom, useSheetZoom, zoomAxis } from "./sheetZoom";
 import { open, ask } from "@tauri-apps/plugin-dialog";
 import { importCellImage, copyImageAssets, pasteImageAssets } from "./ipc";
@@ -27,6 +29,7 @@ import {
   type AxisMetrics,
 } from "./gridSizing";
 import {
+  getStyleSummary,
   getGridWindow,
   getSessionSummary,
   getSheetCell,
@@ -37,6 +40,9 @@ import {
 } from "./ipc";
 import { GRID_PALETTES, type ThemeMode } from "./theme";
 import type {
+  CellStyle,
+  StylePatch,
+  StyleSummary,
   CellImage,
   CellCoordinate,
   CellInfo,
@@ -63,6 +69,7 @@ let internalClipboard: {
   documentId: number;
   text: string;
   generation: number | null;
+  marker: string | null;
   inputs: CellInfo[][];
 } | null = null;
 const MIN_ROWS = 100;
@@ -73,6 +80,7 @@ const SELECTION_ROW_CHUNK = 400;
 export const GRID_WINDOW_COLUMN_LIMIT = 200;
 
 interface CsvGridProps {
+  onStyleSummaryChange?: (summary: StyleSummary | null) => void;
   zoom?: number;
   onZoomChange?: (zoom: number) => void;
   onCreateImageProject?: (row: number, column: number) => Promise<void>;
@@ -297,6 +305,7 @@ const DEFAULT_SELECTION: SelectionRange = {
 };
 
 export default function CsvGrid({
+  onStyleSummaryChange,
   zoom: requestedZoom = 1,
   onZoomChange,
   appliedFunctions = "",
@@ -346,6 +355,7 @@ export default function CsvGrid({
     end: number;
   } | null>(null);
   const pendingEdit = useRef<Promise<void> | null>(null);
+  const formatQueue = useRef<Promise<void>>(Promise.resolve());
   const [autoSum, setAutoSum] = useState<(AutoSumProposal & { revision: number }) | null>(null);
   const [sumDestination, setSumDestination] = useState("");
   const [sumError, setSumError] = useState<string | null>(null);
@@ -371,8 +381,8 @@ export default function CsvGrid({
     null,
   );
 
-  const columnCount = Math.max(MIN_COLUMNS, summary.columnCount);
-  const rowCount = Math.max(MIN_ROWS, summary.visibleRowCount || 1);
+  const columnCount = Math.max(MIN_COLUMNS, summary.columnCount, summary.styledColumnCount ?? 0);
+  const rowCount = Math.max(MIN_ROWS, summary.visibleRowCount || 1, !summary.filtersActive && summary.sortCount === 0 ? summary.styledRowCount ?? 0 : 0);
   const activeSizing = useMemo<GridSizingState>(() => {
     if (!resizeState) return initialSizing;
     if (resizeState.axis === "column") {
@@ -655,20 +665,26 @@ export default function CsvGrid({
           row <= range.endRow &&
           column >= range.startColumn &&
           column <= range.endColumn;
-        if (selected) {
-          context.fillStyle = palette.selectionFill;
+        const info = cachedRow(row)?.inputs?.[column - (windowData?.columnStart ?? 0)];
+        const style = info?.style;
+        if (style?.background) {
+          context.fillStyle = style.background;
           context.fillRect(x, y, columnWidth, rowHeight);
         }
-        context.fillStyle = cachedRow(row)?.inputs?.[
-          column - (windowData?.columnStart ?? 0)
-        ]?.error
-          ? "#b94141"
-          : palette.cellText;
-        context.textAlign = "left";
+        if (selected) {
+          context.save();
+          context.fillStyle = palette.selectionFill;
+          if (style?.background) context.globalAlpha = 0.25;
+          context.fillRect(x, y, columnWidth, rowHeight);
+          context.restore();
+        }
+        context.fillStyle = info?.error ? "#b94141" : cellTextColor(style, palette.cellText);
+        context.textAlign = style?.alignment || "left";
         context.save();
         context.beginPath();
         context.rect(x + 6 * zoom, y, Math.max(0, columnWidth - 12 * zoom), rowHeight);
         context.clip();
+        context.font = cellFont(style, zoom);
         const cellImage = cachedRow(row)?.inputs?.[column - (windowData?.columnStart ?? 0)]?.image;
         const bitmap = cellImage ? thumbnails.get(cellImage.assetId) : undefined;
         if (bitmap) {
@@ -676,7 +692,14 @@ export default function CsvGrid({
           const w = bitmap.width * scale, h = bitmap.height * scale;
           context.drawImage(bitmap, x + (columnWidth - w) / 2, y + (rowHeight - h) / 2, w, h);
         } else {
-          context.fillText(cellImage ? `▧ ${cellImage.name}` : getCell(row, column), x + 8 * zoom, y + rowHeight / 2);
+          const text = cellImage ? `▧ ${cellImage.name}` : getCell(row, column);
+          const tx = style?.alignment === "center" ? x + columnWidth / 2 : style?.alignment === "right" ? x + columnWidth - 8 * zoom : x + 8 * zoom;
+          context.fillText(text, tx, y + rowHeight / 2);
+          if (style?.underline && text) {
+            const textWidth = context.measureText(text).width;
+            const start = style.alignment === "center" ? tx - textWidth / 2 : style.alignment === "right" ? tx - textWidth : tx;
+            context.fillRect(start, y + rowHeight / 2 + 6 * zoom, textWidth, Math.max(1, zoom));
+          }
         }
         context.restore();
       }
@@ -714,6 +737,27 @@ export default function CsvGrid({
     context.moveTo(0, COLUMN_HEADER_HEIGHT + 0.5);
     context.lineTo(width, COLUMN_HEADER_HEIGHT + 0.5);
     context.stroke();
+
+    // Custom edges overlay grid lines. Resolve each shared edge exactly once.
+    const styleAt = (r: number, c: number): CellStyle | undefined => cachedRow(r)?.inputs?.[c - (windowData?.columnStart ?? 0)]?.style;
+    context.save();
+    context.beginPath();
+    context.rect(ROW_HEADER_WIDTH, COLUMN_HEADER_HEIGHT, Math.max(0, width - ROW_HEADER_WIDTH), Math.max(0, height - COLUMN_HEADER_HEIGHT));
+    context.clip();
+    for (let row = firstRow; row <= lastRow; row++) {
+      const y = COLUMN_HEADER_HEIGHT + rowMetrics.offsetAt(row) - viewport.scrollTop;
+      const rh = rowMetrics.sizeAt(row);
+      for (let col = firstColumn; col <= lastColumn; col++) {
+        const x = ROW_HEADER_WIDTH + columnMetrics.offsetAt(col) - viewport.scrollLeft;
+        const cw = columnMetrics.sizeAt(col);
+        const style = styleAt(row, col);
+        drawBorder(context, sharedBorder(style?.top, styleAt(row - 1, col)?.bottom), x, y, x + cw, y, zoom);
+        drawBorder(context, sharedBorder(style?.left, styleAt(row, col - 1)?.right), x, y, x, y + rh, zoom);
+        if (row === lastRow) drawBorder(context, sharedBorder(styleAt(row + 1, col)?.top, style?.bottom), x, y + rh, x + cw, y + rh, zoom);
+        if (col === lastColumn) drawBorder(context, sharedBorder(styleAt(row, col + 1)?.left, style?.right), x + cw, y, x + cw, y + rh, zoom);
+      }
+    }
+    context.restore();
 
     const selectedX =
       ROW_HEADER_WIDTH +
@@ -906,7 +950,7 @@ export default function CsvGrid({
         anchor: { row: anchor.row, column: 0 },
         focus: {
           row: target.row,
-          column: Math.max(0, summary.columnCount - 1),
+          column: Math.max(0, Math.max(summary.columnCount, summary.styledColumnCount ?? 0) - 1),
         },
         mode: "rows",
       };
@@ -915,7 +959,7 @@ export default function CsvGrid({
       return {
         anchor: { row: 0, column: anchor.column },
         focus: {
-          row: Math.max(0, summary.visibleRowCount - 1),
+          row: Math.max(0, Math.max(summary.visibleRowCount, !summary.filtersActive && summary.sortCount === 0 ? summary.styledRowCount ?? 0 : 0) - 1),
           column: target.column,
         },
         mode: "columns",
@@ -1099,6 +1143,28 @@ export default function CsvGrid({
     finally { setSumWorking(false); }
   };
 
+  const formatSelection = async (patch: StylePatch) => {
+    if (!isSheet || readOnly) return;
+    const range = normalizeSelection(selection);
+    if ((editing || pendingEdit.current) && (summary.sortCount > 0 || summary.filtersActive)) {
+      await commitEdit();
+      throw new Error("La edición se guardó. Selecciona de nuevo las celdas para dar formato en esta vista.");
+    }
+    await commitEdit();
+    const current = await getSessionSummary(summary.documentId);
+    await onApplyEdit({ kind: "formatCells", range, patch }, { documentId: summary.documentId, revision: current.revision });
+  };
+  useEffect(() => {
+    if (!onStyleSummaryChange) return;
+    onStyleSummaryChange(null);
+    if (!isSheet) return;
+    let alive = true;
+    void getStyleSummary(summary.documentId, normalizeSelection(selection), summary.revision)
+      .then(value => { if (alive) onStyleSummaryChange(value); })
+      .catch(error => { if (alive) onError(String(error)); });
+    return () => { alive = false; };
+  }, [isSheet, summary.documentId, summary.revision, selection, onStyleSummaryChange]);
+
   const insertImage = async () => {
     await commitEdit();
     if (!isSheet) {
@@ -1126,13 +1192,16 @@ export default function CsvGrid({
     const text = encodeClipboardMatrix(matrix);
     const imageIds = [...new Set(inputs.flat().flatMap(cell => cell.image ? [cell.image.assetId] : []))];
     if (imageIds.length || internalClipboard?.inputs.flat().some(cell => cell.image)) await copyImageAssets(summary.documentId, imageIds);
-    await writeClipboard(text);
+    const generationBefore = isSheet ? await clipboardGeneration().catch(() => null) : null;
+    const marker = isSheet && generationBefore === null ? await writeMarkedClipboard(text) : null;
+    if (!marker) await writeClipboard(text);
     internalClipboard = isSheet
       ? {
           documentId: summary.documentId,
           text,
           generation: await clipboardGeneration().catch(() => null),
           inputs,
+          marker,
         }
       : null;
   };
@@ -1173,8 +1242,7 @@ export default function CsvGrid({
       isSheet &&
       internalClipboard != null &&
       internalClipboard.text === text &&
-      generation !== null &&
-      generation === internalClipboard.generation
+      ((generation !== null && generation === internalClipboard.generation) || (generation === null && await clipboardHasMarker(internalClipboard.marker)))
         ? internalClipboard
         : null;
     const imageIds = [...new Set(copied?.inputs.flat().flatMap(cell => cell.image ? [cell.image.assetId] : []) ?? [])];
@@ -1217,6 +1285,7 @@ export default function CsvGrid({
           literal: isSheet && !original?.formula && !original?.escaped,
           cellType: original?.cellType,
           image: original?.image,
+          style: original ? original.style ?? {} : undefined,
           row: sourceRow,
           column: range.startColumn + columnOffset,
           value:
@@ -1243,7 +1312,7 @@ export default function CsvGrid({
   useEffect(() => {
     const handleCommand = (event: Event) => {
       const detail = (
-        event as CustomEvent<string | { command: string; documentId: number; functionName?: string }>
+        event as CustomEvent<string | { command: string; documentId: number; functionName?: string; patch?: StylePatch }>
       ).detail;
       if (
         typeof detail !== "string" &&
@@ -1253,6 +1322,13 @@ export default function CsvGrid({
       const command = typeof detail === "string" ? detail : detail.command;
       if (readOnly && command !== "copy") return;
       const operation =
+        command === "format" && typeof detail !== "string" && detail.patch ? () => {
+          const task = formatQueue.current.catch(() => {}).then(() => formatSelection(detail.patch!));
+          formatQueue.current = task;
+          pendingCellEdits.add(task);
+          void task.finally(() => pendingCellEdits.delete(task)).catch(() => {});
+          return task;
+        } :
         command === "autoSum" ? prepareAutoSum : command === "insertFunction" ? () => insertFunction(typeof detail === "string" ? "" : detail.functionName ?? "") : command === "insertImage" ? insertImage : command === "copy"
           ? copySelection
           : command === "cut"
@@ -1605,8 +1681,8 @@ export default function CsvGrid({
       {isSheet && activeInfo?.pending && !activeInfo.error && (
         <div className="cell-pending-detail" role="status">
           {activeInfo.display === "…"
-            ? "Waiting for calculation"
-            : "Pending calculation · displaying a cached result"}
+            ? "Sin resultado · Recalcula para evaluar esta fórmula"
+            : "Resultado anterior · requiere cálculo"}
         </div>
       )}
       <div

@@ -182,7 +182,7 @@ fn collect_images(
     }
     Ok(())
 }
-fn new_document(name: String) -> Result<MarkdownDocument, String> {
+pub(super) fn new_document(name: String) -> Result<MarkdownDocument, String> {
     validate_name(&name)?;
     Ok(MarkdownDocument {
         id: format!(
@@ -201,7 +201,7 @@ fn new_document(name: String) -> Result<MarkdownDocument, String> {
         images: BTreeMap::new(),
     })
 }
-fn open_document(path: &str) -> Result<MarkdownSession, String> {
+pub(super) fn open_document(path: &str) -> Result<MarkdownSession, String> {
     ensure_extension(path)?;
     let mut doc = new_document(
         Path::new(path)
@@ -403,6 +403,7 @@ fn action_internal(
                     .iter()
                     .position(|d| d.id == id)
                     .ok_or("Unknown document")?;
+                p.data.organization.item_folders.remove(&id);
                 Ok(p.data.markdown.remove(index))
             } else {
                 let mut docs = state.markdown.lock().map_err(|e| e.to_string())?;

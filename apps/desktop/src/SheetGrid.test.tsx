@@ -30,6 +30,7 @@ vi.mock("./ipc", () => ({
 const info: CellInfo = {
   row: 0,
   column: 0,
+  style: { bold: true, background: "#fff0b3" },
   source: "=B1+C1",
   display: "35",
   formula: true,
@@ -349,6 +350,7 @@ it("copies formulas within the sheet and supports paste values", async () => {
           row: 1,
           column: 0,
           value: "=B2+C2",
+          style: info.style,
           literal: false,
           cellType: "auto",
         },
@@ -471,4 +473,24 @@ it("selects fixed column headers correctly after scrolling a zoomed sheet", asyn
   viewport.scrollTop = 200;
   fireEvent.pointerDown(viewport, { clientX: 120, clientY: 20, button: 0 });
   expect(onSelectionChange.mock.lastCall?.[0]).toMatchObject({ mode: "columns", focus: { column: 1 } });
+});
+
+it("serializes formatting commands for the target document and flushes them before save", async () => {
+  let finish!: () => void;
+  const onApplyEdit = vi.fn().mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; })).mockResolvedValue(undefined);
+  mount(onApplyEdit);
+  await waitFor(() => expect(screen.getByLabelText("Formula bar")).toHaveProperty("value", "=B1+C1"));
+  act(() => {
+    document.dispatchEvent(new CustomEvent("tablune-grid-command", { detail: { command: "format", documentId: 99, patch: { bold: true } } }));
+    document.dispatchEvent(new CustomEvent("tablune-grid-command", { detail: { command: "format", documentId: 1, patch: { bold: true } } }));
+    document.dispatchEvent(new CustomEvent("tablune-grid-command", { detail: { command: "format", documentId: 1, patch: { background: "#fff0b3" } } }));
+  });
+  await waitFor(() => expect(onApplyEdit).toHaveBeenCalledTimes(1));
+  expect(onApplyEdit).toHaveBeenCalledWith({kind:"formatCells",range:{startRow:0,endRow:0,startColumn:0,endColumn:0},patch:{bold:true}},{documentId:1,revision:1});
+  let flushed = false;
+  const flush = flushCellEdits().then(() => { flushed = true; });
+  await Promise.resolve(); expect(flushed).toBe(false);
+  await act(async () => { finish(); await flush; });
+  expect(onApplyEdit).toHaveBeenCalledTimes(2);
+  expect(onApplyEdit).toHaveBeenLastCalledWith({kind:"formatCells",range:{startRow:0,endRow:0,startColumn:0,endColumn:0},patch:{background:"#fff0b3"}},{documentId:1,revision:1});
 });

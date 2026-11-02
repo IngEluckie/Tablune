@@ -7,6 +7,8 @@ export interface Selection {
 }
 
 export interface DocumentSummary {
+  styledRowCount?: number;
+  styledColumnCount?: number;
   imageCount?: number;
   imageRows?: number[];
   calculationRevision?: number;
@@ -88,6 +90,7 @@ export interface CellInput {
 }
 
 export type EditCommand =
+  | { kind: "formatCells"; range: CellRange; patch: StylePatch }
   | { kind: "setSheetCells"; cells: SheetCellInput[] }
   | { kind: "setCellTypes"; cells: CellCoordinate[]; cellType: CellType }
   | { kind: "setCells"; cells: CellInput[] }
@@ -228,6 +231,7 @@ export interface ProjectTableSummary {
   document: DocumentSummary;
 }
 export interface ProjectSummary {
+  organization?: ProjectOrganization;
   markdown?: MarkdownDocument[];
   functions?: FunctionsData;
   calculation?: CalculationSummary;
@@ -240,17 +244,25 @@ export interface ProjectSummary {
   tables: ProjectTableSummary[];
   scripts: ScriptSummary[];
 }
+export interface ProjectFolder { id: string; name: string; parentId: string | null; }
+export interface ProjectOrganization { folders: ProjectFolder[]; itemFolders: Record<string, string>; }
 export interface RecentFile {
   path: string;
   kind: "csv" | "project" | "markdown";
 }
 export type ProjectAction =
+  | { kind: "createFolder"; name: string; parentId: string | null }
+  | { kind: "renameFolder"; folderId: string; name: string }
+  | { kind: "moveItem"; itemId: string; folderId: string | null }
+  | { kind: "removeFolder"; folderId: string }
+  | { kind: "newDocument"; name: string; folderId?: string | null }
+  | { kind: "importDocument"; path: string; folderId?: string | null }
   | { kind: "updateFunctions"; code: string; expectedRevision: number }
-  | { kind: "newTable" | "newScript" }
-  | { kind: "importTable"; path: string }
+  | { kind: "newTable" | "newScript"; folderId?: string | null }
+  | { kind: "importTable"; path: string; folderId?: string | null }
   | { kind: "renameTable"; tableId: string; name: string }
   | { kind: "duplicateTable" | "deleteTable"; tableId: string }
-  | { kind: "importScript"; name: string; code: string }
+  | { kind: "importScript"; name: string; code: string; folderId?: string | null }
   | {
       kind: "updateScript";
       scriptId: string;
@@ -264,6 +276,7 @@ export type ProjectAction =
 export type CellType = "auto" | "text" | "number" | "boolean";
 export interface CellImage { assetId: string; name: string; alt: string; }
 export interface CellInfo {
+  style?: CellStyle;
   image?: CellImage | null;
   row: number;
   column: number;
@@ -276,6 +289,7 @@ export interface CellInfo {
   error: { code: string; message: string } | null;
 }
 export interface SheetCellInput {
+  style?: CellStyle;
   image?: CellImage | null;
   row: number;
   column: number;
@@ -290,7 +304,6 @@ export interface FunctionsData {
   draftRevision: number;
 }
 export interface CalculationSummary {
-  enabled: boolean;
   running: boolean;
   paused: boolean;
   error: string | null;
@@ -312,3 +325,17 @@ export type MarkdownAction =
   | { kind: "rename"; name: string }
   | { kind: "delete"; discard: boolean }
   | { kind: "copyToProject"; targetProjectId: number };
+
+export interface CellRange { startRow: number; endRow: number; startColumn: number; endColumn: number; }
+export interface CellBorder { color: string; width: 1 | 2 | 3; line: "solid" | "dashed"; }
+export interface CellStyle {
+  bold?: boolean; italic?: boolean; underline?: boolean;
+  textColor?: string; background?: string; alignment?: "left" | "center" | "right";
+  top?: CellBorder | null; right?: CellBorder | null; bottom?: CellBorder | null; left?: CellBorder | null;
+}
+export interface StylePatch {
+  reset?: boolean; bold?: boolean; italic?: boolean; underline?: boolean;
+  textColor?: string; background?: string; alignment?: "left" | "center" | "right";
+  borders?: { preset: "all" | "outer" | "inner" | "top" | "right" | "bottom" | "left" | "none"; border: CellBorder | null };
+}
+export interface StyleSummary { bold: boolean | null; italic: boolean | null; underline: boolean | null; textColor: string | null; background: string | null; alignment: "left" | "center" | "right" | null; }

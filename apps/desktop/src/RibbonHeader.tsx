@@ -1,3 +1,4 @@
+import FormatToolbar, { type FormatControls } from "./FormatToolbar";
 import { clampSheetZoom, MIN_SHEET_ZOOM, MAX_SHEET_ZOOM } from "./sheetZoom";
 import {
   type FocusEvent,
@@ -8,7 +9,7 @@ import {
 } from "react";
 import type { ThemeMode } from "./theme";
 
-type MenuSection = "file" | "edit" | "data" | "formulas" | "view";
+type MenuSection = "file" | "edit" | "data" | "formulas" | "format" | "view";
 
 const PIN_STORAGE_KEY = "tablune.ribbonPinned";
 const CLOSE_DELAY_MS = 180;
@@ -17,20 +18,20 @@ const MENUS: Array<{ id: MenuSection; label: string }> = [
   { id: "file", label: "File" },
   { id: "edit", label: "Edit" },
   { id: "data", label: "Data" },
+  { id: "format", label: "Formato" },
   { id: "formulas", label: "Fórmulas" },
   { id: "view", label: "View" },
 ];
 
 export interface RibbonHeaderProps {
+  formatting?: FormatControls;
   formulas?: {
-    enabled: boolean;
     running: boolean;
     status: string;
     autoSumAvailable: boolean;
     onAutoSum: () => void;
     onInsert: () => void;
     onProject: () => void;
-    onEnable: () => void;
     onRecalculate: () => void;
     onCancel: () => void;
   };
@@ -97,6 +98,7 @@ function writePinnedPreference(pinned: boolean): void {
 }
 
 export default function RibbonHeader({
+  formatting,
   formulas,
   zoom = 1,
   onZoomChange,
@@ -243,7 +245,7 @@ export default function RibbonHeader({
       <header className="compact-header">
         <nav className="header-menus" aria-label="Application sections">
           {navigation}
-          {MENUS.filter((menu) => (menu.id !== "formulas" || !!formulas) && (tableAvailable || menu.id === "file" || menu.id === "view")).map((menu) => (
+          {MENUS.filter((menu) => (menu.id !== "formulas" || !!formulas) && (menu.id !== "format" || !!formatting) && (tableAvailable || menu.id === "file" || menu.id === "view")).map((menu) => (
             <button
               key={menu.id}
               data-formula-tools={menu.id === "formulas" ? "" : undefined}
@@ -388,11 +390,12 @@ export default function RibbonHeader({
               <button disabled={busy || mutationsLocked} onClick={formulas.onInsert}>ƒx Insertar función</button>
               <button disabled={busy || mutationsLocked} onClick={formulas.onProject}>Funciones del proyecto</button>
               <span className="ribbon-divider" aria-hidden="true" />
-              {!formulas.enabled ? <button disabled={busy || mutationsLocked} onClick={formulas.onEnable}>Activar Python</button>
-                : formulas.running ? <button onClick={formulas.onCancel}>Cancelar cálculo</button>
-                : <button disabled={busy || mutationsLocked} onClick={formulas.onRecalculate}>Recalcular</button>}
+              {formulas.running ? <button onClick={formulas.onCancel}>Cancelar cálculo</button>
+                : <button disabled={busy || mutationsLocked} onClick={formulas.onRecalculate}>Recalcular todo</button>}
               <span className="formula-calculation-status" role="status">{formulas.status}</span>
             </div>}
+
+            {activeMenu === "format" && formatting && <FormatToolbar controls={formatting} disabled={busy || !!mutationsLocked} />}
 
             {activeMenu === "view" && (
               <div className="ribbon-group" aria-label="View actions">

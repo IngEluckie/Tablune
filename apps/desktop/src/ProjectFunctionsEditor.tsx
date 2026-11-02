@@ -11,7 +11,6 @@ export default function ProjectFunctionsEditor({
   onEdit,
   onFlush,
   onUpdate,
-  onEnable,
   onError,
 }: {
   project: ProjectSummary;
@@ -20,7 +19,6 @@ export default function ProjectFunctionsEditor({
   onEdit: (code: string) => void;
   onFlush: () => Promise<void>;
   onUpdate: (project: ProjectSummary) => void;
-  onEnable: () => Promise<void>;
   onError: (error: unknown) => void;
 }) {
   const [python, setPython] = useState<PythonStatus | null>(null);
@@ -79,33 +77,23 @@ export default function ProjectFunctionsEditor({
             ? `Python ${python.version}`
             : (python?.error ?? "Checking Python…")}
         </span>
-        {!project.calculation?.enabled ? (
-          <button
-            className="primary"
-            disabled={disabled}
-            onClick={() => void onEnable().catch(onError)}
-          >
-            Enable Python calculation
-          </button>
-        ) : (
-          <button
-            className="primary"
-            disabled={
-              disabled ||
-              applying ||
-              project.calculation.running ||
-              !python?.available
-            }
-            onClick={() => void apply()}
-          >
-            {applying ? "Applying…" : "Apply functions"}
-          </button>
-        )}
+        <button
+          className="primary"
+          disabled={
+            disabled ||
+            applying ||
+            project.calculation?.running ||
+            !python?.available
+          }
+          onClick={() => void apply()}
+        >
+          {applying ? "Applying…" : "Apply functions"}
+        </button>
       </div>
       <p className="functions-description">
         Define functions here and call them from a cell, for example{" "}
         <code>=precio_final(B2, C2)</code>. Drafts are saved with the project.
-        Apply functions activates your changes.
+        Apply functions activates your changes. Formulas calculate automatically when their inputs change.
         {" "}Al cambiar o eliminar un nombre, actualiza también las fórmulas que lo utilizan.
       </p>
       <div className="project-code">

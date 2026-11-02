@@ -14,7 +14,7 @@ Formula coverage includes arithmetic, ranges, custom functions, dependency chain
 
 Worker tests exercise reusable processes with fresh namespaces, unavailable Python/packages, invalid/reserved function declarations, cancellation, a shortened test timeout, bounded logs, and rejection of stale or cross-sheet results. Persistence tests cover format-2 source/types/caches, distinct Functions draft/applied code, script/formula recovery, version-1 archives without formula activation, corruption, atomic failed writes, path ownership, and project isolation. Existing CSV/history/view/macro tests remain passing.
 
-Frontend tests cover raw formula editing, reference insertion without premature commit, formula-aware copy/paste, Paste values, detection of an external clipboard replacement with identical text, per-cell type changes, cell-edit flushing before save, Functions draft flushing, execution only after enabling, and closing protection during calculation.
+Frontend tests cover raw formula editing, reference insertion without premature commit, formula-aware copy/paste, Paste values, detection of an external clipboard replacement with identical text, per-cell type changes, cell-edit flushing before save, Functions draft flushing, automatic execution after edits and no execution on open, and closing protection during calculation.
 
 ## Measurements
 
@@ -65,3 +65,12 @@ The automation could not confirm a selection in the native file picker's icon vi
 Generated native fixtures are in `/private/tmp/tablune-05-qa/`; they contain no user dataset. The original 0.4 project draft was saved before its application was closed, and no user changes were discarded.
 
 The verified optimized bundle replaced `/Users/josueernestogalindomorales/Desktop/Tablune Sheets.app`. The installed copy was opened from that exact path; its executable matches the verified build. It reopened both saved sheets with calculation disabled, enabled and recalculated the imported sheet, and exported `prices-imported-export.csv` with the expected header and values. The application was left on Home with no pending project changes.
+
+
+## Automatic calculation and saved results (November 2026)
+
+The activation button and dialog have been removed. The native validation observations above describe the earlier opt-in behavior and are historical, not validation of this change.
+
+Regression coverage now checks retained current and unfinished caches on reopen/recovery, automatic calculation after content edits, view-only changes, explicit recalculation, applied versus draft Functions, no retry loop after failure/cancellation, and dirty/recovery tracking for results completed after a save. Frontend coverage checks automatic scheduling without authorization and the remaining recalculation/cancellation controls.
+
+Native acceptance scenario for this change: calculate `=B2*2`, save, close, and reopen without starting Python; inspect the source formula and export its saved result. Change B2 and observe automatic updating. Save during a calculation and verify completion marks the project unsaved again. Reopen an unfinished snapshot and verify old results stay visible and pending. With Python unavailable, opening still works; a calculation attempt explains how to configure the interpreter. Select an interpreter and use Recalcular todo. Cancel a long calculation and verify it stays stopped until another edit or explicit recalculation.

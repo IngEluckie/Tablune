@@ -40,6 +40,8 @@ import {
   writeWorkspaceRecovery,
 } from "./ipc";
 import type {
+  StyleSummary,
+  StylePatch,
   ColumnType,
   DocumentId,
   DocumentSummary,
@@ -117,10 +119,12 @@ function shortPath(path: string): string {
 }
 
 export interface CsvWorkspaceProps {
-  formulaControls?: Pick<NonNullable<RibbonHeaderProps["formulas"]>, "enabled" | "running" | "status" | "onEnable" | "onRecalculate" | "onCancel"> & {
+  projectDirty?: boolean;
+  formulaControls?: Pick<NonNullable<RibbonHeaderProps["formulas"]>, "running" | "status" | "onRecalculate" | "onCancel"> & {
     draftCode: string;
     onManage: (create: boolean) => void;
   };
+  onCreateFormatProject?: () => void;
   onCreateImageProject?: (row: number, column: number) => Promise<void>;
   managed?: boolean;
   appliedFunctions?: string;
@@ -148,6 +152,7 @@ export interface CsvWorkspaceProps {
 export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
   const propsRef = useRef(props);
   propsRef.current = props;
+  const [formatSummary, setFormatSummary] = useState<StyleSummary | null>(null);
   const [documents, setDocuments] = useState<DocumentSummary[]>([]);
   const [activeDocumentId, setActiveDocumentId] = useState<DocumentId>(0);
   const [tabUiStates, setTabUiStates] = useState<
@@ -691,7 +696,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
     const handleShortcuts = (event: globalThis.KeyboardEvent) => {
       if (
         event.defaultPrevented ||
-        (event.target instanceof Element && event.target.closest(".sidebar-editor, .formula-panel, .autosum-proposal")) ||
+        (event.target instanceof Element && event.target.closest(".sidebar-editor, .project-explorer, .project-explorer-menu, .formula-panel, .autosum-proposal")) ||
         propsRef.current.active === false ||
         macroOpen ||
         unsavedRequest ||
@@ -857,11 +862,11 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
     }
   };
 
-  const runGridCommand = (command: "copy" | "cut" | "paste" | "insertImage" | "autoSum" | "insertFunction", functionName?: string) => {
+  const runGridCommand = (command: "copy" | "cut" | "paste" | "insertImage" | "autoSum" | "insertFunction" | "format", functionName?: string, patch?: StylePatch) => {
     if (macroOpen && command !== "copy") return;
     document.dispatchEvent(
       new CustomEvent("tablune-grid-command", {
-        detail: { command, documentId: summary.documentId, functionName },
+        detail: { command, documentId: summary.documentId, functionName, patch },
       }),
     );
   };
@@ -932,6 +937,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
 
   const ribbon = <RibbonHeader
         {...props.ribbonControls}
+        formatting={{ available: summary.projectId != null, summary: formatSummary, onApply: patch => runGridCommand("format", undefined, patch), onCreateProject: props.onCreateFormatProject }}
         formulas={props.formulaControls && summary.projectId != null ? {
           ...props.formulaControls,
           autoSumAvailable: !summary.filtersActive && summary.sortCount === 0 && tabUi.selection.mode === "cells",
@@ -940,7 +946,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
           onProject: () => { setFormulaTab("project"); setFormulasOpen(true); setExplorerOpen(false); },
         } : undefined}
         documentName={summary.displayName}
-        dirty={summary.dirty}
+        dirty={summary.dirty || !!props.projectDirty}
         busy={busy || props.active === false}
         mutationsLocked={macroOpen}
         error={error}
@@ -1042,6 +1048,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
               onCreateImageProject={props.onCreateImageProject}
               initialSizing={tabUi.sizing}
               onApplyEdit={applyEdit}
+              onStyleSummaryChange={setFormatSummary}
               onSelectionChange={(selection) =>
                 updateTabUi(summary.documentId, (current) => ({
                   ...current,
@@ -1156,7 +1163,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
       />
 
       <footer className="statusbar">
-        <span>{summary.dirty ? "Unsaved changes" : "Saved"}</span>
+        <span>{summary.dirty ? "Unsaved changes" : props.projectDirty ? "Unsaved project changes" : "Saved"}</span>
         <span>
           {summary.visibleRowCount.toLocaleString()}
           {summary.filtersActive

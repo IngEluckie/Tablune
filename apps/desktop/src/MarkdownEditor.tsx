@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Crepe } from "@milkdown/crepe";
 import { commandsCtx, editorViewCtx, remarkCtx } from "@milkdown/kit/core";
-import { $view, insert, replaceAll } from "@milkdown/kit/utils";
-import { imageSchema, clearTextInCurrentBlockCommand } from "@milkdown/kit/preset/commonmark";
+import { $prose, $view, insert, replaceAll } from "@milkdown/kit/utils";
+import { imageSchema, htmlSchema, linkSchema, clearTextInCurrentBlockCommand } from "@milkdown/kit/preset/commonmark";
 import { uploadConfig } from "@milkdown/kit/plugin/upload";
 import { NodeSelection, TextSelection } from "@milkdown/kit/prose/state";
 import type { Node as ProseNode } from "@milkdown/kit/prose/model";
@@ -13,6 +13,10 @@ import { markdown } from "@codemirror/lang-markdown";
 import { open } from "@tauri-apps/plugin-dialog";
 import * as ipc from "./ipc";
 import { registerMarkdownEditor, trackMarkdownOperation } from "./markdownPending";
+import { fileLink, insertDocumentLink, linkTrigger, markdownLink, parseTabluneLink, projectLink, type MarkdownLinkTarget } from "./markdownLinks";
+import { completionDatePlugin } from "./markdownTaskDates";
+import { hasUnsupportedMarkdown, isMarkdownBreakHtml, requiresSourceMode } from "./markdownSupport";
+export { requiresSourceMode } from "./markdownSupport";
 import "@milkdown/crepe/theme/common/style.css";
 import "@milkdown/crepe/theme/classic.css";
 import "./markdown.css";
@@ -25,13 +29,18 @@ interface Props {
   onChange: (value: string) => void;
   onError: (error: unknown) => void;
   onSave: () => void;
-}
-// Unsupported source stays editable, rather than being silently removed by a rich-text schema.
-export function requiresSourceMode(value: string) {
-  return /^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/.test(value) || /^\[\^[^\]]+\]:/m.test(value);
+  linkTargets: MarkdownLinkTarget[];
+  onOpenLink: (link: { kind: "project" | "file"; value: string }) => void;
 }
 export default function MarkdownEditor(props: Props) {
   const [mode, setMode] = useState<"visual" | "source">(() => requiresSourceMode(props.value) ? "source" : "visual");
+  const [linkQuery, setLinkQuery] = useState<string | null>(null);
+  const linkRange = useRef<{ from: number; to: number } | null>(null);
+  const updateLinkQuery = (before: string, cursor: number) => {
+    const match = linkTrigger(before);
+    linkRange.current = match ? { from: cursor - match.length, to: cursor } : null;
+    setLinkQuery(match?.query ?? null);
+  };
   const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(false);
   const [query, setQuery] = useState("");
@@ -76,7 +85,10 @@ export default function MarkdownEditor(props: Props) {
       extensions: [markdown(), history(), keymap.of([...defaultKeymap, ...historyKeymap]), EditorView.lineWrapping,
         EditorView.contentAttributes.of({ "aria-label": "Markdown source", spellcheck: "true" }),
         readOnly.current.of(EditorView.editable.of(!latest.current.disabled)),
-        EditorView.updateListener.of(update => { if (update.docChanged) publish(update.state.doc.toString()); })],
+        EditorView.updateListener.of(update => {
+          if (update.docChanged) publish(update.state.doc.toString());
+          if (update.docChanged || update.selectionSet) { const cursor = update.state.selection.main; const line = update.state.doc.lineAt(cursor.head); updateLinkQuery(cursor.empty ? update.state.doc.sliceString(line.from, cursor.head) : "", cursor.head); }
+        })],
     }) });
     source.current = view;
     flushRef.current = () => publish(view.state.doc.toString());
@@ -116,10 +128,25 @@ export default function MarkdownEditor(props: Props) {
       // Use standard Markdown image nodes: Crepe's block images encode their
       // resize ratio in alt text, which would discard an imported description.
       instance.editor.config(ctx => {
+        // Returning to the end of an existing link must also allow plain text.
+        ctx.update(linkSchema.key, previous => ctx => ({ ...previous(ctx), inclusive: false }));
+        // Render only attribute-free <br> markers. Keep the raw value on the
+        // schema node for serialization/clipboard; never interpret other HTML.
+        ctx.update(htmlSchema.key, previous => ctx => {
+          const schema = previous(ctx);
+          return { ...schema, toDOM: node => {
+            const value: unknown = node.attrs.value;
+            if (!isMarkdownBreakHtml(value)) return schema.toDOM!(node);
+            const span = document.createElement("span");
+            span.dataset.type = "html"; span.dataset.value = value;
+            for (const _ of value.matchAll(/<br\s*\/?\s*>/gi)) span.append(document.createElement("br"));
+            return span;
+          } };
+        });
         ctx.update(uploadConfig.key, previous => ({ ...previous, uploader: async (files, schema) => {
           return Promise.all(Array.from(files).filter(file => file.type.startsWith("image/")).map(async file => schema.nodes.image.create({ src: await upload(file), alt: file.name })));
         } }));
-      }).use($view(imageSchema.node, () => (initial, view, getPos) => {
+      }).use($prose(() => completionDatePlugin())).use($view(imageSchema.node, () => (initial, view, getPos) => {
         const dom = document.createElement("span"); dom.className = "markdown-image";
         const img = document.createElement("img"); const status = document.createElement("span");
         dom.append(img, status); let node = initial; let disposed = false; let src = "";
@@ -151,7 +178,11 @@ export default function MarkdownEditor(props: Props) {
         const current = instance.editor.action(ctx => ctx.get(editorViewCtx).state.doc);
         if (!current.eq(baseline)) { baseline = current; outline(current); publish(instance.getMarkdown()); }
       };
-      instance.on(listener => listener.updated(flush).selectionUpdated((ctx, selection) => {
+      instance.on(listener => listener.updated((ctx) => {
+        flush(); const selection = ctx.get(editorViewCtx).state.selection;
+        updateLinkQuery(selection.empty ? selection.$from.parent.textBetween(0, selection.$from.parentOffset, "", "\uFFFC") : "", selection.from);
+      }).selectionUpdated((ctx, selection) => {
+        updateLinkQuery(selection.empty ? selection.$from.parent.textBetween(0, selection.$from.parentOffset, "", "\uFFFC") : "", selection.from);
         if (selection instanceof NodeSelection && selection.node.type.name === "image") setSelectedImage({ position: selection.from, alt: selection.node.attrs.alt ?? "" });
         else setSelectedImage(null);
       }));
@@ -159,9 +190,7 @@ export default function MarkdownEditor(props: Props) {
       if (!alive) return;
       const unsupported = instance.editor.action(ctx => {
         const ast = ctx.get(remarkCtx).parse(text.current);
-        const allowed = new Set(["root", "paragraph", "text", "heading", "emphasis", "strong", "delete", "inlineCode", "code", "blockquote", "list", "listItem", "break", "thematicBreak", "link", "image", "definition", "linkReference", "imageReference", "table", "tableRow", "tableCell"]);
-        const check = (node: { type: string; children?: unknown[] }): boolean => !allowed.has(node.type) || Boolean(node.children?.some(child => check(child as typeof node)));
-        return check(ast);
+        return hasUnsupportedMarkdown(ast);
       });
       if (unsupported || requiresSourceMode(text.current)) {
         setNotice("This document contains syntax outside the visual editor. Markdown code preserves the complete original content.");
@@ -170,6 +199,7 @@ export default function MarkdownEditor(props: Props) {
       baseline = instance.editor.action(ctx => ctx.get(editorViewCtx).state.doc);
       outline(baseline);
       editor.current = instance;
+      setNotice("");
       instance.setReadonly(Boolean(latest.current.disabled));
       flushRef.current = flush; setLoading(false);
     }).catch(error => { if (alive) { latest.current.onError(error); setNotice("The visual editor could not open this content. You can continue in Markdown code."); setMode("source"); } });
@@ -232,10 +262,36 @@ export default function MarkdownEditor(props: Props) {
     })()).catch(props.onError);
   };
   insertImageRef.current = insertImage;
+  const insertLink = (label: string, href: string) => {
+    const range = linkRange.current;
+    if (!range || props.disabled) return;
+    if (source.current) {
+      const view = source.current; const value = markdownLink(label, href);
+      view.dispatch({ changes: { ...range, insert: value }, selection: { anchor: range.from + value.length } }); view.focus();
+    } else if (editor.current) {
+      editor.current.editor.action(ctx => {
+        const view = ctx.get(editorViewCtx); const link = view.state.schema.marks.link;
+        if (!link) return;
+        view.dispatch(insertDocumentLink(view.state, range, label, href)); view.focus();
+      });
+      flushRef.current();
+    }
+    linkRange.current = null; setLinkQuery(null);
+  };
+  const chooseFileLink = async () => {
+    const path = await open({ title: "Vincular archivo", filters: [{ name: "Documentos", extensions: ["md", "markdown", "csv", "tsv", "txt", "tablune"] }] });
+    if (typeof path === "string") insertLink(path.split(/[\\/]/).at(-1) ?? path, fileLink(path));
+  };
   return <section className="markdown-editor" data-history={historyRevision} onClickCapture={event => {
     // Links remain text-editing targets; never navigate the desktop WebView away.
-    if ((event.target as HTMLElement).closest("a[href]")) event.preventDefault();
+    const anchor = (event.target as HTMLElement).closest("a[href]");
+    if (anchor) {
+      event.preventDefault();
+      const link = parseTabluneLink(anchor.getAttribute("href") ?? "");
+      if (link) { event.stopPropagation(); props.onOpenLink(link); }
+    }
   }} onKeyDownCapture={event => {
+    if (linkQuery !== null && event.key === "Escape") { event.preventDefault(); setLinkQuery(null); linkRange.current = null; return; }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") { event.preventDefault(); event.stopPropagation(); searchInput.current?.focus(); return; }
     if (event.target !== searchInput.current && (event.ctrlKey || event.metaKey) && ["z", "y"].includes(event.key.toLowerCase())) {
       event.preventDefault(); event.stopPropagation(); replay(event.shiftKey || event.key.toLowerCase() === "y");
@@ -244,8 +300,8 @@ export default function MarkdownEditor(props: Props) {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") { event.preventDefault(); event.stopPropagation(); flushRef.current(); props.onSave(); }
   }}>
     <div className="markdown-toolbar" role="toolbar" aria-label="Document editing">
-      <button aria-pressed={mode === "visual"} onClick={() => switchMode("visual")}>Visual</button>
-      <button aria-pressed={mode === "source"} onClick={() => switchMode("source")}>Markdown code</button>
+      <button aria-pressed={mode === "visual"} title="Type / for blocks · Select text to format" onClick={() => switchMode("visual")}>Visual</button>
+      <button aria-pressed={mode === "source"} title="Markdown source · Ctrl/Cmd+S to save" onClick={() => switchMode("source")}>Markdown code</button>
       <span className="toolbar-divider" />
       <button disabled={props.disabled || !historyState.current.undo.length} onClick={() => replay(false)}>Undo</button>
       <button disabled={props.disabled || !historyState.current.redo.length} onClick={() => replay(true)}>Redo</button>
@@ -262,8 +318,12 @@ export default function MarkdownEditor(props: Props) {
       <input ref={searchInput} className="markdown-search" aria-label="Find in document" placeholder="Find…" value={query} onChange={event => { setQuery(event.target.value); setSearchStatus(""); }} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); findNext(); } }} />
       <button disabled={!query} onClick={findNext}>Next match</button>
       <span className="markdown-search-status" role="status">{searchStatus}</span>
-      <span className="markdown-hint">{mode === "visual" ? "Type / for blocks · Select text to format" : "Markdown source · Ctrl/Cmd+S to save"}</span>
     </div>
+    {linkQuery !== null && !props.disabled && <div className="markdown-link-menu" role="listbox" aria-label="Vincular documento" onMouseDown={event => event.preventDefault()}>
+      {props.linkTargets.filter(target => `${target.name} ${target.path}`.toLocaleLowerCase().includes(linkQuery.toLocaleLowerCase())).slice(0, 12).map(target =>
+        <button type="button" role="option" aria-selected="false" key={target.id} onClick={() => insertLink(target.name, projectLink(target.id))}>{target.name}<small>{target.path}</small></button>)}
+      <button type="button" onClick={() => void chooseFileLink().catch(props.onError)}>Buscar archivo…</button>
+    </div>}
     {notice && <p className="markdown-notice" role="status">{notice}</p>}
     {mode === "visual" && loading && <p role="status">Opening document…</p>}
     <div className="markdown-page" hidden={mode !== "visual"} ref={host} />

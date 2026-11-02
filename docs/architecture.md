@@ -77,11 +77,11 @@ Project crash recovery has its own versioned manifest (`projects-recovery.json`)
 
 `sheet_session.rs` extends existing document transactions with sparse metadata changes. Raw `TableDocument` strings remain editable source; cached values drive the view. Structural operations rewrite references atomically, and undo stores only changed metadata. Content revisions and calculation revisions are distinct. Recalculating rebuilds the view without making an independent undo step. Project headers remain source row 1.
 
-`calculation.rs` snapshots pending formulas and referenced values, binds requests to project generation, sheet identity, content revision, and applied-functions revision, and rejects stale publication. `calculation_worker.rs` owns a reusable subprocess and exchanges bounded JSON through private temporary files. The worker interprets validated trees rather than evaluating raw cell text. User Functions code is explicitly activated Python code with normal interpreter permissions. Each generation builds a new module namespace; source edits only update the persisted draft until successful application.
+`calculation.rs` snapshots pending formulas and referenced values, binds requests to project generation, sheet identity, calculation input revision, and applied-functions revision, and rejects stale publication. A separate runtime input revision advances on edits/undo/redo/type changes, allowing view changes during calculation without discarding valid results. `calculation_worker.rs` owns a reusable subprocess and exchanges bounded JSON through private temporary files. The worker interprets validated trees rather than evaluating raw cell text. User Functions code is explicitly activated Python code with normal interpreter permissions. Each generation builds a new module namespace; source edits only update the persisted draft until successful application.
 
 Calculations and macros share an async mutex covering execution and publication. Project state is locked only for preparation/publication; Python runs outside document locks. Worker reservation and generation checks share the project lock so cancellation cannot miss a job during startup. Interpreter changes join the same queue and invalidate cached results. Formula results are published through `tablune-calculation` project summaries, and grid windows include displayed values plus editable cell information. React batches confirmed edits before scheduling a new generation.
 
-Format 2 stores raw rows plus sparse sheet metadata in each table entry, and keeps Functions draft/applied source separately. Recovery uses the same metadata and reads older formats. Loaded caches are marked pending; no runtime process or trust authorization survives reopening. Export and transformation snapshots materialize current results and check calculation revision when accepting previews.
+Format 2 stores raw rows plus sparse sheet metadata in each table entry, and keeps Functions draft/applied source separately. Recovery uses the same metadata and reads older formats. Loaded caches retain their saved pending status; no calculation process starts on opening or recovery. A runtime calculation checkpoint tracks sheet input revisions and applied-functions revision. Automatic requests are ignored until these inputs change; view changes and unmodified pending results cannot start a job. Attempts consume that checkpoint so errors and cancellation cannot loop. Recalculate-all explicitly bypasses it. Calculation revisions participate in the project save/recovery signature, including results published after a save. Export and transformation snapshots materialize current results and check calculation revision when accepting previews.
 
 On macOS, grid clipboard reads/writes use small NSPasteboard IPC commands to avoid WebKit's additional paste authorization prompt. Clipboard generation still guards formula-aware copies; other platforms retain the browser clipboard fallback.
 
@@ -105,5 +105,17 @@ AST nodes fall back to source.
 
 `useWorkspace.flushDrafts` drains editor transactions and image uploads before
 revision-checked text updates, save or close. Standalone recovery is versioned
-separately; project recovery format 4 includes Markdown alongside existing data.
-Archive format 4 stores source in `documents/<id>.md` and still reads formats 1–3.
+separately; project recovery format 6 includes Markdown alongside existing data.
+Archive format 6 stores source in `documents/<id>.md` and still reads formats 1–5.
+
+## Project organization (format 5)
+
+`ProjectData.organization` defaults to empty when reading formats 1–4. Folder records have stable IDs, names and parent IDs; a sparse item-to-folder map places existing tables, scripts and Markdown. ZIP payload paths remain ID-based. `project_tree.rs` validates a candidate organization before committing changes, including missing parents/items, folder ID collisions, sibling name collisions, cycles, depth (64) and count (10,000). Creation/import validates the destination first and records placement under the same project lock. Folder removal lifts children to the parent; deletion cleans up item placements.
+
+Archive and recovery writers use version 6. Organization is included in the project signature, so structural edits participate in dirty tracking and recovery without changing script input IDs or invalidating Python modules. `ProjectExplorer` provides a mixed tree with keyboard navigation, project-scoped drag payloads, and locally remembered expansion/selection by persistent project ID. Breadcrumbs and input-table choices use the same logical path helpers. Scripts and Functions retain their side-editor lifecycle.
+
+## Cell formatting (format 6)
+
+`session::styles` validates formatting patches and maps visible selections to source rows. `SheetData.styles` is sparse and independent of formula/type/cache metadata, including for empty cells. Style-only history records update display revision and dirty state without changing the calculation input revision or overwriting asynchronously published results. Structural edits shift styles; applied sorting moves them by stable row IDs.
+
+`FormatToolbar` emits queued `formatCells` edits through `CsvGrid`; save/close waits for that queue. `sheet_style_summary` supplies mixed-selection state. The windowed canvas renders fills, font emphasis, alignment and shared-edge borders. Normal internal paste carries explicit styles; values-only paste preserves destination styles. Native clipboard generation, or a per-copy HTML marker when unavailable, prevents reusing internal metadata for unrelated external text.

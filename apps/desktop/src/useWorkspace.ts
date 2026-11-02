@@ -37,6 +37,7 @@ export function useWorkspace() {
     markdownDraftsRef.current = next; setMarkdownDrafts(next);
   };
   const [tabs, setTabs] = useState<Record<number, ProjectTab[]>>({});
+  const tabsRef = useRef(tabs); tabsRef.current = tabs;
   const [selected, setSelected] = useState<Record<number, ProjectTab | null>>(
     {},
   );
@@ -107,12 +108,14 @@ export function useWorkspace() {
       setBusy(false);
     }
   };
-  const openTab = useCallback((projectId: number, tab: ProjectTab) => {
-    if (tab.kind === "script" || tab.kind === "functions") {
+  const openTab = useCallback((projectId: number, tab: ProjectTab, placement?: "main") => {
+    const inMain = placement === "main" || tabsRef.current[projectId]?.some(t => t.kind === tab.kind && t.id === tab.id);
+    if ((tab.kind === "script" || tab.kind === "functions") && !inMain) {
       setPythonEditors((current) => ({ ...current, [projectId]: tab }));
       setSpace(projectId);
       return;
     }
+    if (placement === "main" || tab.kind === "script") setPythonEditors(current => ({ ...current, [projectId]: null }));
     setTabs((current) => ({
       ...current,
       [projectId]: (current[projectId] ?? []).some(
@@ -128,7 +131,7 @@ export function useWorkspace() {
     setPythonEditors((current) => ({ ...current, [projectId]: null }));
   };
   const closeTab = (projectId: number, tab: ProjectTab) => {
-    if (tab.kind === "script" || tab.kind === "functions") {
+    if ((tab.kind === "script" || tab.kind === "functions") && !tabs[projectId]?.some(t => t.kind === tab.kind && t.id === tab.id)) {
       setPythonEditors((current) => ({
         ...current,
         [projectId]: current[projectId]?.kind === tab.kind && current[projectId]?.id === tab.id
@@ -612,7 +615,7 @@ export function useWorkspace() {
     workspace.projects?.map((p) => [
       p.projectId,
       p.calculation,
-      p.tables.map((t) => [t.document.revision, t.document.pendingCells]),
+      p.tables.map((t) => [t.document.revision, t.document.calculationRevision, t.document.pendingCells]),
     ]),
   );
   useEffect(() => {
@@ -620,14 +623,13 @@ export function useWorkspace() {
     const timer = window.setTimeout(() => {
       for (const p of workspaceRef.current.projects ?? []) {
         if (
-          !p.calculation?.enabled ||
-          p.calculation.running ||
-          p.calculation.paused ||
+          p.calculation?.running ||
           savingRef.current.has(p.projectId) ||
           calculationRequests.current.has(p.projectId) ||
           !p.tables.some((t) => (t.document.pendingCells ?? 0) > 0)
         )
           continue;
+        // Rust ignores automatic requests until inputs change after opening or the last attempt.
         calculationRequests.current.add(p.projectId);
         void ipc
           .recalculateProject(p.projectId)
@@ -644,22 +646,11 @@ export function useWorkspace() {
       }
     }, 150);
     return () => window.clearTimeout(timer);
-  }, [calculationKey, ready, updateProject, report]);
-  const enableProjectCalculation = async (id: number) => {
-    if (
-      !(await ask(
-        "Python functions run with your normal user permissions. The separate Python process is not a security sandbox. Enable automatic calculation for this project in this session?",
-        { title: "Enable Python calculation", kind: "warning" },
-      ))
-    )
-      return;
-    updateProject(await ipc.enableCalculation(id));
-  };
+  }, [calculationKey, ready, savingProjects, updateProject, report]);
   return {
     selectedMarkdown, setSelectedMarkdown, markdownDrafts, editMarkdown, actMarkdown, newMarkdown, saveMarkdown, closeMarkdown,
     functionDrafts,
     editFunctions,
-    enableProjectCalculation,
     workspace,
     workspaceRef,
     commit,

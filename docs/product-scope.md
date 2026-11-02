@@ -6,6 +6,9 @@ Tablune Sheets 0.5 combines the existing CSV editor with calculable sheets insid
 
 ## Included
 
+- Mixed project explorer with nested folders, creation/import destinations, drag/menu moves, and content-preserving folder removal
+- Logical breadcrumbs, keyboard tree navigation, per-project expansion state, and migration from formats 1–5
+
 - Standalone and project Markdown documents with visual/source editing
 - Local images, portable Markdown export, document recovery and close protection
 - Block menu, formatting toolbar, search, heading outline and cross-mode undo
@@ -16,7 +19,7 @@ Tablune Sheets 0.5 combines the existing CSV editor with calculable sheets insid
 - Formula bar, reference insertion, per-cell types, error details, recalculate/cancel controls
 - Incremental dependency calculation, cycle detection, revision-safe result publication
 - Formula-aware copy/paste and structural undo/redo
-- Format-4 persistence/recovery, backward reading, and cached results requiring session enablement
+- Format-6 persistence/recovery, backward reading, and cached results available without Python execution on open
 
 - Home, recent files, and multiple simultaneously open project/CSV spaces
 - Self-contained, versioned `.tablune` project files with atomic saving
@@ -29,6 +32,8 @@ Tablune Sheets 0.5 combines the existing CSV editor with calculable sheets insid
 - Duplicate the current document beside its source without changing the active tab
 - Open CSV, TSV, and semicolon-delimited text
 - Canvas-rendered grid
+- Formato tab: text emphasis, colors, borders, alignment, quick styles and clear formatting
+- Persistent project styles with undo/redo and internal formatted copy/paste
 - Visual row-height and column-width resizing with visible-content auto-fit
 - Cell selection and editing
 - Keyboard navigation
@@ -52,7 +57,7 @@ Tablune Sheets 0.5 combines the existing CSV editor with calculable sheets insid
 ## Excluded
 
 - Cross-sheet references and multi-cell formula results
-- Styling and number formats
+- Number formats, conditional formatting, merged cells, font family/size and text wrapping
 - Excel workbook/worksheet compatibility
 - Excel formula syntax, transformation pipelines, and linked external sources
 - XLSX import or export
@@ -63,6 +68,6 @@ Tablune Sheets 0.5 combines the existing CSV editor with calculable sheets insid
 
 ## Acceptance criterion
 
-In a project, enter `=B1+C1`, edit an input, and see the dependent result update while its formula remains editable. Apply a project function, copy a relative formula, save/reopen without executing code, enable calculation, and export current values.
+In a project, enter `=B1+C1`, edit an input, and see the dependent result update while its formula remains editable. Apply a project function, copy a relative formula, save/reopen without executing code, export saved current values, and edit an input to calculate automatically.
 
 On macOS, a user can safely edit and recover a CSV, inspect up to 100,000 rows through a windowed canvas, create non-destructive views, preview and undo Python transformations, and export results without losing or coercing textual cell values.

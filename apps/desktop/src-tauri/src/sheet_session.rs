@@ -6,6 +6,8 @@ use crate::formulas::{CellMeta, CellResult, CellType, Position, Shift};
 #[serde(rename_all = "camelCase")]
 pub struct SheetCellInput {
     #[serde(default)]
+    pub style: Option<styles::CellStyle>,
+    #[serde(default)]
     pub image: Option<crate::images::CellImage>,
     pub row: usize,
     pub column: usize,
@@ -18,6 +20,7 @@ pub struct SheetCellInput {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CellInfo {
+    pub style: styles::CellStyle,
     pub image: Option<crate::images::CellImage>,
     pub row: usize,
     pub column: usize,
@@ -62,10 +65,7 @@ impl DocumentSession {
         }
         if let Some(m) = meta.filter(|m| m.formula) {
             return m.cached.clone().unwrap_or_else(|| {
-                CellResult::error(
-                    "#PENDING!",
-                    "Enable Python calculation to evaluate this cell",
-                )
+                CellResult::error("#PENDING!", "Recalculate to evaluate this cell")
             });
         }
         formulas::literal(
@@ -78,6 +78,12 @@ impl DocumentSession {
         let meta = self.sheet.cells.get(&formulas::key((row, column)));
         let result = self.scalar_at((row, column));
         CellInfo {
+            style: self
+                .sheet
+                .styles
+                .get(&formulas::key((row, column)))
+                .cloned()
+                .unwrap_or_default(),
             image: meta.and_then(|m| m.image.clone()),
             row,
             column,
@@ -238,6 +244,20 @@ impl DocumentSession {
             ),
             InternalOp::ReorderRows(ids) => {
                 let new: HashMap<_, _> = ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+                sheet.styles = sheet
+                    .styles
+                    .into_iter()
+                    .map(|(k, m)| {
+                        let (r, c) = formulas::position(&k).unwrap();
+                        let row = self
+                            .row_ids
+                            .get(r)
+                            .and_then(|id| new.get(id))
+                            .copied()
+                            .unwrap_or(r);
+                        (formulas::key((row, c)), m)
+                    })
+                    .collect();
                 sheet.cells = sheet
                     .cells
                     .into_iter()
@@ -251,7 +271,7 @@ impl DocumentSession {
         }
         sheet
     }
-    fn shift_sheet(&self, sheet: &mut SheetData, shift: Shift) {
+    pub(super) fn shift_sheet(&self, sheet: &mut SheetData, shift: Shift) {
         let Shift::Structure {
             rows,
             index,
@@ -261,6 +281,24 @@ impl DocumentSession {
         else {
             return;
         };
+        sheet.styles = std::mem::take(&mut sheet.styles)
+            .into_iter()
+            .filter_map(|(k, style)| {
+                let (mut r, mut c) = formulas::position(&k)?;
+                let coord = if rows { &mut r } else { &mut c };
+                if delete {
+                    if *coord >= index && *coord < index + count {
+                        return None;
+                    }
+                    if *coord >= index + count {
+                        *coord -= count;
+                    }
+                } else if *coord >= index {
+                    *coord += count;
+                }
+                Some((formulas::key((r, c)), style))
+            })
+            .collect();
         sheet.cells = std::mem::take(&mut sheet.cells)
             .into_iter()
             .filter_map(|(k, mut m)| {
@@ -318,6 +356,10 @@ impl DocumentSession {
                 c.literal = true;
                 c.cell_type = Some(CellType::Text);
             }
+            if let Some(style) = &c.style {
+                style.validate()?;
+                styles::put_style(&mut after.styles, k.clone(), style.clone());
+            }
             let previous = after.cells.get(&k).cloned().unwrap_or_default();
             let meta = CellMeta {
                 image: c.image,
@@ -350,6 +392,21 @@ impl DocumentSession {
             after.cells.insert(k, meta);
         }
         if changed.is_empty() {
+            let change = SheetChange {
+                cells: vec![],
+                styles: styles::style_changes(&self.sheet.styles, &after.styles),
+            };
+            if !change.styles.is_empty() {
+                return self.commit(
+                    EditRecord {
+                        sheet: Some(change),
+                        forward: InternalOp::StyleOnly,
+                        inverse: InternalOp::StyleOnly,
+                        column_state: None,
+                    },
+                    0,
+                );
+            }
             return Ok(());
         }
         for k in self.graph.affected(changed) {
@@ -539,6 +596,7 @@ mod tests {
             .unwrap()
             .insert(image.asset_id.clone(), asset);
         let input = SheetCellInput {
+            style: None,
             image: Some(image.clone()),
             row: 0,
             column: 0,
@@ -591,6 +649,7 @@ mod tests {
         s.edit_sheet_cells(
             (0..1000)
                 .map(|row| SheetCellInput {
+                    style: None,
                     image: Some(image.clone()),
                     row,
                     column: 0,
@@ -639,6 +698,7 @@ mod tests {
             .unwrap()
             .insert(image.asset_id.clone(), asset);
         s.edit_sheet_cells(vec![SheetCellInput {
+            style: None,
             image: Some(image),
             row: 0,
             column: 0,
@@ -663,6 +723,7 @@ mod tests {
                 cells: cells
                     .iter()
                     .map(|(r, c, v)| SheetCellInput {
+                        style: None,
                         image: None,
                         row: *r,
                         column: *c,
@@ -818,6 +879,7 @@ mod tests {
         s.edit_sheet_cells(
             (0..10_000)
                 .map(|row| SheetCellInput {
+                    style: None,
                     image: None,
                     row,
                     column: 2,

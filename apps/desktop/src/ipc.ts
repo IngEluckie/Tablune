@@ -194,10 +194,6 @@ export const getSheetCell = (documentId: number, row: number, column: number) =>
 export const shiftSheetFormulas = (
   cells: { source: string; rowDelta: number; columnDelta: number }[],
 ) => invoke<string[]>("sheet_shift_formulas", { cells });
-export const enableCalculation = (projectId: number) =>
-  invoke<import("./types").ProjectSummary>("project_enable_calculation", {
-    projectId,
-  });
 export const recalculateProject = (projectId: number, force = false) =>
   invoke<import("./types").ProjectSummary>("project_recalculate", {
     projectId,
@@ -241,3 +237,6 @@ export const importMarkdownImage = (projectId: number | null, documentId: string
   invoke<string>("markdown_image_import", { projectId, documentId, path, bytes });
 export const readMarkdownImage = (projectId: number | null, documentId: string, url: string) =>
   invoke<ArrayBuffer>("markdown_image_read", { projectId, documentId, url });
+
+export const getStyleSummary = (documentId: number, range: import("./types").CellRange, expectedRevision: number) =>
+  invoke<import("./types").StyleSummary>("sheet_style_summary", { documentId, range, expectedRevision });

@@ -2,6 +2,9 @@
 use super::*;
 #[path = "project_archive.rs"]
 mod archive;
+#[path = "project_tree.rs"]
+mod tree;
+pub use tree::{ProjectFolder, ProjectOrganization};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,7 +26,6 @@ pub struct FunctionsData {
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CalculationSummary {
-    pub enabled: bool,
     pub running: bool,
     pub paused: bool,
     pub error: Option<String>,
@@ -43,6 +45,8 @@ pub struct TableMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectData {
+    #[serde(default)]
+    pub organization: ProjectOrganization,
     #[serde(default)]
     pub markdown: Vec<super::markdown::MarkdownDocument>,
     #[serde(default)]
@@ -66,6 +70,7 @@ pub struct ProjectTableSummary {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectSummary {
+    pub organization: ProjectOrganization,
     pub markdown: Vec<super::markdown::MarkdownDocument>,
     pub functions: FunctionsData,
     pub calculation: CalculationSummary,
@@ -123,6 +128,8 @@ pub struct ProjectSession {
     pub(super) calculation: CalculationSummary,
     pub(super) calculation_generation: u64,
     saved_signature: String,
+    // Runtime-only baseline: opening/recovery must never authorize a calculation.
+    calculation_checkpoint: (u64, HashMap<u64, u64>),
 }
 static PROJECT_PATH_OPERATIONS: std::sync::LazyLock<Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -245,7 +252,12 @@ impl ProjectSession {
             });
             session.image_assets = image_assets.clone();
             session.sheet = meta.sheet.clone();
-            session.sheet.invalidate_all();
+            // Keep saved caches and pending flags; loading does not change inputs.
+            for meta in session.sheet.cells.values_mut().filter(|m| m.formula) {
+                if meta.cached.is_none() {
+                    meta.pending = true;
+                }
+            }
             session.sync_sheet();
             session.project_id = Some(runtime_id);
             session.title = Some(meta.name.clone());
@@ -261,15 +273,69 @@ impl ProjectSession {
             path,
             tables,
             saved_signature: String::new(),
+            calculation_checkpoint: Default::default(),
             calculation: CalculationSummary::default(),
             calculation_generation: 0,
         };
-        project.data.version = 4;
+        project.checkpoint_calculation()?;
+        project.data.version = 6;
         project.data.rows.clear();
         if !dirty {
             project.saved_signature = project.signature()?;
         }
         Ok(project)
+    }
+    pub(super) fn checkpoint_calculation(&mut self) -> Result<(), String> {
+        self.calculation_checkpoint = (
+            self.data.functions.revision,
+            self.tables
+                .iter()
+                .map(|table| {
+                    let s = lock_document(table)?;
+                    Ok((s.identity, s.calculation_input_revision))
+                })
+                .collect::<Result<_, String>>()?,
+        );
+        Ok(())
+    }
+    /// Automatic requests only run after a content edit or applied function change.
+    /// Navigation, opening, recovery and failed/cancelled jobs cannot start Python.
+    pub(super) fn begin_calculation(&mut self, force: bool) -> Result<bool, String> {
+        if self.calculation.running {
+            return Ok(false);
+        }
+        let sessions = self
+            .tables
+            .iter()
+            .map(lock_document)
+            .collect::<Result<Vec<_>, _>>()?;
+        let inputs = (
+            self.data.functions.revision,
+            sessions
+                .iter()
+                .map(|s| (s.identity, s.calculation_input_revision))
+                .collect(),
+        );
+        if !force && inputs == self.calculation_checkpoint {
+            return Ok(false);
+        }
+        self.calculation_checkpoint = inputs;
+        let mut pending = false;
+        for mut s in sessions {
+            if force && s.sheet.formulas().next().is_some() {
+                s.sheet.invalidate_all();
+                s.calculation_revision += 1;
+            }
+            pending |= s.sheet.formulas().any(|(_, m)| m.pending);
+        }
+        if !pending {
+            return Ok(false);
+        }
+        self.calculation.paused = false;
+        self.calculation.error = None;
+        self.calculation.running = true;
+        self.calculation_generation += 1;
+        Ok(true)
     }
     fn save_to(&mut self, destination: PathBuf) -> Result<ProjectSummary, String> {
         let handles = self.tables.clone();
@@ -293,7 +359,14 @@ impl ProjectSession {
     ) -> Result<String, String> {
         let states: Vec<_> = sessions
             .iter()
-            .map(|s| (s.identity, s.revision, s.current_state))
+            .map(|s| {
+                (
+                    s.identity,
+                    s.revision,
+                    s.current_state,
+                    s.calculation_revision,
+                )
+            })
             .collect();
         serde_json::to_string(&(&self.data, states)).map_err(|e| e.to_string())
     }
@@ -320,10 +393,10 @@ impl ProjectSession {
             s.calculation_revision.hash(&mut hash);
         }
         Ok(ProjectSummary {
+            organization: self.data.organization.clone(),
             markdown: self.data.markdown.clone(),
             functions: self.data.functions.clone(),
             calculation: CalculationSummary {
-                enabled: self.calculation.enabled,
                 running: self.calculation.running,
                 paused: self.calculation.paused,
                 error: self.calculation.error.clone(),
@@ -484,6 +557,7 @@ pub(super) fn project_new_internal(
         .transpose()?;
     let mut project = ProjectSession::from_data(
         ProjectData {
+            organization: ProjectOrganization::default(),
             markdown: Vec::new(),
             assets: Default::default(),
             functions: FunctionsData::default(),
@@ -609,9 +683,37 @@ fn project_save_internal(
     rename_all_fields = "camelCase"
 )]
 pub enum ProjectAction {
-    NewTable,
+    CreateFolder {
+        name: String,
+        parent_id: Option<String>,
+    },
+    RenameFolder {
+        folder_id: String,
+        name: String,
+    },
+    MoveItem {
+        item_id: String,
+        folder_id: Option<String>,
+    },
+    RemoveFolder {
+        folder_id: String,
+    },
+    NewDocument {
+        name: String,
+        folder_id: Option<String>,
+    },
+    ImportDocument {
+        path: String,
+        folder_id: Option<String>,
+    },
+    NewTable {
+        #[serde(default)]
+        folder_id: Option<String>,
+    },
     ImportTable {
         path: String,
+        #[serde(default)]
+        folder_id: Option<String>,
     },
     RenameTable {
         table_id: String,
@@ -623,7 +725,10 @@ pub enum ProjectAction {
     DeleteTable {
         table_id: String,
     },
-    NewScript,
+    NewScript {
+        #[serde(default)]
+        folder_id: Option<String>,
+    },
     UpdateFunctions {
         code: String,
         expected_revision: u64,
@@ -631,6 +736,8 @@ pub enum ProjectAction {
     ImportScript {
         name: String,
         code: String,
+        #[serde(default)]
+        folder_id: Option<String>,
     },
     UpdateScript {
         script_id: String,
@@ -664,6 +771,102 @@ fn apply_action(
     let handle = handle(state, project_id)?;
     let mut p = lock_project(&handle)?;
     match action {
+        ProjectAction::CreateFolder { name, parent_id } => {
+            let name = tree::folder_name(&name)?;
+            p.change_organization(|org| {
+                org.folders.push(ProjectFolder {
+                    id: persistent_id(),
+                    name,
+                    parent_id,
+                });
+                Ok(())
+            })?;
+        }
+        ProjectAction::RenameFolder { folder_id, name } => {
+            let name = tree::folder_name(&name)?;
+            p.change_organization(|org| {
+                org.folders
+                    .iter_mut()
+                    .find(|f| f.id == folder_id)
+                    .ok_or("Carpeta no encontrada")?
+                    .name = name;
+                Ok(())
+            })?;
+        }
+        ProjectAction::MoveItem { item_id, folder_id } => {
+            let is_folder = p.data.organization.folders.iter().any(|f| f.id == item_id);
+            if !is_folder && !tree::item_ids(&p.data).any(|id| id == &item_id) {
+                return Err("Elemento no encontrado".into());
+            }
+            p.change_organization(|org| {
+                if is_folder {
+                    org.folders
+                        .iter_mut()
+                        .find(|f| f.id == item_id)
+                        .unwrap()
+                        .parent_id = folder_id;
+                } else if let Some(parent) = folder_id {
+                    org.item_folders.insert(item_id, parent);
+                } else {
+                    org.item_folders.remove(&item_id);
+                }
+                Ok(())
+            })?;
+        }
+        ProjectAction::RemoveFolder { folder_id } => {
+            p.change_organization(|org| {
+                let parent = org
+                    .folders
+                    .iter()
+                    .find(|f| f.id == folder_id)
+                    .ok_or("Carpeta no encontrada")?
+                    .parent_id
+                    .clone();
+                org.folders.retain(|f| f.id != folder_id);
+                for folder in &mut org.folders {
+                    if folder.parent_id.as_ref() == Some(&folder_id) {
+                        folder.parent_id = parent.clone();
+                    }
+                }
+                let children: Vec<_> = org
+                    .item_folders
+                    .iter()
+                    .filter(|(_, folder)| *folder == &folder_id)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in children {
+                    if let Some(parent) = &parent {
+                        org.item_folders.insert(id, parent.clone());
+                    } else {
+                        org.item_folders.remove(&id);
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        ProjectAction::NewDocument { name, folder_id } => {
+            p.ensure_folder(folder_id.as_deref())?;
+            let title = unique_name(&name, p.data.markdown.iter().map(|d| d.name.clone()));
+            let doc = super::markdown::new_document(title)?;
+            p.place_item(doc.id.clone(), folder_id);
+            p.data.markdown.push(doc);
+        }
+        ProjectAction::ImportDocument { path, folder_id } => {
+            p.ensure_folder(folder_id.as_deref())?;
+            let mut session = super::markdown::open_document(&path)?;
+            session.document.name = unique_name(
+                &session.document.name,
+                p.data.markdown.iter().map(|d| d.name.clone()),
+            );
+            session.document.path = None;
+            session.document.dirty = true;
+            p.image_assets
+                .lock()
+                .map_err(|e| e.to_string())?
+                .extend(session.assets);
+            p.place_item(session.document.id.clone(), folder_id);
+            p.data.markdown.push(session.document);
+        }
         ProjectAction::UpdateFunctions {
             code,
             expected_revision,
@@ -679,10 +882,14 @@ fn apply_action(
                 p.data.functions.draft_revision += 1;
             }
         }
-        ProjectAction::NewTable => {
+        ProjectAction::NewTable { folder_id } => {
+            p.ensure_folder(folder_id.as_deref())?;
             p.add_table(DocumentSession::default(), "Table")?;
+            let id = p.data.tables.last().unwrap().id.clone();
+            p.place_item(id, folder_id);
         }
-        ProjectAction::ImportTable { path } => {
+        ProjectAction::ImportTable { path, folder_id } => {
+            p.ensure_folder(folder_id.as_deref())?;
             let file = tablune_csv::read_path(&path).map_err(|e| e.to_string())?;
             let header = suggest_header(file.document.rows());
             let session = DocumentSession::from_file(
@@ -700,6 +907,8 @@ fn apply_action(
                     .and_then(|s| s.to_str())
                     .unwrap_or("Table"),
             )?;
+            let id = p.data.tables.last().unwrap().id.clone();
+            p.place_item(id, folder_id);
         }
         ProjectAction::RenameTable {
             table_id,
@@ -737,7 +946,10 @@ fn apply_action(
             };
             session.rebuild_view();
             let title = p.data.tables[i].name.clone();
+            let folder_id = p.data.organization.item_folders.get(&table_id).cloned();
             p.add_table(session, &title)?;
+            let id = p.data.tables.last().unwrap().id.clone();
+            p.place_item(id, folder_id);
         }
         ProjectAction::DeleteTable { table_id } => {
             let i = p
@@ -747,6 +959,7 @@ fn apply_action(
                 .position(|t| t.id == table_id)
                 .ok_or("Table not found")?;
             p.data.tables.remove(i);
+            p.data.organization.item_folders.remove(&table_id);
             p.tables.remove(i);
             for s in &mut p.data.scripts {
                 if s.input_table_id.as_ref() == Some(&table_id) {
@@ -755,7 +968,8 @@ fn apply_action(
                 }
             }
         }
-        ProjectAction::NewScript => {
+        ProjectAction::NewScript { folder_id } => {
+            p.ensure_folder(folder_id.as_deref())?;
             let title = unique_name(
                 "Transform.py",
                 p.data.scripts.iter().map(|s| s.name.clone()),
@@ -768,8 +982,15 @@ fn apply_action(
                 revision: 0,
                 input_table_id: input,
             });
+            let id = p.data.scripts.last().unwrap().id.clone();
+            p.place_item(id, folder_id);
         }
-        ProjectAction::ImportScript { name: title, code } => {
+        ProjectAction::ImportScript {
+            name: title,
+            code,
+            folder_id,
+        } => {
+            p.ensure_folder(folder_id.as_deref())?;
             if code.len() > 1024 * 1024 {
                 return Err("Script exceeds 1 MiB".into());
             }
@@ -785,6 +1006,8 @@ fn apply_action(
                 revision: 0,
                 input_table_id: input,
             });
+            let id = p.data.scripts.last().unwrap().id.clone();
+            p.place_item(id, folder_id);
         }
         ProjectAction::UpdateScript {
             script_id,
@@ -832,6 +1055,7 @@ fn apply_action(
                 .position(|s| s.id == script_id)
                 .ok_or("Script not found")?;
             p.data.scripts.remove(i);
+            p.data.organization.item_folders.remove(&script_id);
         }
     }
     update_directory(&handle, &p)?;
@@ -1014,7 +1238,7 @@ pub(super) fn write_recovery(app: &AppHandle, state: &WorkspaceState) -> Result<
         write_bytes_atomic(
             &path,
             &serde_json::to_vec(&RecoveryProjects {
-                version: 4,
+                version: 6,
                 projects,
             })
             .map_err(|e| e.to_string())?,
@@ -1078,7 +1302,7 @@ pub(super) fn read_recovery(app: &AppHandle) -> Result<Vec<RecoveryProject>, Str
         return Ok(Vec::new());
     }
     let mut payload: RecoveryProjects = read_json(&path)?;
-    if !matches!(payload.version, 1..=4) {
+    if !matches!(payload.version, 1..=6) {
         return Err("Unsupported project recovery version".into());
     }
     for p in &mut payload.projects {
@@ -1105,6 +1329,362 @@ pub(super) fn restore_projects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn add_folder(
+        state: &WorkspaceState,
+        project: u64,
+        name: &str,
+        parent_id: Option<String>,
+    ) -> String {
+        apply_action(
+            state,
+            project,
+            ProjectAction::CreateFolder {
+                name: name.into(),
+                parent_id,
+            },
+        )
+        .unwrap()
+        .organization
+        .folders
+        .last()
+        .unwrap()
+        .id
+        .clone()
+    }
+
+    #[test]
+    fn nested_folders_round_trip_and_recovery_keep_item_ids_and_script_bindings() {
+        let state = WorkspaceState::default();
+        let id = add_project(&state, fixture());
+        let parent = add_folder(&state, id, "Análisis", None);
+        let child = add_folder(&state, id, "Mensual", Some(parent));
+        for item in ["table-fixture", "script-fixture"] {
+            apply_action(
+                &state,
+                id,
+                ProjectAction::MoveItem {
+                    item_id: item.into(),
+                    folder_id: Some(child.clone()),
+                },
+            )
+            .unwrap();
+        }
+        let summary = apply_action(
+            &state,
+            id,
+            ProjectAction::NewDocument {
+                name: "Resumen.md".into(),
+                folder_id: Some(child.clone()),
+            },
+        )
+        .unwrap();
+        assert!(summary.dirty);
+        assert_eq!(
+            summary.scripts[0].input_table_id.as_deref(),
+            Some("table-fixture")
+        );
+        assert_eq!(summary.scripts[0].revision, 3);
+        assert_eq!(summary.organization.item_folders.len(), 3);
+        let h = handle(&state, id).unwrap();
+        let mut p = lock_project(&h).unwrap();
+        let path = temporary_path();
+        p.save_to(path.clone()).unwrap();
+        assert!(!p.summary().unwrap().dirty);
+        let read = archive::read(&path).unwrap();
+        assert_eq!(read.version, 6);
+        assert_eq!(read.organization, summary.organization);
+        assert_eq!(read.rows, fixture().rows);
+        let mut data = p.snapshot_with(
+            &p.tables
+                .iter()
+                .map(lock_document)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+        let rows = std::mem::take(&mut data.rows);
+        let payload = RecoveryProjects {
+            version: 6,
+            projects: vec![RecoveryProject {
+                data,
+                rows,
+                path: None,
+            }],
+        };
+        let decoded: RecoveryProjects =
+            serde_json::from_slice(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        let mut recovered = decoded.projects.into_iter().next().unwrap();
+        recovered.data.rows = recovered.rows;
+        let mut restored = ProjectSession::from_data(recovered.data, None, true).unwrap();
+        assert!(!restored.begin_calculation(false).unwrap());
+        assert_eq!(
+            restored.summary().unwrap().organization,
+            summary.organization
+        );
+        assert_eq!(
+            restored
+                .script_input("script-fixture")
+                .unwrap()
+                .0
+                .input_table_id
+                .as_deref(),
+            Some("table-fixture")
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn organization_mutations_reject_cycles_missing_parents_and_name_conflicts_atomically() {
+        let state = WorkspaceState::default();
+        let id = add_project(&state, fixture());
+        let parent = add_folder(&state, id, "Datos", None);
+        let child = add_folder(&state, id, "Origen", Some(parent.clone()));
+        add_folder(&state, id, "Archivo", None);
+        let h = handle(&state, id).unwrap();
+        let before = lock_project(&h).unwrap().summary().unwrap();
+        for action in [
+            ProjectAction::MoveItem {
+                item_id: parent.clone(),
+                folder_id: Some(child),
+            },
+            ProjectAction::MoveItem {
+                item_id: parent.clone(),
+                folder_id: Some(parent.clone()),
+            },
+            ProjectAction::MoveItem {
+                item_id: "missing-item".into(),
+                folder_id: None,
+            },
+            ProjectAction::MoveItem {
+                item_id: "table-fixture".into(),
+                folder_id: Some("missing-folder".into()),
+            },
+            ProjectAction::RenameFolder {
+                folder_id: parent.clone(),
+                name: "Archivo".into(),
+            },
+            ProjectAction::CreateFolder {
+                name: "../escape".into(),
+                parent_id: None,
+            },
+            ProjectAction::CreateFolder {
+                name: "Datos".into(),
+                parent_id: None,
+            },
+            ProjectAction::NewTable {
+                folder_id: Some("missing-folder".into()),
+            },
+        ] {
+            assert!(apply_action(&state, id, action).is_err());
+            assert_eq!(
+                lock_project(&h).unwrap().summary().unwrap().revision,
+                before.revision
+            );
+        }
+    }
+
+    #[test]
+    fn removing_a_folder_preserves_nested_content_and_deleted_items_leave_no_placements() {
+        let state = WorkspaceState::default();
+        let id = add_project(&state, fixture());
+        let parent = add_folder(&state, id, "Datos", None);
+        let child = add_folder(&state, id, "Origen", Some(parent.clone()));
+        apply_action(
+            &state,
+            id,
+            ProjectAction::MoveItem {
+                item_id: "table-fixture".into(),
+                folder_id: Some(child.clone()),
+            },
+        )
+        .unwrap();
+        apply_action(
+            &state,
+            id,
+            ProjectAction::MoveItem {
+                item_id: "script-fixture".into(),
+                folder_id: Some(parent.clone()),
+            },
+        )
+        .unwrap();
+        let next = apply_action(
+            &state,
+            id,
+            ProjectAction::RemoveFolder { folder_id: parent },
+        )
+        .unwrap();
+        assert_eq!(next.tables.len(), 1);
+        assert_eq!(next.scripts.len(), 1);
+        assert_eq!(next.organization.folders[0].parent_id, None);
+        assert_eq!(
+            next.organization.item_folders.get("table-fixture"),
+            Some(&child)
+        );
+        assert!(
+            !next
+                .organization
+                .item_folders
+                .contains_key("script-fixture")
+        );
+        let duplicate = apply_action(
+            &state,
+            id,
+            ProjectAction::DuplicateTable {
+                table_id: "table-fixture".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            duplicate
+                .organization
+                .item_folders
+                .get(&duplicate.tables[1].id),
+            Some(&child)
+        );
+        let deleted = apply_action(
+            &state,
+            id,
+            ProjectAction::DeleteTable {
+                table_id: "table-fixture".into(),
+            },
+        )
+        .unwrap();
+        assert!(
+            !deleted
+                .organization
+                .item_folders
+                .contains_key("table-fixture")
+        );
+        assert_eq!(deleted.scripts[0].input_table_id, None);
+    }
+
+    #[test]
+    fn folder_removal_with_conflicting_child_names_is_atomic() {
+        let state = WorkspaceState::default();
+        let id = add_project(&state, fixture());
+        let parent = add_folder(&state, id, "Datos", None);
+        add_folder(&state, id, "Origen", Some(parent.clone()));
+        add_folder(&state, id, "Origen", None);
+        let h = handle(&state, id).unwrap();
+        let before = lock_project(&h).unwrap().summary().unwrap().revision;
+        assert!(
+            apply_action(
+                &state,
+                id,
+                ProjectAction::RemoveFolder { folder_id: parent }
+            )
+            .is_err()
+        );
+        assert_eq!(
+            lock_project(&h).unwrap().summary().unwrap().revision,
+            before
+        );
+    }
+
+    #[test]
+    fn archive_validation_rejects_invalid_folder_graphs_and_legacy_files_migrate_to_root() {
+        let mut old = serde_json::to_value(fixture()).unwrap();
+        old.as_object_mut().unwrap().remove("organization");
+        let mut legacy: ProjectData = serde_json::from_value(old).unwrap();
+        legacy.rows = fixture().rows;
+        let project = ProjectSession::from_data(legacy, None, false).unwrap();
+        assert_eq!(project.data.version, 6);
+        assert_eq!(project.data.organization, ProjectOrganization::default());
+        assert!(!project.summary().unwrap().dirty);
+        let mut data = fixture();
+        data.version = 5;
+        data.organization.folders.push(ProjectFolder {
+            id: "folder-one".into(),
+            name: "Datos".into(),
+            parent_id: None,
+        });
+        data.organization
+            .item_folders
+            .insert("table-fixture".into(), "folder-one".into());
+        assert!(archive::validate(&data).is_ok());
+        let mut invalid = data.clone();
+        invalid.organization.folders[0].parent_id = Some("folder-one".into());
+        assert!(archive::validate(&invalid).is_err());
+        let mut invalid = data.clone();
+        invalid.organization.folders[0].id = "table-fixture".into();
+        assert!(archive::validate(&invalid).is_err());
+        let mut invalid = data.clone();
+        invalid
+            .organization
+            .item_folders
+            .insert("missing".into(), "folder-one".into());
+        assert!(archive::validate(&invalid).is_err());
+        data.version = 4;
+        assert!(archive::validate(&data).is_err());
+    }
+
+    #[test]
+    fn creation_and_import_target_folders_without_linking_external_documents() {
+        let state = WorkspaceState::default();
+        let id = add_project(&state, fixture());
+        let folder = add_folder(&state, id, "Mixto", None);
+        let table = apply_action(
+            &state,
+            id,
+            ProjectAction::NewTable {
+                folder_id: Some(folder.clone()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            table
+                .organization
+                .item_folders
+                .get(&table.tables.last().unwrap().id),
+            Some(&folder)
+        );
+        let script = apply_action(
+            &state,
+            id,
+            ProjectAction::NewScript {
+                folder_id: Some(folder.clone()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            script
+                .organization
+                .item_folders
+                .get(&script.scripts.last().unwrap().id),
+            Some(&folder)
+        );
+        let directory = temporary_path();
+        let source = directory.with_extension("md");
+        fs::write(&source, "# Notas\n\nContenido local.").unwrap();
+        let doc = apply_action(
+            &state,
+            id,
+            ProjectAction::ImportDocument {
+                path: source.to_string_lossy().into(),
+                folder_id: Some(folder.clone()),
+            },
+        )
+        .unwrap();
+        let markdown = &doc.markdown[0];
+        assert_eq!(markdown.path, None);
+        assert_eq!(markdown.content, "# Notas\n\nContenido local.");
+        assert_eq!(
+            doc.organization.item_folders.get(&markdown.id),
+            Some(&folder)
+        );
+        fs::remove_file(&source).unwrap();
+        let h = handle(&state, id).unwrap();
+        lock_project(&h)
+            .unwrap()
+            .save_to(directory.clone())
+            .unwrap();
+        assert_eq!(
+            archive::read(&directory).unwrap().markdown[0].content,
+            markdown.content
+        );
+        let legacy: ProjectAction = serde_json::from_str(r#"{"kind":"newTable"}"#).unwrap();
+        assert!(apply_action(&state, id, legacy).is_ok());
+        fs::remove_dir_all(directory.parent().unwrap()).unwrap();
+    }
     #[test]
     fn markdown_round_trip_and_document_only_changes_are_persistent() {
         let mut data = fixture();
@@ -1122,7 +1702,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("{}.tablune", persistent_id()));
         archive::write(&path, &data).unwrap();
         let read = archive::read(&path).unwrap();
-        assert_eq!(read.version, 4);
+        assert_eq!(read.version, 6);
         assert_eq!(read.markdown[0].content, data.markdown[0].content);
         let mut p = ProjectSession::from_data(read, Some(path.clone()), false).unwrap();
         assert!(!p.summary().unwrap().dirty);
@@ -1195,6 +1775,7 @@ mod tests {
     }
     fn fixture() -> ProjectData {
         ProjectData {
+            organization: ProjectOrganization::default(),
             markdown: Vec::new(),
             assets: Default::default(),
             functions: FunctionsData::default(),
@@ -1246,6 +1827,7 @@ mod tests {
         lock_document(&p.tables[0])
             .unwrap()
             .edit_sheet_cells(vec![sheets::SheetCellInput {
+                style: None,
                 image: Some(image),
                 row: 1,
                 column: 1,
@@ -1262,7 +1844,7 @@ mod tests {
         let path = temporary_path();
         p.save_to(path.clone()).unwrap();
         let data = archive::read(&path).unwrap();
-        assert_eq!(data.version, 4);
+        assert_eq!(data.version, 6);
         assert_eq!(data.assets.len(), 1);
         let mut restored = ProjectSession::from_data(data, None, true).unwrap();
         {
@@ -1334,6 +1916,7 @@ mod tests {
         assert!(archive::validate(&data).is_err());
         sessions[0]
             .edit_sheet_cells(vec![sheets::SheetCellInput {
+                style: None,
                 image: None,
                 row: 1,
                 column: 1,
@@ -1732,6 +2315,7 @@ mod tests {
             s.apply_edit(
                 EditCommand::SetSheetCells {
                     cells: vec![sheets::SheetCellInput {
+                        style: None,
                         image: None,
                         row: 1,
                         column: 2,
@@ -1749,19 +2333,245 @@ mod tests {
         let path = temporary_path();
         p.save_to(path.clone()).unwrap();
         let data = archive::read(&path).unwrap();
-        assert_eq!(data.version, 4);
+        assert_eq!(data.version, 6);
         assert_eq!(data.functions.draft, p.data.functions.draft);
         assert_eq!(data.functions.applied, p.data.functions.applied);
         let restored = ProjectSession::from_data(data, Some(path.clone()), false).unwrap();
-        assert!(!restored.calculation.enabled);
+        assert!(!restored.calculation.running);
         let table = lock_document(&restored.tables[0]).unwrap();
         assert_eq!(table.raw_cell(1, 2), "=f(21)");
         assert_eq!(table.cell_value(1, 2), "42");
-        assert!(table.sheet.cells["1,2"].pending);
-        assert!(table.ensure_calculated().is_err());
+        assert!(!table.sheet.cells["1,2"].pending);
+        assert!(table.ensure_calculated().is_ok());
         assert!(!restored.calculation.running);
         drop(table);
         assert!(!restored.summary().unwrap().dirty);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    fn edit_calculation_cell(p: &ProjectSession, column: usize, value: &str) {
+        lock_document(&p.tables[0])
+            .unwrap()
+            .edit_sheet_cells(vec![sheets::SheetCellInput {
+                style: None,
+                image: None,
+                row: 1,
+                column,
+                value: value.into(),
+                literal: false,
+                cell_type: None,
+            }])
+            .unwrap();
+    }
+    fn finish_test_calculation(p: &mut ProjectSession) {
+        calculation::calculate_for_test(
+            &mut lock_document(&p.tables[0]).unwrap(),
+            &p.data.functions.applied,
+        );
+        p.calculation.running = false;
+    }
+    #[test]
+    fn cached_and_unfinished_projects_open_without_calculation_until_an_input_changes() {
+        let path = temporary_path();
+        let mut p = ProjectSession::from_data(fixture(), None, true).unwrap();
+        edit_calculation_cell(&p, 1, "10");
+        edit_calculation_cell(&p, 2, "=B2*2");
+        edit_calculation_cell(&p, 3, "=7*3");
+        assert!(p.begin_calculation(false).unwrap());
+        finish_test_calculation(&mut p);
+        p.save_to(path.clone()).unwrap();
+        let mut reopened =
+            ProjectSession::from_data(archive::read(&path).unwrap(), Some(path.clone()), false)
+                .unwrap();
+        assert!(!reopened.begin_calculation(false).unwrap());
+        assert!(!reopened.summary().unwrap().dirty);
+        assert!(
+            lock_document(&reopened.tables[0])
+                .unwrap()
+                .ensure_calculated()
+                .is_ok()
+        );
+        // Save with a previous result and a brand new formula still pending.
+        edit_calculation_cell(&reopened, 1, "15");
+        edit_calculation_cell(&reopened, 4, "=B2+1");
+        reopened.save_to(path.clone()).unwrap();
+        let mut reopened =
+            ProjectSession::from_data(archive::read(&path).unwrap(), Some(path.clone()), false)
+                .unwrap();
+        assert!(!reopened.begin_calculation(false).unwrap());
+        {
+            let mut table = lock_document(&reopened.tables[0]).unwrap();
+            assert_eq!(table.cell_value(1, 2), "20");
+            assert!(table.sheet.cells["1,2"].pending);
+            assert!(table.sheet.cells["1,4"].cached.is_none());
+            assert!(!table.sheet.cells["1,3"].pending);
+            assert!(table.ensure_calculated().is_err());
+            // View changes use the document revision, not calculation inputs.
+            table.view = ViewState::default();
+            table.revision += 1;
+            table.rebuild_view();
+        }
+        assert!(!reopened.begin_calculation(false).unwrap());
+        edit_calculation_cell(&reopened, 1, "18");
+        assert!(reopened.begin_calculation(false).unwrap());
+        finish_test_calculation(&mut reopened);
+        let table = lock_document(&reopened.tables[0]).unwrap();
+        assert_eq!(table.cell_value(1, 2), "36");
+        assert_eq!(table.cell_value(1, 3), "21");
+        assert_eq!(table.cell_value(1, 4), "19");
+        assert!(table.ensure_calculated().is_ok());
+        drop(table);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn calculation_attempts_do_not_loop_and_resume_after_edit_or_explicit_recalculate() {
+        let mut p = ProjectSession::from_data(fixture(), None, true).unwrap();
+        edit_calculation_cell(&p, 2, "=B2*2");
+        assert!(p.begin_calculation(false).unwrap());
+        assert!(!p.begin_calculation(true).unwrap()); // Already running.
+        // Missing Python, timeout, or another worker failure leaves the input pending.
+        p.calculation.running = false;
+        p.calculation.paused = true;
+        p.calculation.error = Some("Python unavailable".into());
+        assert!(!p.begin_calculation(false).unwrap());
+        edit_calculation_cell(&p, 1, "20");
+        assert!(p.begin_calculation(false).unwrap());
+        assert!(p.calculation.error.is_none());
+        assert!(!p.calculation.paused);
+        // Cancellation also acknowledges any edits made during that attempt.
+        edit_calculation_cell(&p, 1, "25");
+        p.checkpoint_calculation().unwrap();
+        p.calculation.running = false;
+        p.calculation.paused = true;
+        assert!(!p.begin_calculation(false).unwrap());
+        assert!(p.begin_calculation(true).unwrap());
+        finish_test_calculation(&mut p);
+        assert_eq!(lock_document(&p.tables[0]).unwrap().cell_value(1, 2), "50");
+    }
+    #[test]
+    fn results_finished_after_save_are_dirty_and_survive_another_save_and_recovery() {
+        let path = temporary_path();
+        let mut p = ProjectSession::from_data(fixture(), None, true).unwrap();
+        let external = path.with_extension("txt");
+        fs::write(&external, "42").unwrap();
+        p.data.functions.applied = format!(
+            "from pathlib import Path\ndef external(): return int(Path({}).read_text())\n",
+            serde_json::to_string(&external.to_string_lossy()).unwrap()
+        );
+        edit_calculation_cell(&p, 2, "=external()");
+        assert!(p.begin_calculation(false).unwrap());
+        p.save_to(path.clone()).unwrap(); // Save a coherent, unfinished snapshot.
+        assert!(!p.summary().unwrap().dirty);
+        finish_test_calculation(&mut p);
+        assert!(p.summary().unwrap().dirty);
+        let sessions = p
+            .tables
+            .iter()
+            .map(lock_document)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        // Recovery uses this exact signature comparison to include changed projects.
+        assert_ne!(p.signature_with(&sessions).unwrap(), p.saved_signature);
+        let recovery = p.snapshot_with(&sessions);
+        drop(sessions);
+        let mut recovered = ProjectSession::from_data(recovery, None, true).unwrap();
+        assert!(!recovered.begin_calculation(false).unwrap());
+        assert_eq!(
+            lock_document(&recovered.tables[0])
+                .unwrap()
+                .cell_value(1, 2),
+            "42"
+        );
+        p.save_to(path.clone()).unwrap();
+        assert!(!p.summary().unwrap().dirty);
+        let mut p =
+            ProjectSession::from_data(archive::read(&path).unwrap(), Some(path.clone()), false)
+                .unwrap();
+        assert!(!p.begin_calculation(false).unwrap());
+        // A calculation-only update must also mark a previously clean project dirty.
+        fs::write(&external, "84").unwrap();
+        assert!(p.begin_calculation(true).unwrap());
+        finish_test_calculation(&mut p);
+        assert!(p.summary().unwrap().dirty);
+        assert_eq!(
+            lock_document(&p.tables[0]).unwrap().raw_cell(1, 2),
+            "=external()"
+        );
+        assert_eq!(lock_document(&p.tables[0]).unwrap().cell_value(1, 2), "84");
+        p.save_to(path.clone()).unwrap();
+        let reopened =
+            ProjectSession::from_data(archive::read(&path).unwrap(), Some(path.clone()), false)
+                .unwrap();
+        assert_eq!(
+            lock_document(&reopened.tables[0]).unwrap().cell_value(1, 2),
+            "84"
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn only_applied_functions_trigger_automatic_calculation() {
+        let mut p = ProjectSession::from_data(fixture(), None, true).unwrap();
+        edit_calculation_cell(&p, 2, "=f(21)");
+        p.checkpoint_calculation().unwrap();
+        p.data.functions.draft = "def f(x): return x*2".into();
+        p.data.functions.draft_revision += 1;
+        assert!(!p.begin_calculation(false).unwrap());
+        p.data.functions.applied = p.data.functions.draft.clone();
+        p.data.functions.revision += 1;
+        assert!(p.begin_calculation(false).unwrap());
+        finish_test_calculation(&mut p);
+        assert_eq!(lock_document(&p.tables[0]).unwrap().cell_value(1, 2), "42");
+    }
+    #[test]
+    fn format_six_styles_round_trip_recover_duplicate_and_leave_csv_values_unchanged() {
+        let mut p = ProjectSession::from_data(fixture(), None, false).unwrap();
+        let path = temporary_path();
+        let (style, raw, copy) = {
+            let mut table = lock_document(&p.tables[0]).unwrap();
+            table.view = ViewState::default();
+            table.rebuild_view();
+            let raw = table.document.rows().to_vec();
+            let exported = table.materialized_rows();
+            table.format_cells(CellRange { start_row: 0, end_row: 8, start_column: 0, end_column: 3 }, serde_json::from_value(serde_json::json!({"bold":true,"background":"#fff0b3","alignment":"center","borders":{"preset":"outer","border":{"color":"#123456","width":2,"line":"solid"}}})).unwrap()).unwrap();
+            assert_eq!(table.materialized_rows(), exported);
+            assert_eq!(table.document.rows(), raw);
+            (
+                table.sheet.styles.clone(),
+                raw,
+                table.duplicate_to(PathBuf::new()),
+            )
+        };
+        assert!(p.summary().unwrap().dirty);
+        assert!(!p.begin_calculation(false).unwrap());
+        p.add_table(copy, "Copy").unwrap();
+        assert_eq!(lock_document(&p.tables[1]).unwrap().sheet.styles, style);
+        p.save_to(path.clone()).unwrap();
+        let data = archive::read(&path).unwrap();
+        assert_eq!(data.version, 6);
+        assert_eq!(data.tables[0].sheet.styles, style);
+        assert_eq!(data.rows[0], raw);
+        let mut legacy = data.clone();
+        legacy.version = 5;
+        assert!(archive::validate(&legacy).is_err());
+        let mut invalid = data.clone();
+        invalid.tables[0]
+            .sheet
+            .styles
+            .values_mut()
+            .next()
+            .unwrap()
+            .background = "bad".into();
+        assert!(archive::validate(&invalid).is_err());
+        let restored = ProjectSession::from_data(data.clone(), Some(path.clone()), false).unwrap();
+        assert_eq!(
+            lock_document(&restored.tables[0]).unwrap().sheet.styles,
+            style
+        );
+        assert!(!restored.summary().unwrap().dirty);
+        let recovered = ProjectSession::from_data(data, None, true).unwrap();
+        assert_eq!(
+            lock_document(&recovered.tables[0]).unwrap().sheet.styles,
+            style
+        );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
     #[test]
@@ -1787,7 +2597,7 @@ mod tests {
         zip.finish().unwrap();
         let p = ProjectSession::from_data(archive::read(&path).unwrap(), Some(path.clone()), false)
             .unwrap();
-        assert_eq!(p.data.version, 4);
+        assert_eq!(p.data.version, 6);
         let s = lock_document(&p.tables[0]).unwrap();
         assert!(!s.cell_info(1, 0).formula);
         assert_eq!(s.cell_value(1, 0), "=danger()");
@@ -1801,6 +2611,7 @@ mod tests {
         let mut table = lock_document(&p.tables[0]).unwrap();
         table
             .edit_sheet_cells(vec![sheets::SheetCellInput {
+                style: None,
                 image: None,
                 row: 1,
                 column: 2,
@@ -1827,7 +2638,8 @@ mod tests {
         .unwrap();
         let mut recovered: RecoveryProject = serde_json::from_slice(&encoded).unwrap();
         recovered.data.rows = recovered.rows;
-        let restored = ProjectSession::from_data(recovered.data, None, true).unwrap();
+        let mut restored = ProjectSession::from_data(recovered.data, None, true).unwrap();
+        assert!(!restored.begin_calculation(false).unwrap());
         assert_eq!(restored.data.functions.draft, "def unsaved(): return 7");
         assert!(restored.data.functions.applied.is_empty());
         assert!(
@@ -1837,6 +2649,6 @@ mod tests {
                 .formula
         );
         assert!(restored.summary().unwrap().dirty);
-        assert!(!restored.calculation.enabled);
+        assert!(!restored.calculation.running);
     }
 }
