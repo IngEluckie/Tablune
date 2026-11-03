@@ -2,6 +2,8 @@
 use super::*;
 #[path = "project_archive.rs"]
 mod archive;
+#[path = "canvas.rs"]
+pub mod canvas;
 #[path = "project_tree.rs"]
 mod tree;
 pub use tree::{ProjectFolder, ProjectOrganization};
@@ -46,6 +48,10 @@ pub struct TableMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectData {
     #[serde(default)]
+    pub standalone_canvas: bool,
+    #[serde(default)]
+    pub canvases: Vec<canvas::CanvasDocument>,
+    #[serde(default)]
     pub organization: ProjectOrganization,
     #[serde(default)]
     pub markdown: Vec<super::markdown::MarkdownDocument>,
@@ -70,6 +76,8 @@ pub struct ProjectTableSummary {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectSummary {
+    pub standalone_canvas: bool,
+    pub canvases: Vec<canvas::CanvasDocument>,
     pub organization: ProjectOrganization,
     pub markdown: Vec<super::markdown::MarkdownDocument>,
     pub functions: FunctionsData,
@@ -88,6 +96,7 @@ pub struct ProjectHandle {
     session: Mutex<ProjectSession>,
     documents: Mutex<HashMap<u64, DocumentHandle>>,
     closed: std::sync::atomic::AtomicBool,
+    save: Mutex<()>,
 }
 impl ProjectHandle {
     fn new(project: ProjectSession) -> Self {
@@ -101,6 +110,7 @@ impl ProjectHandle {
             session: Mutex::new(project),
             documents: Mutex::new(documents),
             closed: std::sync::atomic::AtomicBool::new(false),
+            save: Mutex::new(()),
         }
     }
 }
@@ -131,35 +141,24 @@ pub struct ProjectSession {
     // Runtime-only baseline: opening/recovery must never authorize a calculation.
     calculation_checkpoint: (u64, HashMap<u64, u64>),
 }
-static PROJECT_PATH_OPERATIONS: std::sync::LazyLock<Mutex<HashSet<String>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
-struct ProjectPathReservation(String);
+struct ProjectSaveSnapshot {
+    data: ProjectData,
+    signature: String,
+    table_states: HashMap<u64, u64>,
+}
+struct ProjectPathReservation {
+    _path: FilePathOperation,
+}
 impl ProjectPathReservation {
     fn acquire(path: &Path) -> Result<Self, String> {
-        if !path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("tablune"))
-        {
-            return Err("Project files must use the .tablune extension".into());
+        if !path.extension().is_some_and(|e| {
+            e.eq_ignore_ascii_case("tablune") || e.eq_ignore_ascii_case("tlcanvas")
+        }) {
+            return Err("Use the .tablune or .tlcanvas extension".into());
         }
-        let key = canonical_key(path);
-        if !PROJECT_PATH_OPERATIONS
-            .lock()
-            .map_err(|_| "Project path registry unavailable")?
-            .insert(key.clone())
-        {
-            return Err(
-                "This project file is being opened or saved; try again when it finishes".into(),
-            );
-        }
-        Ok(Self(key))
-    }
-}
-impl Drop for ProjectPathReservation {
-    fn drop(&mut self) {
-        if let Ok(mut paths) = PROJECT_PATH_OPERATIONS.lock() {
-            paths.remove(&self.0);
-        }
+        Ok(Self {
+            _path: FilePathOperation::acquire(path)?,
+        })
     }
 }
 fn persistent_id() -> String {
@@ -278,7 +277,7 @@ impl ProjectSession {
             calculation_generation: 0,
         };
         project.checkpoint_calculation()?;
-        project.data.version = 6;
+        project.data.version = 9;
         project.data.rows.clear();
         if !dirty {
             project.saved_signature = project.signature()?;
@@ -337,21 +336,41 @@ impl ProjectSession {
         self.calculation_generation += 1;
         Ok(true)
     }
-    fn save_to(&mut self, destination: PathBuf) -> Result<ProjectSummary, String> {
-        let handles = self.tables.clone();
-        let mut sessions = handles
+    fn prepare_save(&self) -> Result<ProjectSaveSnapshot, String> {
+        let sessions = self
+            .tables
             .iter()
             .map(lock_document)
             .collect::<Result<Vec<_>, _>>()?;
-        let data = self.snapshot_with(&sessions);
-        archive::write(&destination, &data)?;
-        for session in &mut sessions {
-            session.saved_state = session.current_state;
+        Ok(ProjectSaveSnapshot {
+            data: self.snapshot_with(&sessions),
+            signature: self.signature_with(&sessions)?,
+            table_states: sessions
+                .iter()
+                .map(|s| (s.identity, s.current_state))
+                .collect(),
+        })
+    }
+    fn finish_save(
+        &mut self,
+        destination: PathBuf,
+        snapshot: ProjectSaveSnapshot,
+    ) -> Result<ProjectSummary, String> {
+        for handle in &self.tables {
+            let mut session = lock_document(handle)?;
+            if let Some(saved) = snapshot.table_states.get(&session.identity) {
+                session.saved_state = *saved;
+            }
         }
         self.path = Some(destination);
-        self.saved_signature = self.signature_with(&sessions)?;
-        drop(sessions);
+        self.saved_signature = snapshot.signature;
         self.summary()
+    }
+    #[cfg(test)]
+    fn save_to(&mut self, destination: PathBuf) -> Result<ProjectSummary, String> {
+        let snapshot = self.prepare_save()?;
+        archive::write(&destination, &snapshot.data)?;
+        self.finish_save(destination, snapshot)
     }
     fn signature_with(
         &self,
@@ -393,6 +412,8 @@ impl ProjectSession {
             s.calculation_revision.hash(&mut hash);
         }
         Ok(ProjectSummary {
+            standalone_canvas: self.data.standalone_canvas,
+            canvases: self.data.canvases.clone(),
             organization: self.data.organization.clone(),
             markdown: self.data.markdown.clone(),
             functions: self.data.functions.clone(),
@@ -529,7 +550,7 @@ pub(super) fn ensure_not_project_path(state: &WorkspaceState, path: &Path) -> Re
     }
     if path
         .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("tablune"))
+        .is_some_and(|e| e.eq_ignore_ascii_case("tablune") || e.eq_ignore_ascii_case("tlcanvas"))
     {
         return Err("Use project open/save for .tablune files".into());
     }
@@ -557,6 +578,8 @@ pub(super) fn project_new_internal(
         .transpose()?;
     let mut project = ProjectSession::from_data(
         ProjectData {
+            standalone_canvas: false,
+            canvases: Vec::new(),
             organization: ProjectOrganization::default(),
             markdown: Vec::new(),
             assets: Default::default(),
@@ -602,18 +625,47 @@ fn project_open_internal(
         for p in items {
             let p = lock_project(&p)?;
             if p.path.as_deref().is_some_and(|p| canonical_key(p) == key) {
-                remember(app, &path, "project");
+                remember(
+                    app,
+                    &path,
+                    if Path::new(&path)
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("tlcanvas"))
+                    {
+                        "canvas"
+                    } else {
+                        "project"
+                    },
+                );
                 return p.summary();
             }
         }
     }
     let data = archive::read(Path::new(&path))?;
+    if data.standalone_canvas
+        != Path::new(&path)
+            .extension()
+            .is_some_and(|s| s.eq_ignore_ascii_case("tlcanvas"))
+    {
+        return Err("File extension does not match its document type".into());
+    }
     let project = ProjectSession::from_data(data, Some(PathBuf::from(&path)), false)?;
     let mut registry = registry(state)?;
     for p in registry.iter() {
         let p = lock_project(p)?;
         if p.path.as_deref().is_some_and(|p| canonical_key(p) == key) {
-            remember(app, &path, "project");
+            remember(
+                app,
+                &path,
+                if Path::new(&path)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("tlcanvas"))
+                {
+                    "canvas"
+                } else {
+                    "project"
+                },
+            );
             return p.summary();
         }
     }
@@ -624,7 +676,18 @@ fn project_open_internal(
     let summary = project.summary()?;
     registry.push(Arc::new(ProjectHandle::new(project)));
     drop(registry);
-    remember(app, &path, "project");
+    remember(
+        app,
+        &path,
+        if Path::new(&path)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("tlcanvas"))
+        {
+            "canvas"
+        } else {
+            "project"
+        },
+    );
     Ok(summary)
 }
 #[tauri::command]
@@ -666,11 +729,34 @@ fn project_save_internal(
         .find(|p| p.id == project_id)
         .cloned()
         .ok_or("Project is no longer open")?;
-    let mut project = lock_project(&handle)?;
     drop(registry);
-    let summary = project.save_to(destination)?;
-    drop(project);
-    remember(app, &path, "project");
+    let _save = handle
+        .save
+        .try_lock()
+        .map_err(|_| "A save is already in progress for this project")?;
+    let snapshot = lock_project(&handle)?.prepare_save()?;
+    if snapshot.data.standalone_canvas
+        != destination
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("tlcanvas"))
+    {
+        return Err("File extension does not match its document type".into());
+    }
+    // Compression and disk I/O do not hold the project or table edit locks.
+    archive::write(&destination, &snapshot.data)?;
+    let summary = lock_project(&handle)?.finish_save(destination, snapshot)?;
+    remember(
+        app,
+        &path,
+        if Path::new(&path)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("tlcanvas"))
+        {
+            "canvas"
+        } else {
+            "project"
+        },
+    );
     if let Err(e) = write_recovery(app, state) {
         report_nonfatal("project recovery after save", &e);
     }
@@ -683,6 +769,25 @@ fn project_save_internal(
     rename_all_fields = "camelCase"
 )]
 pub enum ProjectAction {
+    NewCanvas {
+        name: String,
+        folder_id: Option<String>,
+    },
+    UpdateCanvas {
+        canvas_id: String,
+        content: serde_json::Value,
+        expected_revision: u64,
+    },
+    RenameCanvas {
+        canvas_id: String,
+        name: String,
+    },
+    DuplicateCanvas {
+        canvas_id: String,
+    },
+    DeleteCanvas {
+        canvas_id: String,
+    },
     CreateFolder {
         name: String,
         parent_id: Option<String>,
@@ -843,6 +948,86 @@ fn apply_action(
                 }
                 Ok(())
             })?;
+        }
+        ProjectAction::NewCanvas {
+            name: title,
+            folder_id,
+        } => {
+            p.ensure_folder(folder_id.as_deref())?;
+            let title = unique_name(
+                &name(&title)?,
+                p.data.canvases.iter().map(|c| c.name.clone()),
+            );
+            let id = persistent_id();
+            p.place_item(id.clone(), folder_id);
+            p.data.canvases.push(canvas::CanvasDocument {
+                id,
+                name: title,
+                revision: 0,
+                content: canvas::empty(),
+            });
+        }
+        ProjectAction::UpdateCanvas {
+            canvas_id,
+            content,
+            expected_revision,
+        } => {
+            canvas::validate(
+                &content,
+                &*p.image_assets.lock().map_err(|e| e.to_string())?,
+            )?;
+            let doc = p
+                .data
+                .canvases
+                .iter_mut()
+                .find(|c| c.id == canvas_id)
+                .ok_or("Lienzo no encontrado")?;
+            if doc.revision != expected_revision {
+                return Err("El lienzo cambió; actualiza antes de editar".into());
+            }
+            if doc.content != content {
+                doc.content = content;
+                doc.revision += 1;
+            }
+        }
+        ProjectAction::RenameCanvas {
+            canvas_id,
+            name: title,
+        } => {
+            let title = name(&title)?;
+            if p.data
+                .canvases
+                .iter()
+                .any(|c| c.id != canvas_id && c.name == title)
+            {
+                return Err("Ya existe un lienzo con ese nombre".into());
+            }
+            let doc = p
+                .data
+                .canvases
+                .iter_mut()
+                .find(|c| c.id == canvas_id)
+                .ok_or("Lienzo no encontrado")?;
+            doc.name = title;
+        }
+        ProjectAction::DuplicateCanvas { canvas_id } => {
+            let mut doc = p
+                .data
+                .canvases
+                .iter()
+                .find(|c| c.id == canvas_id)
+                .ok_or("Lienzo no encontrado")?
+                .clone();
+            doc.id = persistent_id();
+            doc.revision = 0;
+            doc.name = unique_name(&doc.name, p.data.canvases.iter().map(|c| c.name.clone()));
+            let folder = p.data.organization.item_folders.get(&canvas_id).cloned();
+            p.place_item(doc.id.clone(), folder);
+            p.data.canvases.push(doc);
+        }
+        ProjectAction::DeleteCanvas { canvas_id } => {
+            p.data.canvases.retain(|c| c.id != canvas_id);
+            p.data.organization.item_folders.remove(&canvas_id);
         }
         ProjectAction::NewDocument { name, folder_id } => {
             p.ensure_folder(folder_id.as_deref())?;
@@ -1077,10 +1262,18 @@ pub fn project_close(
         .iter()
         .position(|p| p.id == project_id)
         .ok_or("Project not found")?;
+    let closing_handle = registry[i].clone();
+    let _save = closing_handle
+        .save
+        .try_lock()
+        .map_err(|_| "Wait for the project save before closing")?;
     if lock_project(&registry[i])?.summary()?.dirty && !discard_unsaved {
         return Err("Save or discard this project before closing".into());
     }
     let closing = lock_project(&registry[i])?;
+    if app.state::<crate::python_macros::jobs::PythonJobs>().has_active(Some(project_id), None)? {
+        return Err("Cancel this project’s jobs in Python jobs before closing".into());
+    }
     if closing.calculation.running {
         return Err("Cancel this project’s calculation before closing".into());
     }
@@ -1353,6 +1546,263 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_text_round_trips_with_project_and_recovery_metadata() {
+        let mut data = fixture();
+        data.version = 9;
+        data.tables[0].sheet.styles.insert(
+            formulas::key((0, 0)),
+            styles::CellStyle {
+                wrap_text: true,
+                ..Default::default()
+            },
+        );
+        let path = temporary_path();
+        archive::write(&path, &data).unwrap();
+        let read = archive::read(&path).unwrap();
+        assert!(read.tables[0].sheet.styles[&formulas::key((0, 0))].wrap_text);
+        let p = ProjectSession::from_data(read, None, true).unwrap();
+        let snapshot = p.prepare_save().unwrap().data;
+        let mut recovered: ProjectData =
+            serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        recovered.rows = snapshot.rows;
+        let restored = ProjectSession::from_data(recovered, None, true).unwrap();
+        assert!(
+            lock_document(&restored.tables[0])
+                .unwrap()
+                .cell_info(0, 0)
+                .style
+                .wrap_text
+        );
+        data.version = 8;
+        assert!(archive::validate(&data).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn merged_regions_round_trip_and_invalid_hidden_contents_are_rejected() {
+        let mut data = fixture();
+        data.version = 8;
+        let region = CellRange {
+            start_row: 10,
+            end_row: 12,
+            start_column: 1,
+            end_column: 3,
+        };
+        data.tables[0].sheet.merges.push(region);
+        data.tables[0].view = ViewState::default();
+        let path = temporary_path();
+        archive::write(&path, &data).unwrap();
+        let read = archive::read(&path).unwrap();
+        assert_eq!(read.version, 9);
+        assert_eq!(read.tables[0].sheet.merges, vec![region]);
+        let p = ProjectSession::from_data(read, None, true).unwrap();
+        assert_eq!(p.summary().unwrap().tables[0].document.merges, vec![region]);
+        assert_eq!(
+            p.prepare_save().unwrap().data.tables[0].sheet.merges,
+            vec![region]
+        );
+        let mut invalid = data.clone();
+        invalid.version = 7;
+        assert!(archive::validate(&invalid).is_err());
+        invalid = data;
+        invalid.rows[0].resize(12, vec![]);
+        invalid.rows[0][11] = vec!["".into(), "hidden".into()];
+        assert!(archive::validate(&invalid).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn freehand_strokes_round_trip_and_reject_invalid_points() {
+        let mut data = fixture();
+        data.version = 7;
+        let node = serde_json::json!({"id":"stroke","kind":"freehand","x":5,"y":10,"width":100,"height":100,"text":"","fill":"transparent","stroke":"#123456","strokeWidth":3,"color":"#123456","fontSize":16,"align":"center","points":[{"x":0.1,"y":0.2},{"x":0.9,"y":0.8}]});
+        let content = serde_json::json!({"nodes":[node],"edges":[]});
+        data.canvases.push(canvas::CanvasDocument {
+            id: "drawing".into(),
+            name: "Trazo".into(),
+            revision: 0,
+            content: content.clone(),
+        });
+        let path = temporary_path();
+        archive::write(&path, &data).unwrap();
+        assert_eq!(archive::read(&path).unwrap().canvases[0].content, content);
+        fs::remove_file(path).unwrap();
+        data.canvases[0].content["nodes"][0]["points"][0]["x"] = serde_json::json!(2);
+        assert!(archive::validate(&data).is_err());
+        data.canvases[0].content["nodes"][0]["points"] = serde_json::json!([]);
+        assert!(archive::validate(&data).is_err());
+    }
+
+    #[test]
+    fn standalone_canvas_is_portable_and_recovers_as_an_independent_document() {
+        let mut data = fixture();
+        data.version = 7;
+        data.standalone_canvas = true;
+        data.tables.clear();
+        data.rows.clear();
+        data.scripts.clear();
+        data.canvases.push(canvas::CanvasDocument {
+            id: "standalone-canvas".into(),
+            name: "Idea".into(),
+            revision: 0,
+            content: canvas::empty(),
+        });
+        let mut doc = ProjectSession::from_data(data, None, true).unwrap();
+        let path = temporary_path().with_extension("tlcanvas");
+        let _reservation = ProjectPathReservation::acquire(&path).unwrap();
+        doc.save_to(path.clone()).unwrap();
+        let reopened = archive::read(&path).unwrap();
+        assert!(reopened.standalone_canvas);
+        assert_eq!(reopened.canvases.len(), 1);
+        let recovery = doc.prepare_save().unwrap().data;
+        let restored = ProjectSession::from_data(recovery, None, true).unwrap();
+        assert!(restored.summary().unwrap().standalone_canvas);
+        let mut invalid = reopened;
+        invalid.scripts = fixture().scripts;
+        assert!(archive::validate(&invalid).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn canvas_only_images_survive_archive_pruning_and_recovery() {
+        let (image, asset) = crate::images::fixture();
+        let asset_id = image.asset_id;
+        let mut data = fixture();
+        data.version = 7;
+        data.assets.insert(asset_id.clone(), asset.clone());
+        data.canvases.push(canvas::CanvasDocument{id:"image-canvas".into(),name:"Fotos".into(),revision:0,
+            content:serde_json::json!({"nodes":[{"id":"image-node","kind":"image","x":0,"y":0,"width":100,"height":100,"text":"Foto","fill":"#ffffff","stroke":"#000000","strokeWidth":1,"color":"#000000","fontSize":16,"align":"left","assetId":asset_id}],"edges":[]})});
+        let mut p = ProjectSession::from_data(data, None, true).unwrap();
+        let path = temporary_path();
+        p.save_to(path.clone()).unwrap();
+        let saved = archive::read(&path).unwrap();
+        assert_eq!(saved.assets[&asset_id].bytes, asset.bytes);
+        let snapshot = p.prepare_save().unwrap().data;
+        assert!(snapshot.assets.contains_key(&asset_id));
+        let restored = ProjectSession::from_data(snapshot, None, true).unwrap();
+        assert_eq!(
+            restored.image_assets.lock().unwrap()[&asset_id].bytes,
+            asset.bytes
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn canvas_lifecycle_round_trip_recovery_and_revision_guards() {
+        let state = WorkspaceState::default();
+        let pid = add_project(&state, fixture());
+        let folder = add_folder(&state, pid, "Diagramas", None);
+        let created = apply_action(
+            &state,
+            pid,
+            ProjectAction::NewCanvas {
+                name: "Mapa".into(),
+                folder_id: Some(folder.clone()),
+            },
+        )
+        .unwrap();
+        let id = created.canvases[0].id.clone();
+        assert_eq!(created.organization.item_folders[&id], folder);
+        let node = serde_json::json!({"id":"node-a","kind":"card","x":20,"y":30,"width":200,"height":100,"text":"","fill":"#ffffff","stroke":"#123456","strokeWidth":2,"color":"#123456","fontSize":16,"align":"center","link":{"id":"table-fixture","kind":"table","name":"Ventas"}});
+        let content = serde_json::json!({"nodes":[node],"edges":[]});
+        let updated = apply_action(
+            &state,
+            pid,
+            ProjectAction::UpdateCanvas {
+                canvas_id: id.clone(),
+                content: content.clone(),
+                expected_revision: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.canvases[0].revision, 1);
+        assert!(
+            apply_action(
+                &state,
+                pid,
+                ProjectAction::UpdateCanvas {
+                    canvas_id: id.clone(),
+                    content: canvas::empty(),
+                    expected_revision: 0
+                }
+            )
+            .is_err()
+        );
+        let copied = apply_action(
+            &state,
+            pid,
+            ProjectAction::DuplicateCanvas {
+                canvas_id: id.clone(),
+            },
+        )
+        .unwrap();
+        assert_ne!(copied.canvases[0].id, copied.canvases[1].id);
+        assert_eq!(copied.canvases[1].content, content);
+        // A removed document leaves an editable, recoverable card with a stable missing target.
+        apply_action(
+            &state,
+            pid,
+            ProjectAction::DeleteTable {
+                table_id: "table-fixture".into(),
+            },
+        )
+        .unwrap();
+        let h = handle(&state, pid).unwrap();
+        let mut p = lock_project(&h).unwrap();
+        let path = temporary_path();
+        p.save_to(path.clone()).unwrap();
+        let saved = archive::read(&path).unwrap();
+        assert_eq!(saved.version, 9);
+        assert_eq!(saved.canvases[0].content, content);
+        assert!(!p.summary().unwrap().dirty);
+        let mut recovered: ProjectData =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        recovered.rows = saved.rows;
+        let restored = ProjectSession::from_data(recovered, None, true).unwrap();
+        assert_eq!(restored.data.canvases[0].content, content);
+        assert!(restored.summary().unwrap().dirty);
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn canvas_validation_rejects_dangling_edges_bad_geometry_and_missing_images() {
+        let state = WorkspaceState::default();
+        let pid = add_project(&state, fixture());
+        let created = apply_action(
+            &state,
+            pid,
+            ProjectAction::NewCanvas {
+                name: "Mapa".into(),
+                folder_id: None,
+            },
+        )
+        .unwrap();
+        let id = created.canvases[0].id.clone();
+        let bad = serde_json::json!({"nodes":[],"edges":[{"id":"e","text":"","stroke":"#000000","strokeWidth":2,"from":{"nodeId":"gone","side":"left"},"to":{"nodeId":"gone","side":"right"}}]});
+        assert!(
+            apply_action(
+                &state,
+                pid,
+                ProjectAction::UpdateCanvas {
+                    canvas_id: id,
+                    content: bad,
+                    expected_revision: 0
+                }
+            )
+            .is_err()
+        );
+        let h = handle(&state, pid).unwrap();
+        assert_eq!(lock_project(&h).unwrap().data.canvases[0].revision, 0);
+        let n = serde_json::json!({"id":"n","kind":"image","x":0,"y":0,"width":100,"height":100,"text":"","fill":"#ffffff","stroke":"#000000","strokeWidth":1,"color":"#000000","fontSize":12,"align":"left","assetId":"missing"});
+        assert!(
+            canvas::validate(
+                &serde_json::json!({"nodes":[n],"edges":[]}),
+                &Default::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn nested_folders_round_trip_and_recovery_keep_item_ids_and_script_bindings() {
         let state = WorkspaceState::default();
         let id = add_project(&state, fixture());
@@ -1391,7 +1841,7 @@ mod tests {
         p.save_to(path.clone()).unwrap();
         assert!(!p.summary().unwrap().dirty);
         let read = archive::read(&path).unwrap();
-        assert_eq!(read.version, 6);
+        assert_eq!(read.version, 9);
         assert_eq!(read.organization, summary.organization);
         assert_eq!(read.rows, fixture().rows);
         let mut data = p.snapshot_with(
@@ -1587,7 +2037,7 @@ mod tests {
         let mut legacy: ProjectData = serde_json::from_value(old).unwrap();
         legacy.rows = fixture().rows;
         let project = ProjectSession::from_data(legacy, None, false).unwrap();
-        assert_eq!(project.data.version, 6);
+        assert_eq!(project.data.version, 9);
         assert_eq!(project.data.organization, ProjectOrganization::default());
         assert!(!project.summary().unwrap().dirty);
         let mut data = fixture();
@@ -1702,7 +2152,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("{}.tablune", persistent_id()));
         archive::write(&path, &data).unwrap();
         let read = archive::read(&path).unwrap();
-        assert_eq!(read.version, 6);
+        assert_eq!(read.version, 9);
         assert_eq!(read.markdown[0].content, data.markdown[0].content);
         let mut p = ProjectSession::from_data(read, Some(path.clone()), false).unwrap();
         assert!(!p.summary().unwrap().dirty);
@@ -1775,6 +2225,8 @@ mod tests {
     }
     fn fixture() -> ProjectData {
         ProjectData {
+            standalone_canvas: false,
+            canvases: Vec::new(),
             organization: ProjectOrganization::default(),
             markdown: Vec::new(),
             assets: Default::default(),
@@ -1844,7 +2296,7 @@ mod tests {
         let path = temporary_path();
         p.save_to(path.clone()).unwrap();
         let data = archive::read(&path).unwrap();
-        assert_eq!(data.version, 6);
+        assert_eq!(data.version, 9);
         assert_eq!(data.assets.len(), 1);
         let mut restored = ProjectSession::from_data(data, None, true).unwrap();
         {
@@ -1933,6 +2385,38 @@ mod tests {
         let dir = std::env::temp_dir().join(persistent_id());
         fs::create_dir(&dir).unwrap();
         dir.join("test.tablune")
+    }
+    #[test]
+    fn background_save_preserves_edits_and_history_after_its_snapshot() {
+        let path = temporary_path();
+        let mut project = ProjectSession::from_data(fixture(), None, true).unwrap();
+        edit_calculation_cell(&project, 1, "10");
+        let snapshot = project.prepare_save().unwrap();
+        // Edits and script updates may arrive while the archive is being compressed.
+        edit_calculation_cell(&project, 1, "20");
+        project.data.scripts[0].code.push_str("# new draft\n");
+        project.data.scripts[0].revision += 1;
+        archive::write(&path, &snapshot.data).unwrap();
+        let summary = project.finish_save(path.clone(), snapshot).unwrap();
+        assert!(summary.dirty);
+        assert!(summary.tables[0].document.dirty);
+        assert!(summary.tables[0].document.can_undo);
+        let stored = archive::read(&path).unwrap();
+        assert_eq!(stored.rows[0][1][1], "10");
+        assert!(!stored.scripts[0].code.contains("new draft"));
+        assert_eq!(
+            lock_document(&project.tables[0]).unwrap().raw_cell(1, 1),
+            "20"
+        );
+        assert!(!project.save_to(path.clone()).unwrap().dirty);
+        let mut table = lock_document(&project.tables[0]).unwrap();
+        table.undo().unwrap();
+        assert_eq!(table.raw_cell(1, 1), "10");
+        assert!(table.summary().dirty);
+        table.redo().unwrap();
+        assert_eq!(table.raw_cell(1, 1), "20");
+        assert!(!table.summary().dirty);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
     fn add_project(state: &WorkspaceState, data: ProjectData) -> u64 {
         let p = ProjectSession::from_data(data, None, false).unwrap();
@@ -2333,7 +2817,7 @@ mod tests {
         let path = temporary_path();
         p.save_to(path.clone()).unwrap();
         let data = archive::read(&path).unwrap();
-        assert_eq!(data.version, 6);
+        assert_eq!(data.version, 9);
         assert_eq!(data.functions.draft, p.data.functions.draft);
         assert_eq!(data.functions.applied, p.data.functions.applied);
         let restored = ProjectSession::from_data(data, Some(path.clone()), false).unwrap();
@@ -2546,7 +3030,7 @@ mod tests {
         assert_eq!(lock_document(&p.tables[1]).unwrap().sheet.styles, style);
         p.save_to(path.clone()).unwrap();
         let data = archive::read(&path).unwrap();
-        assert_eq!(data.version, 6);
+        assert_eq!(data.version, 9);
         assert_eq!(data.tables[0].sheet.styles, style);
         assert_eq!(data.rows[0], raw);
         let mut legacy = data.clone();
@@ -2597,7 +3081,7 @@ mod tests {
         zip.finish().unwrap();
         let p = ProjectSession::from_data(archive::read(&path).unwrap(), Some(path.clone()), false)
             .unwrap();
-        assert_eq!(p.data.version, 6);
+        assert_eq!(p.data.version, 9);
         let s = lock_document(&p.tables[0]).unwrap();
         assert!(!s.cell_info(1, 0).formula);
         assert_eq!(s.cell_value(1, 0), "=danger()");

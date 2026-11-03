@@ -1,10 +1,13 @@
+import { isPythonJobActive, showPythonJobs } from "./pythonJobs";
+import type { CanvasContent } from "./canvasModel";
 import { flushMarkdownEditors } from "./markdownPending";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import * as ipc from "./ipc";
-import { flushCellEdits } from "./CsvGrid";
+import { flushCellEdits, waitForCellEdits } from "./CsvGrid";
+import { SaveCoordinator, type SaveTarget } from "./saveCoordinator";
 import type {
   MarkdownDocument,
   MarkdownAction,
@@ -17,10 +20,16 @@ import type {
 } from "./types";
 
 export type Space = "home" | "csv" | "markdown" | number;
-export type ProjectTab = { kind: "table" | "script" | "functions" | "markdown"; id: string };
+export type ProjectTab = { kind: "table" | "script" | "functions" | "markdown" | "canvas"; id: string };
 export type ScriptDraft = Pick<ScriptSummary, "name" | "code" | "inputTableId">;
 const basename = (path: string) => path.split(/[\\/]/).at(-1) ?? path;
 export function useWorkspace() {
+  const [saves] = useState(() => {
+    let storage: Storage | undefined;
+    try { storage = window.localStorage; } catch { /* Preferences remain session-local. */ }
+    return new SaveCoordinator(storage);
+  });
+  useEffect(() => () => saves.dispose(), [saves]);
   const [workspace, setWorkspace] = useState<WorkspaceSummary>({
     documents: [],
     projects: [],
@@ -36,6 +45,12 @@ export function useWorkspace() {
     const next = { ...markdownDraftsRef.current, [`${projectId ?? "file"}:${id}`]: content };
     markdownDraftsRef.current = next; setMarkdownDrafts(next);
   };
+  const [canvasDrafts, setCanvasDrafts] = useState<Record<string, CanvasContent>>({});
+  const canvasDraftsRef = useRef(canvasDrafts);
+  const editCanvas = (projectId: number, id: string, content: CanvasContent) => {
+    const next = { ...canvasDraftsRef.current, [`${projectId}:${id}`]: content };
+    canvasDraftsRef.current = next; setCanvasDrafts(next);
+  };
   const [tabs, setTabs] = useState<Record<number, ProjectTab[]>>({});
   const tabsRef = useRef(tabs); tabsRef.current = tabs;
   const [selected, setSelected] = useState<Record<number, ProjectTab | null>>(
@@ -50,9 +65,6 @@ export function useWorkspace() {
   readyRef.current = ready;
   const [savingProjects, setSavingProjects] = useState<number[]>([]);
   const savingRef = useRef(new Set<number>());
-  const [runningProject, setRunningProject] = useState<number | null>(null);
-  const runningRef = useRef<number | null>(null);
-  runningRef.current = runningProject;
   const [closeRequest, setCloseRequest] = useState<"app" | number | null>(null);
   const [drafts, setDrafts] = useState<Record<string, ScriptDraft>>({});
   const [functionDrafts, setFunctionDrafts] = useState<Record<number, string>>(
@@ -98,9 +110,12 @@ export function useWorkspace() {
   }, []);
   const report = useCallback((e: unknown) => setError(String(e)), []);
   const guard = async (action: () => Promise<unknown>) => {
+    // Capture the active cell synchronously, before a UI lock hides its editor.
+    const cellEdits = flushCellEdits();
     setBusy(true);
     setError(null);
     try {
+      await cellEdits;
       await action();
     } catch (e) {
       report(e);
@@ -168,15 +183,27 @@ export function useWorkspace() {
     if (projectId === null) commit({ ...current, markdown: merge(current.markdown) });
     else commit({ ...current, projects: current.projects?.map(p => p.projectId === projectId ? { ...p, markdown: merge(p.markdown), dirty: true, revision: `markdown-${doc.id}-${doc.revision}` } : p) });
   }, [commit]);
-  const flushDrafts = useCallback((): Promise<void> => {
+  const flushDrafts = useCallback((options?: { background?: boolean; targetId?: string }): Promise<void> => {
     const run = flushChain.current
       .catch(() => {})
       .then(async () => {
-        await flushCellEdits();
-        await flushMarkdownEditors();
+        if (options?.background) await waitForCellEdits(options.targetId);
+        else await flushCellEdits();
+        await flushMarkdownEditors(options?.targetId);
+        for (const [key, content] of Object.entries(canvasDraftsRef.current)) {
+          const [owner, id] = key.split(":"); const projectId = Number(owner);
+          if (options?.targetId && options.targetId !== `project:${owner}`) continue;
+          const doc = workspaceRef.current.projects?.find(p => p.projectId === projectId)?.canvases?.find(c => c.id === id);
+          if (!doc) continue;
+          updateProject(await ipc.projectAction(projectId, { kind: "updateCanvas", canvasId: id, content, expectedRevision: doc.revision }));
+          if (canvasDraftsRef.current[key] === content) {
+            const next = { ...canvasDraftsRef.current }; delete next[key]; canvasDraftsRef.current = next; setCanvasDrafts(next);
+          }
+        }
         for (const [key, content] of Object.entries(markdownDraftsRef.current)) {
           const [owner, id] = key.split(":");
           const projectId = owner === "file" ? null : Number(owner);
+          if (options?.targetId && options.targetId !== (projectId === null ? `markdown:${id}` : `project:${projectId}`)) continue;
           const docs = projectId === null ? workspaceRef.current.markdown : workspaceRef.current.projects?.find(p => p.projectId === projectId)?.markdown;
           const doc = docs?.find(d => d.id === id);
           if (!doc) continue;
@@ -186,6 +213,7 @@ export function useWorkspace() {
           }
         }
         for (const [id, code] of Object.entries(functionDraftsRef.current)) {
+          if (options?.targetId && options.targetId !== `project:${id}`) continue;
           const project = workspaceRef.current.projects?.find(
             (p) => p.projectId === Number(id),
           );
@@ -208,6 +236,7 @@ export function useWorkspace() {
           const separator = key.indexOf(":");
           const projectId = Number(key.slice(0, separator));
           const scriptId = key.slice(separator + 1);
+          if (options?.targetId && options.targetId !== `project:${projectId}`) continue;
           const project = workspaceRef.current.projects?.find(
             (p) => p.projectId === projectId,
           );
@@ -245,31 +274,38 @@ export function useWorkspace() {
     else openTab(projectId, { kind: "markdown", id: doc.id });
   };
   const saveMarkdown = async (id: string, saveAs = false, projectId: number | null = null): Promise<boolean> => {
-    await flushDrafts();
-    const doc = (projectId === null ? workspaceRef.current.markdown : workspaceRef.current.projects?.find(p => p.projectId === projectId)?.markdown)?.find(d => d.id === id);
-    if (!doc) return false;
-    let path = !saveAs && projectId === null ? doc.path : null;
-    path ??= await save({ defaultPath: doc.name, filters: [{ name: "Markdown", extensions: ["md", "markdown"] }] });
-    if (!path) return false;
-    if (!/\.(md|markdown)$/i.test(path)) path += ".md";
-    await actMarkdown(projectId, id, { kind: "save", path });
-    await ipc.writeWorkspaceRecovery();
-    return true;
+    return saves.run(projectId === null ? `markdown:${id}` : `project:${projectId}`, async () => {
+      await flushDrafts();
+      const doc = (projectId === null ? workspaceRef.current.markdown : workspaceRef.current.projects?.find(p => p.projectId === projectId)?.markdown)?.find(d => d.id === id);
+      if (!doc) return false;
+      let path = !saveAs && projectId === null ? doc.path : null;
+      path ??= await save({ defaultPath: doc.name, filters: [{ name: "Markdown", extensions: ["md", "markdown"] }] });
+      if (!path) return false;
+      if (!/\.(md|markdown)$/i.test(path)) path += ".md";
+      await actMarkdown(projectId, id, { kind: "save", path });
+      await ipc.writeWorkspaceRecovery();
+      return true;
+    });
   };
   const closeMarkdown = async (id: string) => {
-    await flushDrafts();
-    const doc = workspaceRef.current.markdown?.find(d => d.id === id);
-    if (!doc) return;
-    if (doc.dirty) {
-      if (await ask(`Save changes to ${doc.name} before closing?`, { title: "Close document", kind: "info" })) {
-        if (!(await saveMarkdown(id))) return;
-      } else if (!(await ask(`Discard changes to ${doc.name}?`, { title: "Discard changes", kind: "warning" }))) return;
-    }
-    await actMarkdown(null, id, { kind: "delete", discard: true });
-    await ipc.writeWorkspaceRecovery();
-    const remaining = workspaceRef.current.markdown ?? [];
-    if (selectedMarkdown === id) setSelectedMarkdown(remaining.at(-1)?.id ?? null);
-    if (!remaining.length) setSpace("home");
+    saves.pause(`markdown:${id}`);
+    try {
+      await saves.wait(`markdown:${id}`);
+      await flushDrafts();
+      try { await saves.flush(`markdown:${id}`); } catch (error) { report(error); }
+      const doc = workspaceRef.current.markdown?.find(d => d.id === id);
+      if (!doc) return;
+      if (doc.dirty) {
+        if (await ask(`Save changes to ${doc.name} before closing?`, { title: "Close document", kind: "info" })) {
+          if (!(await saveMarkdown(id))) return;
+        } else if (!(await ask(`Discard changes to ${doc.name}?`, { title: "Discard changes", kind: "warning" }))) return;
+      }
+      await actMarkdown(null, id, { kind: "delete", discard: true });
+      await ipc.writeWorkspaceRecovery();
+      const remaining = workspaceRef.current.markdown ?? [];
+      if (selectedMarkdown === id) setSelectedMarkdown(remaining.at(-1)?.id ?? null);
+      if (!remaining.length) setSpace("home");
+    } finally { saves.resume(`markdown:${id}`); }
   };
   const perform = async (projectId: number, action: ProjectAction) => {
     await flushDrafts();
@@ -281,29 +317,80 @@ export function useWorkspace() {
     projectId: number,
     saveAs = false,
   ): Promise<boolean> => {
-    await flushDrafts();
-    const project = workspaceRef.current.projects?.find(
-      (p) => p.projectId === projectId,
-    );
-    if (!project) return false;
-    let path = saveAs ? null : project.path;
-    if (!path)
-      path = await save({
-        defaultPath: `${project.name}.tablune`,
-        filters: [{ name: "Tablune project", extensions: ["tablune"] }],
-      });
-    if (!path) return false;
-    if (!path.toLowerCase().endsWith(".tablune")) path += ".tablune";
-    if (savingRef.current.has(projectId)) return false;
-    savingRef.current.add(projectId);
-    setSavingProjects([...savingRef.current]);
-    try {
-      updateProject(await ipc.saveProject(projectId, path));
+    return saves.run(`project:${projectId}`, async () => {
+      await flushDrafts();
+      const project = workspaceRef.current.projects?.find(
+        (p) => p.projectId === projectId,
+      );
+      if (!project) return false;
+      const extension = project.standaloneCanvas ? "tlcanvas" : "tablune";
+      let path = saveAs ? null : project.path;
+      if (!path)
+        path = await save({
+          defaultPath: `${project.name}.${extension}`,
+          filters: [{ name: project.standaloneCanvas ? "Tablune canvas" : "Tablune project", extensions: [extension] }],
+        });
+      if (!path) return false;
+      if (!path.toLowerCase().endsWith(`.${extension}`)) path += `.${extension}`;
+      if (savingRef.current.has(projectId)) return false;
+      savingRef.current.add(projectId);
+      setSavingProjects([...savingRef.current]);
+      try {
+        updateProject(await ipc.saveProject(projectId, path));
+        await refreshRecents();
+        return true;
+      } finally {
+        savingRef.current.delete(projectId);
+        setSavingProjects([...savingRef.current]);
+      }
+    });
+  };
+  const saveCsv = async (documentId: number, saveAs = false, suggestedName?: string): Promise<boolean> =>
+    saves.run(`csv:${documentId}`, async () => {
+      await flushCellEdits();
+      const doc = workspaceRef.current.documents.find(d => d.documentId === documentId);
+      if (!doc) return false;
+      const path = (!saveAs && doc.path) || await save({ defaultPath: suggestedName ?? doc.displayName, filters: [{ name: "CSV", extensions: ["csv", "tsv", "txt"] }] });
+      if (!path) return false;
+      const next = await ipc.saveSession(documentId, path);
+      mergeSavedCsv(next);
       await refreshRecents();
       return true;
-    } finally {
-      savingRef.current.delete(projectId);
-      setSavingProjects([...savingRef.current]);
+    });
+  // Save acknowledgements must not replace newer edits or revive a closed document.
+  const mergeSavedCsv = (next: DocumentSummary) => {
+    const current = workspaceRef.current;
+    commit({ ...current, documents: current.documents.map(d => d.documentId !== next.documentId ? d :
+      d.revision > next.revision ? { ...d, path: next.path } : next) });
+  };
+  const autosaveTarget = async (targetId: string) => {
+    await flushDrafts({ background: true, targetId });
+    const current = workspaceRef.current;
+    if (targetId.startsWith("project:")) {
+      const id = Number(targetId.slice(8));
+      const before = current.projects?.find(p => p.projectId === id);
+      if (!before?.path || !before.dirty) return;
+      const next = await ipc.saveProject(id, before.path);
+      const latest = workspaceRef.current.projects?.find(p => p.projectId === id);
+      if (latest === before) updateProject(next);
+      else if (latest) {
+        // Preserve drafts and confirmed edits received while the snapshot was written.
+        updateProject({ ...latest, path: next.path, dirty: true,
+          tables: latest.tables.map(t => {
+            const saved = next.tables.find(s => s.id === t.id)?.document;
+            return saved && saved.revision === t.document.revision ? { ...t, document: { ...t.document, dirty: saved.dirty } } : t;
+          }) });
+      }
+    } else if (targetId.startsWith("csv:")) {
+      const doc = current.documents.find(d => `csv:${d.documentId}` === targetId);
+      if (doc?.path && doc.dirty) mergeSavedCsv(await ipc.saveSession(doc.documentId, doc.path));
+    } else if (targetId.startsWith("markdown:")) {
+      const doc = current.markdown?.find(d => `markdown:${d.id}` === targetId);
+      if (!doc?.path || !doc.dirty) return;
+      const next = await ipc.markdownAction(null, doc.id, { kind: "save", path: doc.path });
+      const latest = workspaceRef.current;
+      commit({ ...latest, markdown: latest.markdown?.map(d => d.id !== next.id ? d : d.revision > next.revision ? { ...d, path: next.path } : next) });
+      await ipc.writeWorkspaceRecovery();
     }
   };
   const createProject = async (
@@ -316,6 +403,10 @@ export function useWorkspace() {
     if (p.tables[0])
       openTab(p.projectId, { kind: "table", id: p.tables[0].id });
     return p;
+  };
+  const newCanvas = async () => {
+    const p=await ipc.newStandaloneCanvas();updateProject(p);
+    openTab(p.projectId,{kind:"canvas",id:p.canvases![0].id});
   };
   const newCsv = async () => {
     const d = await ipc.newSession();
@@ -330,12 +421,13 @@ export function useWorkspace() {
     if (/\.(md|markdown)$/i.test(path)) {
       const doc = await actMarkdown(null, null, { kind: "open", path });
       setSelectedMarkdown(doc.id); setSpace("markdown");
-    } else if (path.toLowerCase().endsWith(".tablune")) {
+    } else if (/\.(tablune|tlcanvas)$/i.test(path)) {
       const p = await ipc.openProject(path);
       updateProject(p);
       setSpace(p.projectId);
       if (!selected[p.projectId] && p.tables[0])
         openTab(p.projectId, { kind: "table", id: p.tables[0].id });
+      else if (!selected[p.projectId] && p.canvases?.[0]) openTab(p.projectId, { kind: "canvas", id: p.canvases[0].id });
       else if (!selected[p.projectId] && p.markdown?.[0]) openTab(p.projectId, { kind: "markdown", id: p.markdown[0].id });
     } else {
       let d = await ipc.openSession(path);
@@ -368,7 +460,7 @@ export function useWorkspace() {
       filters: [
         {
           name: "Data files and projects",
-          extensions: ["csv", "tsv", "txt", "md", "markdown", "tablune"],
+          extensions: ["csv", "tsv", "txt", "md", "markdown", "tablune", "tlcanvas"],
         },
       ],
     });
@@ -413,41 +505,47 @@ export function useWorkspace() {
     }
     setCloseRequest(null);
     closingRef.current = false;
+    saves.resume(request === "app" ? undefined : `project:${request}`);
   };
   const requestClose = async (request: "app" | number) => {
-    if (!readyRef.current && request === "app") {
-      await ipc.exitApplication();
-      return;
-    }
-    if (
-      request === "app"
-        ? savingRef.current.size > 0
-        : savingRef.current.has(request)
-    )
-      throw new Error("Wait for the project save to finish before closing.");
-    if (
-      workspaceRef.current.projects?.some(
-        (p) =>
-          p.calculation?.running &&
-          (request === "app" || p.projectId === request),
+    const targetId = request === "app" ? undefined : `project:${request}`;
+    saves.pause(targetId);
+    try {
+      await saves.wait(targetId);
+      if (!readyRef.current && request === "app") {
+        await ipc.exitApplication();
+        return;
+      }
+      if (
+        request === "app"
+          ? savingRef.current.size > 0
+          : savingRef.current.has(request)
       )
-    )
-      throw new Error("Cancel the calculation before closing.");
-    if (
-      runningRef.current !== null &&
-      (request === "app" || request === runningRef.current)
-    ) {
-      throw new Error("Cancel the running Python script before closing.");
-    }
-    await flushDrafts();
-    const current = await refresh();
-    const dirty =
-      request === "app"
-        ? current.documents.some((d) => d.dirty) || current.markdown?.some(d => d.dirty) ||
-          current.projects?.some((p) => p.dirty)
-        : current.projects?.find((p) => p.projectId === request)?.dirty;
-    if (dirty) setCloseRequest(request);
-    else await finishClose(request, false);
+        throw new Error("Wait for the project save to finish before closing.");
+      if (
+        workspaceRef.current.projects?.some(
+          (p) =>
+            p.calculation?.running &&
+            (request === "app" || p.projectId === request),
+        )
+      )
+        throw new Error("Cancel the calculation before closing.");
+      const activeJobs = (await ipc.getPythonJobs()).filter(job => isPythonJobActive(job) && (request === "app" || job.projectId === request));
+      if (activeJobs.length) {
+        showPythonJobs(activeJobs[0].id);
+        throw new Error("Cancel the active Python jobs before closing.");
+      }
+      await flushDrafts();
+      try { await saves.flush(targetId); } catch (error) { report(error); }
+      const current = await refresh();
+      const dirty =
+        request === "app"
+          ? current.documents.some((d) => d.dirty) || current.markdown?.some(d => d.dirty) ||
+            current.projects?.some((p) => p.dirty)
+          : current.projects?.find((p) => p.projectId === request)?.dirty;
+      if (dirty) setCloseRequest(request);
+      else await finishClose(request, false);
+    } catch (error) { saves.resume(targetId); throw error; }
   };
   const saveAndClose = async () => {
     const request = closeRequest;
@@ -456,20 +554,7 @@ export function useWorkspace() {
     if (request === "app") {
       for (const d of workspaceRef.current.markdown?.filter(d => d.dirty) ?? []) if (!(await saveMarkdown(d.id))) return;
       for (const d of workspaceRef.current.documents.filter((d) => d.dirty)) {
-        const path =
-          d.path ??
-          (await save({
-            defaultPath: d.displayName,
-            filters: [{ name: "CSV", extensions: ["csv", "tsv", "txt"] }],
-          }));
-        if (!path) return;
-        const next = await ipc.saveSession(d.documentId, path);
-        commit({
-          ...workspaceRef.current,
-          documents: workspaceRef.current.documents.map((c) =>
-            c.documentId === d.documentId ? next : c,
-          ),
-        });
+        if (!(await saveCsv(d.documentId))) return;
       }
       for (const p of workspaceRef.current.projects?.filter((p) => p.dirty) ??
         [])
@@ -505,6 +590,7 @@ export function useWorkspace() {
           setSpace(p.projectId);
           if (p.tables[0])
             openTab(p.projectId, { kind: "table", id: p.tables[0].id });
+          else if (p.canvases?.[0]) openTab(p.projectId, { kind: "canvas", id: p.canvases[0].id });
           else if (p.markdown?.[0]) openTab(p.projectId, { kind: "markdown", id: p.markdown[0].id });
         } else if (next.markdown?.length) {
           setSpace("markdown"); setSelectedMarkdown(next.markdown[0].id);
@@ -563,16 +649,16 @@ export function useWorkspace() {
   }, [report]);
   // Debounced durable drafts, including projects with no table edits.
   useEffect(() => {
-    if (!Object.keys(markdownDrafts).length && !Object.keys(drafts).length && !Object.keys(functionDrafts).length)
+    if (!Object.keys(canvasDrafts).length && !Object.keys(markdownDrafts).length && !Object.keys(drafts).length && !Object.keys(functionDrafts).length)
       return;
     const timer = window.setTimeout(() => {
       if (closingRef.current) return;
-      void flushDrafts()
+      void flushDrafts({ background: true })
         .then(() => ipc.writeWorkspaceRecovery())
         .catch(report);
     }, 400);
     return () => window.clearTimeout(timer);
-  }, [drafts, functionDrafts, markdownDrafts, flushDrafts, report]);
+  }, [drafts, functionDrafts, markdownDrafts, canvasDrafts, flushDrafts, report]);
   const recoveryKey = JSON.stringify([
     workspace.markdown?.map(d => [d.id, d.revision, d.dirty]),
     workspace.documents.map((d) => [d.documentId, d.revision, d.dirty]),
@@ -582,7 +668,7 @@ export function useWorkspace() {
     if (!ready) return;
     const timer = window.setTimeout(() => {
       if (closingRef.current) return;
-      void flushDrafts()
+      void flushDrafts({ background: true })
         .then(() => ipc.writeWorkspaceRecovery())
         .catch(report);
     }, 1500);
@@ -647,7 +733,26 @@ export function useWorkspace() {
     }, 150);
     return () => window.clearTimeout(timer);
   }, [calculationKey, ready, savingProjects, updateProject, report]);
+  // A destination is registered once, regardless of how many editors share it.
+  useEffect(() => {
+    const targets: SaveTarget[] = [
+      ...workspace.documents.map(d => ({ id: `csv:${d.documentId}`, preferenceKey: `csv:${d.path ?? `session-${d.documentId}`}`, path: d.path, dirty: d.dirty, revision: String(d.revision) })),
+      ...(workspace.markdown ?? []).map(d => ({ id: `markdown:${d.id}`, preferenceKey: `markdown:${d.path ?? d.id}`, path: d.path,
+        dirty: d.dirty || markdownDrafts[`file:${d.id}`] !== undefined,
+        revision: JSON.stringify([d.revision, markdownDrafts[`file:${d.id}`]]) })),
+      ...(workspace.projects ?? []).map(p => {
+        const scripts = Object.entries(drafts).filter(([key]) => key.startsWith(`${p.projectId}:`));
+        const canvases = Object.entries(canvasDrafts).filter(([key]) => key.startsWith(`${p.projectId}:`));
+        const documents = Object.entries(markdownDrafts).filter(([key]) => key.startsWith(`${p.projectId}:`));
+        return { id: `project:${p.projectId}`, preferenceKey: `project:${p.path ?? p.persistentId}`, path: p.path,
+          dirty: p.dirty || canvases.length > 0 || scripts.length > 0 || documents.length > 0 || functionDrafts[p.projectId] !== undefined,
+          revision: JSON.stringify([p.revision, p.tables.map(t => [t.id, t.document.revision, t.document.calculationRevision]), scripts, documents, canvases, functionDrafts[p.projectId]]) };
+      }),
+    ].map(target => ({ ...target, save: () => autosaveTarget(target.id) }));
+    saves.reconcile(targets, ready && !busy && closeRequest === null);
+  });
   return {
+    saves, saveCsv, canvasDrafts, editCanvas,
     selectedMarkdown, setSelectedMarkdown, markdownDrafts, editMarkdown, actMarkdown, newMarkdown, saveMarkdown, closeMarkdown,
     functionDrafts,
     editFunctions,
@@ -675,15 +780,13 @@ export function useWorkspace() {
     guard,
     ready,
     savingProjects,
-    runningProject,
-    setRunningProject,
     drafts,
     editScript,
     flushDrafts,
     perform,
     saveProjectById,
     createProject,
-    newCsv,
+    newCsv, newCanvas,
     openPath,
     openFiles,
     closeRequest,
@@ -692,6 +795,7 @@ export function useWorkspace() {
     saveAndClose,
     finishClose,
     cancelClose: () => {
+      saves.resume(typeof closeRequest === "number" ? `project:${closeRequest}` : undefined);
       setCloseRequest(null);
       closingRef.current = false;
     },

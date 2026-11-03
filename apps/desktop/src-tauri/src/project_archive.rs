@@ -19,8 +19,20 @@ struct StoredTableRef<'a> {
 }
 const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(super) fn validate(data: &ProjectData) -> Result<(), String> {
-    if !matches!(data.version, 1..=6) {
+    if !matches!(data.version, 1..=9) {
         return Err(format!("Unsupported .tablune version {}", data.version));
+    }
+    if data.standalone_canvas
+        && (data.canvases.len() != 1
+            || !data.tables.is_empty()
+            || !data.scripts.is_empty()
+            || !data.markdown.is_empty()
+            || !data.organization.folders.is_empty()
+            || !data.organization.item_folders.is_empty()
+            || !data.functions.draft.is_empty()
+            || !data.functions.applied.is_empty())
+    {
+        return Err("Invalid standalone canvas document".into());
     }
     if data.functions.draft.len() > 1024 * 1024 || data.functions.applied.len() > 1024 * 1024 {
         return Err("Functions code exceeds 1 MiB".into());
@@ -37,6 +49,7 @@ pub(super) fn validate(data: &ProjectData) -> Result<(), String> {
     for id in std::iter::once(&data.id)
         .chain(data.tables.iter().map(|t| &t.id))
         .chain(data.scripts.iter().map(|s| &s.id))
+        .chain(data.canvases.iter().map(|c| &c.id))
         .chain(data.markdown.iter().map(|d| &d.id))
     {
         if id.is_empty()
@@ -59,8 +72,23 @@ pub(super) fn validate(data: &ProjectData) -> Result<(), String> {
         }
         super::markdown::validate(doc, &data.assets)?;
     }
+    for canvas in &data.canvases {
+        if data.version < 7 {
+            return Err("Canvases require format 7".into());
+        }
+        super::name(&canvas.name)?;
+        super::canvas::validate(&canvas.content, &data.assets)?;
+    }
     let mut names = HashSet::new();
     for t in &data.tables {
+        if !t.sheet.merges.is_empty()
+            && (data.version < 8 || !t.view.sorts.is_empty() || !t.view.filters.is_empty())
+        {
+            return Err(
+                "Las combinaciones requieren formato 8 y una hoja sin filtros ni ordenación".into(),
+            );
+        }
+        super::merges::validate(&t.sheet.merges)?;
         if data.version < 6 && !t.sheet.styles.is_empty() {
             return Err("Cell styles require project format 6".into());
         }
@@ -68,6 +96,9 @@ pub(super) fn validate(data: &ProjectData) -> Result<(), String> {
             let (row, col) = crate::formulas::position(key).ok_or("Invalid styled cell address")?;
             if row > 9_999_999 || col >= 100_000 {
                 return Err("Styled cell exceeds sheet limits".into());
+            }
+            if data.version < 9 && style.wrap_text {
+                return Err("El ajuste de texto requiere formato 9".into());
             }
             style.validate()?;
         }
@@ -106,6 +137,24 @@ pub(super) fn validate(data: &ProjectData) -> Result<(), String> {
         }
     }
     for (table, rows) in data.tables.iter().zip(&data.rows) {
+        for m in &table.sheet.merges {
+            for row in m.start_row..=m.end_row {
+                for col in m.start_column..=m.end_column {
+                    if row == m.start_row && col == m.start_column {
+                        continue;
+                    }
+                    let meta = table.sheet.cells.get(&crate::formulas::key((row, col)));
+                    if rows
+                        .get(row)
+                        .and_then(|r| r.get(col))
+                        .is_some_and(|v| !v.is_empty())
+                        || meta.is_some_and(|v| v.formula || v.image.is_some())
+                    {
+                        return Err("Combinación con contenido oculto".into());
+                    }
+                }
+            }
+        }
         for (key, meta) in &table.sheet.cells {
             if meta.formula || meta.image.is_some() {
                 let (r, c) = crate::formulas::position(key).ok_or("Invalid cell address")?;
@@ -145,8 +194,16 @@ pub(super) fn read(path: &Path) -> Result<ProjectData, String> {
     let mut data: ProjectData =
         serde_json::from_slice(&entry(&mut zip, "manifest.json", 16 * 1024 * 1024)?)
             .map_err(|e| e.to_string())?;
-    if !matches!(data.version, 1..=6) {
+    if !matches!(data.version, 1..=9) {
         return Err(format!("Unsupported .tablune version {}", data.version));
+    }
+    for canvas in &mut data.canvases {
+        canvas.content = serde_json::from_slice(&entry(
+            &mut zip,
+            &format!("canvases/{}.json", canvas.id),
+            16 * 1024 * 1024,
+        )?)
+        .map_err(|e| e.to_string())?;
     }
     for doc in &mut data.markdown {
         doc.content = String::from_utf8(entry(
@@ -231,17 +288,22 @@ pub(super) fn write(path: &Path, data: &ProjectData) -> Result<(), String> {
         zip.start_file("manifest.json", options)
             .map_err(|e| e.to_string())?;
         let mut manifest = ProjectData {
+            standalone_canvas: data.standalone_canvas,
+            canvases: data.canvases.clone(),
             organization: data.organization.clone(),
             markdown: data.markdown.clone(),
             assets: data.assets.clone(),
             functions: data.functions.clone(),
-            version: 6,
+            version: 9,
             id: data.id.clone(),
             name: data.name.clone(),
             tables: data.tables.clone(),
             scripts: data.scripts.clone(),
             rows: Vec::new(),
         };
+        for canvas in &mut manifest.canvases {
+            canvas.content = super::canvas::empty();
+        }
         for doc in &mut manifest.markdown {
             doc.content.clear();
         }
@@ -284,6 +346,11 @@ pub(super) fn write(path: &Path, data: &ProjectData) -> Result<(), String> {
             zip.start_file(format!("assets/{id}"), options)
                 .map_err(|e| e.to_string())?;
             zip.write_all(&asset.bytes).map_err(|e| e.to_string())?;
+        }
+        for canvas in &data.canvases {
+            zip.start_file(format!("canvases/{}.json", canvas.id), options)
+                .map_err(|e| e.to_string())?;
+            serde_json::to_writer(&mut zip, &canvas.content).map_err(|e| e.to_string())?;
         }
         for doc in &data.markdown {
             zip.start_file(format!("documents/{}.md", doc.id), options)

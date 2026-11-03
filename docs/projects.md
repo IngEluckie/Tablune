@@ -1,5 +1,9 @@
 # Projects and Python cells in Tablune 0.5
 
+Autosave is on by default. The shared bar displays the switch, current save state, and Undo/Redo arrows. In a project the switch applies to the complete `.tablune` file, including tables, Markdown, scripts and Functions drafts. Standalone CSV/TSV/text tables and Markdown have independent switches. Tablune saves after a short pause, including work in background tabs, and keeps recovery enabled when autosave is off. New files require an initial Save to choose their destination. Saving a Python draft does not execute it or apply Functions.
+
+The arrows operate on the last focused visible editor; for example, a focused sidebar script receives Undo while the table remains visible. Saving preserves history. Undo after autosave creates a new pending change, which is saved in turn. History survives tab navigation and Markdown mode switches during the session, but does not survive closing the editor or restarting the application.
+
 ## User behavior
 
 Home lists open workspaces and the last 20 successfully opened or saved files. Removing a recent entry does not delete the file. Missing recent paths remain visible and report an error when opened. Closing the last CSV returns to Home. Visiting Home or another workspace preserves open work.
@@ -8,9 +12,17 @@ A new project starts empty. Importing CSV/TSV data copies it into the project; t
 
 Tables and scripts belong to the project. Tables open in the main area's tabs. Scripts and Functions open in the resizable left sidebar while the active table stays visible. **Back to project items** returns to the navigator without discarding drafts or interrupting a running script. Closing a table tab hides it; deleting an item is a separate confirmed action. Save and Save As write the whole project. Export CSV writes a complete table; Export View writes the currently sorted/filtered table. Exporting never clears the project's unsaved state.
 
-The Python editor remembers a table of the same project as input. New and imported scripts default to the currently selected table; existing scripts retain their input binding. It sends the complete table, not only filtered rows, using the existing `run(rows, context)` / `transform(rows, context)` protocol. Opening a project does not execute code. Run Preview requires the existing trust acknowledgement; scripts execute with normal user permissions. Python 3.10+ and packages are supplied by the local environment, not the project.
+The Python editor remembers a table of the same project as input. New and imported scripts default to the currently selected table; existing scripts retain their input binding. It sends the complete table, not only filtered rows, using the existing `run(rows, context)` / `transform(rows, context)` protocol. Opening a project does not execute code. **Run in background** requires the existing trust acknowledgement; scripts execute with normal user permissions. Python 3.10+ and packages are supplied by the local environment, not the project.
 
-Accepting a preview creates a uniquely named, independent, editable table. Re-running adds another result. Input data and prior results are retained. Changing input data, calculation results, headers, script code, or input selection invalidates the pending preview. Sheets with formulas must have current results without formula errors before export, transformation execution, or preview acceptance. Transformations receive materialized text values, not formula source. Only one Python execution may run across the application. Navigation remains available; closing its project requires cancelling the execution first.
+**Run in background** captures the saved script draft, complete input table, input/header/calculation revisions and selected Python executable. Each run is independent: keep editing the code or table, change tabs/spaces, or launch the same script again. Two background scripts run simultaneously; additional jobs wait in submission order. Formula calculation uses a separate runtime and continues independently.
+
+The global **Python jobs** panel stays available on Home and in every workspace. It shows each job's state, duration, input/script revisions and interpreter. Select a job to see live stdout/stderr or its result preview. **Cancel job** affects only that execution, including a queued job. **Discard job** releases a finished job's console and any unaccepted result. At most 32 jobs are retained; discard old jobs to make room. The time limit defaults to 10 minutes, with 2 minutes, 1 hour and no limit also available; queued time is excluded. Each console stream retains its first 1 MiB and then displays a truncation marker while continuing to drain output.
+
+**Create result table** adds a uniquely named, independent, editable table. Editing or deleting the original script/input after submission does not invalidate a project job's captured result. The panel identifies input changes; results always describe the input captured at start. Sheets with formulas must have current results without formula errors when a job starts. Transformations receive materialized text values, not formula source. Original tables and earlier results are retained.
+
+The standalone CSV macro editor also offers **Run in background**, alongside the existing synchronous **Run Preview** workflow. Background results are accepted from the jobs panel with **Apply to CSV**, as one undoable transaction. Newer input/header revisions block application instead of overwriting edits, and the existing 64 MiB undo limit applies. Close the CSV macro editor to resume table editing while its background jobs continue; its script save/discard protection remains in place.
+
+Cancel running and queued jobs before closing their project or CSV, or exiting the application. Jobs, console output and unaccepted results last only for the current app session; saving/autosave/recovery does not persist or resume them. Accepted result tables are saved normally. Scripts still run with normal user permissions: preview/result acceptance does not defer or undo external file/network side effects.
 
 ## Project explorer and folders
 
@@ -63,9 +75,9 @@ Writing changes the saved draft. **Apply functions** explicitly loads and valida
 
 Opening or recovering a project does not run code. Formula sources, saved results, and pending flags are retained. Current saved results can be viewed and exported without Python installed. Previously unfinished results stay pending until an input edit or **Recalcular todo**. Editing sheet content or applying Functions automatically calculates pending formulas, starting Python only when needed. This includes execution of the project’s applied Python code, without an activation dialog. Functions run with the normal user's permissions; a separate process is not a security sandbox. Python 3.10+ and imported packages must exist in the selected environment. External files, clocks, and services are not tracked dependencies: use **Recalcular todo** to refresh them. Globals in Functions are recreated for each calculation generation; persistent global state is not part of the contract.
 
-Edits invalidate affected formulas and their dependents; unrelated formulas retain their results. A Rust dependency graph orders evaluation and detects cycles. A reusable Python process evaluates validated expression trees, with a fresh module namespace per project generation. Macros and calculation share one application-wide queue. Navigating remains possible while a job runs; cancel a project's job before closing it. **Cancel calculation** and a timeout leave formulas pending with no automatic infinite retries; a new content edit or **Recalcular todo** resumes calculation. Choosing another Python interpreter invalidates results but does not by itself execute projects; recalculate explicitly or edit an input. Limits remain two minutes per execution, 1 MiB of module source, 1 MiB of captured console output, and 512 MiB of protocol input/output. Each formula is limited to 16 KiB, and a referenced range to 50 million cells; these are rejection limits, not performance guarantees.
+Edits invalidate affected formulas and their dependents; unrelated formulas retain their results. A Rust dependency graph orders evaluation and detects cycles. A reusable Python process evaluates validated expression trees, with a fresh module namespace per project generation. Background script jobs have their own scheduler and processes. Calculation, interpreter changes and the legacy CSV Run Preview workflow retain their serialized queue. Navigating remains possible while a job runs; cancel a project's job before closing it. **Cancel calculation** and a timeout leave formulas pending with no automatic infinite retries; a new content edit or **Recalcular todo** resumes calculation. Choosing another Python interpreter invalidates results but does not by itself execute projects; recalculate explicitly or edit an input. Calculation and legacy CSV preview limits remain two minutes per execution (background jobs use their selected time limit), 1 MiB of module source, 1 MiB of captured console output, and 512 MiB of protocol input/output. Each formula is limited to 16 KiB, and a referenced range to 50 million cells; these are rejection limits, not performance guarantees.
 
-## File format, version 6
+## File format, version 9
 
 A `.tablune` file is a ZIP containing:
 
@@ -77,7 +89,7 @@ A `.tablune` file is a ZIP containing:
 
 The runtime does not extract archive entries to the filesystem. It checks IDs, references, duplicate entries, archive integrity, and supported format version before registration. Limits are 2 GiB of uncompressed archive entries, 16 MiB for the manifest, and 1 MiB per script. These are validation limits, not a promise that datasets at the limit fit in available RAM. Save writes a sibling temporary file and atomically replaces the destination only after successful completion.
 
-Version-1 through version-5 projects are read without reinterpreting their data. Migration happens in memory, and the next save writes version 6. Earlier application versions reject the new format. Dependencies are rebuilt on open without running Python.
+Version-1 through version-6 projects are read without reinterpreting their data. Migration happens in memory, and the next save writes version 9. Earlier application versions reject the new format. Dependencies are rebuilt on open without running Python.
 
 Project identity is persistent; open-session IDs are regenerated. A second copy of the same saved project has independent sessions. Reopening the same canonical path activates its existing space. Concurrent open/save operations reserve their destination path, and Save As cannot claim another open project's path.
 
@@ -95,7 +107,7 @@ Projects do not embed Python interpreters, packages, console output, preview res
 
 Use **Edit → Insert image…** or the cell context menu to insert a PNG/JPEG into the active cell. CSV workspaces offer to create a project first. An image replaces the previous cell content as one undoable edit. Enter or double-click opens a proportional full preview, with controls to replace/remove the image and edit alternative text. Typing or pasting text replaces the image. Image rows automatically use 96 px unless manually resized; automatic heights are reconstructed on reopening. Manual grid sizing remains session-only.
 
-Original files are embedded, so moving/deleting the source does not break a saved project. Each resource is addressed by its SHA-256 hash and shared across cells in the project. The format-3 manifest adds `assets`, mapping each hash to its format and dimensions; bytes are stored in ZIP entries `assets/<hash>`. Each cell's optional `image` metadata contains `assetId`, `name`, and `alt`. Its textual row/source representation is the filename, with formula mode disabled. Images are not scalar calculation results. Versions 1 and 2 remain readable; all new saves use version 6, which older applications reject.
+Original files are embedded, so moving/deleting the source does not break a saved project. Each resource is addressed by its SHA-256 hash and shared across cells in the project. The format-3 manifest adds `assets`, mapping each hash to its format and dimensions; bytes are stored in ZIP entries `assets/<hash>`. Each cell's optional `image` metadata contains `assetId`, `name`, and `alt`. Its textual row/source representation is the filename, with formula mode disabled. Images are not scalar calculation results. Versions 1 and 2 remain readable; all new saves use version 9, which older applications reject.
 
 Inputs must decode as PNG/JPEG and be at most 20 MiB and 25 megapixels. Resource hashes, dimensions, formats, and cell references are validated before a project is opened. Thumbnails are generated at up to 256 × 256, requested only for the current grid window with at most four requests per window, and retained in a 64 MiB decoded-image cache per mounted grid. The original is loaded on demand for preview. Unsupported or damaged input leaves the cell unchanged.
 
@@ -131,3 +143,13 @@ path is stored for a project document. See [Markdown](markdown.md).
 ## Cell styles (format 6)
 
 The **Formato** ribbon stores text emphasis, colors, alignment and per-edge borders in a sparse `sheet.styles` map. Formatting empty cells does not create CSV rows. Styles survive project save, recovery and duplication; CSV export contains values only. Format-only edits do not invalidate or execute Python. See [cell styles](cell-styles.md) for controls, clipboard behavior and limits.
+
+
+## Project canvases (format 7)
+
+The explorer creates, moves, renames, duplicates and removes canvases. Their stable
+IDs appear in the same organization tree and tab area as other documents. The
+manifest contains canvas names/revisions; `canvases/<id>.json` contains validated
+objects and connectors. Images use the shared project resource store. Recovery
+format 6 can carry format-9 project data, including canvas content and its assets.
+See [canvas interactions, persistence and validation](canvas.md).

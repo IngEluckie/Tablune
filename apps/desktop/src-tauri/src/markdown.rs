@@ -358,6 +358,7 @@ fn action_internal(
             },
         ),
         MarkdownAction::Open { path } => {
+            let _path = FilePathOperation::acquire(Path::new(&path))?;
             if project_id.is_none()
                 && find_document_by_path(&state, Path::new(&path), None)?.is_some()
             {
@@ -419,6 +420,10 @@ fn action_internal(
         }
         other => {
             let id = document_id.ok_or("Missing document ID")?;
+            let _path = match &other {
+                MarkdownAction::Save { path } => Some(FilePathOperation::acquire(Path::new(path))?),
+                _ => None,
+            };
             if let MarkdownAction::Save { path } = &other {
                 ensure_extension(path)?;
                 if summaries(&state)?.iter().any(|d| {

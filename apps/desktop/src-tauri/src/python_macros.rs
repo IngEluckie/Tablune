@@ -1,5 +1,7 @@
 #[path = "calculation_worker.rs"]
 pub(crate) mod calculation_worker;
+#[path = "python_jobs.rs"]
+pub(crate) mod jobs;
 pub(crate) static PYTHON_QUEUE: tauri::async_runtime::Mutex<()> =
     tauri::async_runtime::Mutex::const_new(());
 use std::{
@@ -119,6 +121,12 @@ struct RuntimeInner {
     child: Option<Arc<Mutex<Child>>>,
     pending: Option<PendingPreview>,
     next_preview: u64,
+    background: bool,
+    timeout_seconds: Option<u64>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
 }
 
 #[derive(Clone, Default)]
@@ -149,7 +157,7 @@ impl Drop for TemporaryDirectory {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct InterpreterInfo {
     path: String,
     version: String,
@@ -438,6 +446,58 @@ fn terminate_process_tree(process: &mut Child) {
     let _ = process.kill();
 }
 
+struct MacroProcessGuard(Option<Arc<Mutex<Child>>>);
+impl Drop for MacroProcessGuard {
+    fn drop(&mut self) {
+        if let Some(process) = &self.0
+            && let Ok(mut child) = process.lock()
+        {
+            terminate_process_tree(&mut child);
+            let _ = child.wait();
+        }
+    }
+}
+fn capture_output(
+    mut pipe: impl Read + Send + 'static,
+    inner: Arc<Mutex<RuntimeInner>>,
+    stderr: bool,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut buffer = [0; 8192];
+        while let Ok(count) = pipe.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            let Ok(mut runtime) = inner.lock() else {
+                break;
+            };
+            let runtime = &mut *runtime;
+            let (log, truncated) = if stderr {
+                (&mut runtime.stderr, &mut runtime.stderr_truncated)
+            } else {
+                (&mut runtime.stdout, &mut runtime.stdout_truncated)
+            };
+            let accepted = count.min(LOG_LIMIT.saturating_sub(log.len()));
+            log.extend_from_slice(&buffer[..accepted]);
+            *truncated |= accepted < count;
+        }
+    })
+}
+fn runtime_logs(inner: &Arc<Mutex<RuntimeInner>>) -> Result<(String, String), String> {
+    let rt = lock_runtime(inner)?;
+    let text = |bytes: &[u8], truncated: bool| {
+        let mut value = String::from_utf8_lossy(bytes).into_owned();
+        if truncated {
+            value.push_str("\n[output truncated]");
+        }
+        value
+    };
+    Ok((
+        text(&rt.stdout, rt.stdout_truncated),
+        text(&rt.stderr, rt.stderr_truncated),
+    ))
+}
+
 fn run_macro(
     inner: Arc<Mutex<RuntimeInner>>,
     interpreter: InterpreterInfo,
@@ -446,12 +506,14 @@ fn run_macro(
     code: String,
     source_path: Option<String>,
 ) -> Result<RunOutput, String> {
+    if lock_runtime(&inner)?.cancel_requested {
+        return Err("Python macro cancelled".into());
+    }
     let directory = TemporaryDirectory::create()?;
     let input_path = directory.0.join("input.json");
     let macro_path = directory.0.join("macro.py");
     let output_path = directory.0.join("output.json");
-    let stdout_path = directory.0.join("stdout.log");
-    let stderr_path = directory.0.join("stderr.log");
+
     let header_present = snapshot.header_enabled && !snapshot.rows.is_empty();
     let headers = snapshot
         .header_enabled
@@ -474,10 +536,11 @@ fn run_macro(
         },
     };
     let encoded = serde_json::to_vec(&input).map_err(|error| error.to_string())?;
+    if encoded.len() > OUTPUT_LIMIT as usize {
+        return Err("Macro input exceeds 512 MiB".into());
+    }
     fs::write(&input_path, encoded).map_err(|error| error.to_string())?;
     fs::write(&macro_path, code).map_err(|error| error.to_string())?;
-    let stdout_file = fs::File::create(&stdout_path).map_err(|error| error.to_string())?;
-    let stderr_file = fs::File::create(&stderr_path).map_err(|error| error.to_string())?;
     let working_directory = source_path
         .as_deref()
         .and_then(|path| Path::new(path).parent())
@@ -485,6 +548,7 @@ fn run_macro(
         .to_path_buf();
     let mut command = Command::new(&interpreter.path);
     command
+        .arg("-u")
         .arg(runner)
         .arg(&input_path)
         .arg(&macro_path)
@@ -492,24 +556,41 @@ fn run_macro(
         .current_dir(&working_directory)
         .env("TABLUNE_MACRO_DIR", &working_directory)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file));
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     configure_macro_process(&mut command);
-    let child = Arc::new(Mutex::new(
-        command
-            .spawn()
-            .map_err(|error| format!("failed to start Python: {error}"))?,
-    ));
-    {
+    // Register under the cancellation lock so shutdown cannot miss a starting process.
+    let child = {
         let mut runtime = lock_runtime(&inner)?;
-        runtime.child = Some(child.clone());
         if runtime.cancel_requested {
-            if let Ok(mut process) = child.lock() {
-                terminate_process_tree(&mut process);
-            }
+            return Err("Python macro cancelled".into());
         }
-    }
-
+        let child = Arc::new(Mutex::new(
+            command
+                .spawn()
+                .map_err(|error| format!("failed to start Python: {error}"))?,
+        ));
+        runtime.child = Some(child.clone());
+        child
+    };
+    let mut process_guard = MacroProcessGuard(Some(child.clone()));
+    let (stdout_pipe, stderr_pipe) = {
+        let mut process = child.lock().map_err(|_| "Python process unavailable")?;
+        (
+            process.stdout.take().unwrap(),
+            process.stderr.take().unwrap(),
+        )
+    };
+    let stdout_reader = capture_output(stdout_pipe, inner.clone(), false);
+    let stderr_reader = capture_output(stderr_pipe, inner.clone(), true);
+    let timeout = {
+        let runtime = lock_runtime(&inner)?;
+        if runtime.background {
+            runtime.timeout_seconds.map(Duration::from_secs)
+        } else {
+            Some(EXECUTION_TIMEOUT)
+        }
+    };
     let started = Instant::now();
     let mut cancelled = false;
     let exit_status = loop {
@@ -520,7 +601,7 @@ fn run_macro(
         if cancel_requested {
             terminate_process_tree(&mut process);
             cancelled = true;
-        } else if started.elapsed() >= EXECUTION_TIMEOUT {
+        } else if timeout.is_some_and(|limit| started.elapsed() >= limit) {
             terminate_process_tree(&mut process);
         }
         match process.try_wait().map_err(|error| error.to_string())? {
@@ -531,15 +612,23 @@ fn run_macro(
             }
         }
     };
-    let stdout = read_limited(&stdout_path, LOG_LIMIT);
-    let stderr = read_limited(&stderr_path, LOG_LIMIT);
+    // Close inherited pipes even when a script left descendants behind.
+    {
+        let mut runtime = lock_runtime(&inner)?;
+        let mut process = child.lock().map_err(|_| "Python process unavailable")?;
+        terminate_process_tree(&mut process);
+        let _ = process.wait();
+        runtime.child = None;
+    }
+    process_guard.0 = None;
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    let (stdout, stderr) = runtime_logs(&inner)?;
     if cancelled {
         return Err("Python macro cancelled".to_string());
     }
-    if started.elapsed() >= EXECUTION_TIMEOUT {
-        return Err(format!(
-            "Python macro exceeded the two minute limit\n{stderr}"
-        ));
+    if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+        return Err(format!("Python macro exceeded its time limit\n{stderr}"));
     }
     if !exit_status.success() {
         return Err(format!("Python macro failed\n{stderr}"));
@@ -720,6 +809,10 @@ async fn run_preview(
         runtime.cancel_requested = false;
         runtime.child = None;
         runtime.pending = None;
+        runtime.stdout.clear();
+        runtime.stderr.clear();
+        runtime.stdout_truncated = false;
+        runtime.stderr_truncated = false;
     }
     let execution_inner = inner.clone();
     let execution_snapshot = snapshot.clone();

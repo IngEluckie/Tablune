@@ -2,7 +2,9 @@ import { clampSheetZoom } from "./sheetZoom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import CsvGrid, { normalizeSelection } from "./CsvGrid";
+import CsvGrid, { normalizeSelection, flushCellEdits } from "./CsvGrid";
+import { useEditorHistory } from "./editorHistory";
+import type { SaveCoordinator } from "./saveCoordinator";
 import DocumentTabs from "./DocumentTabs";
 import ExplorerPanel from "./ExplorerPanel";
 import FormulaPanel, { type FormulaPanelTab } from "./FormulaPanel";
@@ -119,6 +121,8 @@ function shortPath(path: string): string {
 }
 
 export interface CsvWorkspaceProps {
+  saves?: SaveCoordinator;
+  onSaveDocument?: (id: number, saveAs?: boolean, suggestedName?: string) => Promise<boolean>;
   projectDirty?: boolean;
   formulaControls?: Pick<NonNullable<RibbonHeaderProps["formulas"]>, "running" | "status" | "onRecalculate" | "onCancel"> & {
     draftCode: string;
@@ -182,6 +186,12 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
   const closingInProgress = useRef(false);
   const lastRecovery = useRef(0);
   const restoreExplorerAfterMacro = useRef(false);
+  const historyQueue = useRef<Promise<void>>(Promise.resolve());
+  useEffect(() => {
+    if (!unsavedRequest || !props.saves) return;
+    const id = unsavedRequest.kind === "document" ? `csv:${unsavedRequest.documentId}` : undefined;
+    return () => props.saves?.resume(id);
+  }, [unsavedRequest, props.saves]);
 
   const summary =
     documents.find((document) => document.documentId === activeDocumentId) ??
@@ -293,21 +303,43 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
     [updateTabUi],
   );
 
+  useEffect(() => {
+    const applied = (event: Event) => {
+      const id = (event as CustomEvent<number>).detail;
+      if (documentsRef.current.some(d => d.documentId === id)) {
+        updateTabUi(id, current => ({ ...current, view: EMPTY_VIEW, sizing: { columnWidths: {}, rowHeights: {} } }));
+      }
+    };
+    window.addEventListener("tablune-job-applied", applied);
+    return () => window.removeEventListener("tablune-job-applied", applied);
+  }, [updateTabUi]);
+
   const runHistoryCommand = useCallback(
     async (
       documentId: DocumentId,
       command: typeof undoSession | typeof redoSession,
     ) => {
-      try {
-        updateDocument(await command(documentId));
-        clearSizing(documentId, "both");
-      } catch (reason) {
-        if (activeDocumentIdRef.current === documentId)
-          setError(String(reason));
-      }
+      const operation = historyQueue.current.catch(() => {}).then(async () => {
+        try {
+          await flushCellEdits();
+          updateDocument(await command(documentId));
+          clearSizing(documentId, "both");
+        } catch (reason) {
+          if (activeDocumentIdRef.current === documentId)
+            setError(String(reason));
+        }
+      });
+      historyQueue.current = operation;
+      await operation;
     },
     [clearSizing, updateDocument],
   );
+  const historyBinding = useEditorHistory({
+    id: `table:${summary.documentId}`, scope: summary.projectId != null ? `project:${summary.projectId}` : `csv:${summary.documentId}`,
+    canUndo: summary.canUndo, canRedo: summary.canRedo, disabled: interactionsLocked || !summary.documentId,
+    undo: () => { void runHistoryCommand(summary.documentId, undoSession); },
+    redo: () => { void runHistoryCommand(summary.documentId, redoSession); },
+  });
 
   const activateDocument = useCallback((documentId: DocumentId) => {
     if (
@@ -356,6 +388,10 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
     ): Promise<boolean> => {
       if (propsRef.current.project)
         return propsRef.current.project.onSave(saveAs);
+      if (propsRef.current.onSaveDocument) {
+        try { return await propsRef.current.onSaveDocument(documentId, saveAs, suggestedName); }
+        catch (reason) { setError(String(reason)); setUnsavedError(String(reason)); return false; }
+      }
       const document = documentsRef.current.find(
         (candidate) => candidate.documentId === documentId,
       );
@@ -470,37 +506,65 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
 
   const closeDocumentNow = useCallback(
     async (documentId: DocumentId, discardUnsaved: boolean) => {
-      const current = documentsRef.current;
-      const index = current.findIndex(
-        (document) => document.documentId === documentId,
-      );
-      if (index < 0) return;
-      const wasActive = activeDocumentIdRef.current === documentId;
-      const nextActiveId = wasActive
-        ? (current[index + 1]?.documentId ??
-          current[index - 1]?.documentId ??
-          0)
-        : activeDocumentIdRef.current;
+      const saves = propsRef.current.saves;
+      saves?.pause(`csv:${documentId}`);
+      try {
+        await saves?.wait(`csv:${documentId}`);
+        const current = documentsRef.current;
+        const index = current.findIndex(
+          (document) => document.documentId === documentId,
+        );
+        if (index < 0) return;
+        const wasActive = activeDocumentIdRef.current === documentId;
+        const nextActiveId = wasActive
+          ? (current[index + 1]?.documentId ??
+            current[index - 1]?.documentId ??
+            0)
+          : activeDocumentIdRef.current;
 
-      const workspace = await closeSession(documentId, discardUnsaved);
-      commitDocuments(workspace.documents);
-      setTabUiStates((states) => {
-        const updated = { ...states };
-        delete updated[documentId];
-        return updated;
-      });
-      if (wasActive) activateDocument(nextActiveId);
+        const workspace = await closeSession(documentId, discardUnsaved);
+        commitDocuments(workspace.documents);
+        setTabUiStates((states) => {
+          const updated = { ...states };
+          delete updated[documentId];
+          return updated;
+        });
+        if (wasActive) activateDocument(nextActiveId);
+      } finally { saves?.resume(`csv:${documentId}`); }
     },
     [activateDocument, commitDocuments],
   );
 
   const requestCloseDocument = useCallback(
-    (documentId: DocumentId) => {
+    async (documentId: DocumentId) => {
       if (propsRef.current.project) {
         propsRef.current.project.onCloseTab(documentId);
         return;
       }
       if (busy || macroOpen || unsavedRequest) return;
+      const saves = propsRef.current.saves;
+      if (saves) {
+        const targetId = `csv:${documentId}`;
+        let keepPaused = false;
+        saves.pause(targetId);
+        const cellEdits = flushCellEdits();
+        setBusy(true);
+        try {
+          await cellEdits;
+          await saves.wait(targetId);
+          let saveError: string | null = null;
+          try { await saves.flush(targetId); } catch (error) { saveError = String(error); }
+          const latest = await getSessionSummary(documentId);
+          updateDocument(latest);
+          if (latest.dirty) {
+            keepPaused = true;
+            setUnsavedError(saveError);
+            setUnsavedRequest({ kind: "document", documentId });
+          } else await closeDocumentNow(documentId, false);
+        } catch (error) { setError(String(error)); }
+        finally { if (!keepPaused) saves.resume(targetId); setBusy(false); }
+        return;
+      }
       const document = documentsRef.current.find(
         (candidate) => candidate.documentId === documentId,
       );
@@ -515,7 +579,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
         .catch((reason) => setError(String(reason)))
         .finally(() => setBusy(false));
     },
-    [busy, closeDocumentNow, macroOpen, unsavedRequest],
+    [busy, closeDocumentNow, macroOpen, unsavedRequest, updateDocument],
   );
 
   const reorderDocuments = useCallback(
@@ -731,6 +795,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
         event.preventDefault();
         setSearchOpen(true);
       } else if (key === "z" || key === "y") {
+        if (event.target instanceof Element && event.target.closest("input, textarea, [contenteditable=true]")) return;
         event.preventDefault();
         const documentId = activeDocumentIdRef.current;
         if (!documentId) return;
@@ -770,7 +835,8 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
     if (normalizedName === summary.displayName) return true;
     setBusy(true);
     try {
-      updateDocument(await renameSession(summary.documentId, normalizedName));
+      const rename = () => renameSession(summary.documentId, normalizedName);
+      updateDocument(await (propsRef.current.saves?.run(`csv:${summary.documentId}`, rename) ?? rename()));
       setError(null);
       return true;
     } catch (reason) {
@@ -862,7 +928,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
     }
   };
 
-  const runGridCommand = (command: "copy" | "cut" | "paste" | "insertImage" | "autoSum" | "insertFunction" | "format", functionName?: string, patch?: StylePatch) => {
+  const runGridCommand = (command: "copy" | "cut" | "paste" | "insertImage" | "autoSum" | "insertFunction" | "format" | "merge" | "center" | "split", functionName?: string, patch?: StylePatch) => {
     if (macroOpen && command !== "copy") return;
     document.dispatchEvent(
       new CustomEvent("tablune-grid-command", {
@@ -937,7 +1003,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
 
   const ribbon = <RibbonHeader
         {...props.ribbonControls}
-        formatting={{ available: summary.projectId != null, summary: formatSummary, onApply: patch => runGridCommand("format", undefined, patch), onCreateProject: props.onCreateFormatProject }}
+        formatting={{ onMerge:action=>runGridCommand(action), mergeDisabled:summary.filtersActive||summary.sortCount>0||tabUi.selection.mode!=="cells", available: summary.projectId != null, summary: formatSummary, onApply: patch => runGridCommand("format", undefined, patch), onCreateProject: props.onCreateFormatProject }}
         formulas={props.formulaControls && summary.projectId != null ? {
           ...props.formulaControls,
           autoSumAvailable: !summary.filtersActive && summary.sortCount === 0 && tabUi.selection.mode === "cells",
@@ -1005,7 +1071,7 @@ export default function CsvWorkspace(props: CsvWorkspaceProps = {}) {
       {props.managed
         ? props.ribbonVisible && props.ribbonTarget && createPortal(ribbon, props.ribbonTarget)
         : ribbon}
-      <section className="content-region">
+      <section {...historyBinding} className="content-region">
         {searchOpen && summary.documentId !== 0 && (
           <SearchBar
             key={summary.documentId}

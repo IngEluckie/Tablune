@@ -6,6 +6,7 @@ import { EditorView } from "@codemirror/view";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  startPythonJob,
   applyPythonPreview,
   cancelPythonMacro,
   getPythonMacroFolder,
@@ -29,6 +30,7 @@ vi.mock("@tauri-apps/api/path", () => ({
 }));
 
 vi.mock("./ipc", () => ({
+  startPythonJob: vi.fn(),
   applyPythonPreview: vi.fn(),
   cancelPythonMacro: vi.fn(),
   getPythonMacroFolder: vi.fn(),
@@ -143,6 +145,19 @@ describe("PythonMacroDialog", () => {
     vi.restoreAllMocks();
   });
 
+  it("submits independent background jobs without waiting for their results", async () => {
+    vi.mocked(startPythonJob).mockResolvedValue({ id: 7 } as import("./types").PythonJob);
+    vi.mocked(ask).mockResolvedValue(true);
+    render(<PythonMacroDialog summary={summary} trustAcknowledged={true} onTrustAcknowledged={vi.fn()} onApplied={vi.fn()} onClose={vi.fn()} />);
+    await screen.findByText(/Python 3/);
+    fireEvent.click(screen.getByRole("button", { name: "Run in background" }));
+    await waitFor(() => expect(startPythonJob).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Run in background" })).toHaveProperty("disabled", false));
+    fireEvent.click(screen.getByRole("button", { name: "Run in background" }));
+    await waitFor(() => expect(startPythonJob).toHaveBeenCalledTimes(2));
+    expect(startPythonJob).toHaveBeenLastCalledWith(7, expect.stringContaining("def run"), null, 2, 600);
+    expect(previewPythonMacro).not.toHaveBeenCalled();
+  });
   it("warns once, previews changes, and applies by preview id", async () => {
     render(<PythonMacroDialog {...props} />);
     await screen.findByText(/Python 3\.12\.1/);

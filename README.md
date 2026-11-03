@@ -11,6 +11,12 @@ The initial release targets macOS for development and validation, while preservi
 
 ## Current scope (0.5)
 
+- Create standalone canvases from Home, save portable `.tlcanvas` files, or keep canvases with linked document cards in projects
+- Wrap text in normal and merged cells with automatic row heights from Formato
+- Merge, merge and center, or unmerge project sheet cells from Formato ([guide](docs/merged-cells.md))
+- Edit with floating properties, grouping, alignment and undo/redo; export PNG/SVG
+- Save portable canvases in format-9 projects; read earlier formats ([canvas guide](docs/canvas.md))
+
 - Mixed project explorer with nested folders and creation/import destinations
 - Drag/menu moves, logical breadcrumbs, and content-preserving folder removal
 - Format-5 organization and recovery with backward reading
@@ -18,7 +24,7 @@ The initial release targets macOS for development and validation, while preservi
 - Create standalone Markdown documents or keep them alongside tables in projects
 - Edit visually with live formatting, a `/` block menu, or Markdown source mode
 - Import local PNG/JPEG images, find text, navigate headings, and undo across editor modes
-- Save standalone documents with portable image folders, or embed everything in a format-6 project
+- Save standalone documents with portable image folders, or embed everything in a format-9 project
 - Recover unsaved Markdown and protect pending edits when saving or closing
 
 
@@ -28,7 +34,7 @@ The initial release targets macOS for development and validation, while preservi
 - Edit the original formula in a formula bar while the grid shows its result
 - Apply cell types, copy formulas with adjusted references, paste values, and undo structural changes
 - Format project cells with the **Formato** tab: text, colors, borders, alignment and quick styles ([guide](docs/cell-styles.md))
-- Save formulas, original text, function drafts/applied code, and cached results in format-6 projects
+- Save formulas, original text, function drafts/applied code, and cached results in format-9 projects
 - Calculate automatically after edits; reopen saved results without executing Python
 
 - Start from Home with recent files and multiple open workspaces
@@ -110,9 +116,9 @@ Tablune 0.5 adds Python calculation inside existing project sheets. Rust owns or
 
 ## Working with projects
 
-Choose **New project** on Home, import CSV tables, and create or import a Python script. In the left sidebar's script editor, choose an input table, run a preview, and select **Create result table** while keeping the active table visible on the right. **Back to project items** returns to the table and script list without discarding edits. Each accepted execution adds an editable copy; it never overwrites the input or a previous result. Saving a project stores all its tables and scripts in one `.tablune` file. Reopen it later and select a different table to reuse the script.
+Choose **New project** on Home, import CSV tables, and create or import a Python script. In the script editor, choose an input table and **Run in background**. Continue editing or run another script while it works. The global **Python jobs** panel shows live consoles, individual cancellation and result previews; select **Create result table** when a job completes. Two background scripts run concurrently, with additional jobs queued independently of formula calculation. **Back to project items** returns to the table and script list without discarding edits. Each accepted execution adds an editable copy; it never overwrites the input or a previous result. Saving a project stores all its tables and scripts in one `.tablune` file. Reopen it later and select a different table to reuse the script.
 
-CSV workspaces retain their existing macro panel and save behavior. **Create project from this CSV** copies the current in-memory data and view, including unsaved edits, while leaving the original CSV open. Exporting a table produces a CSV and does not save the project.
+CSV workspaces retain their existing macro panel and save behavior, and also offer **Run in background** with results in the jobs panel. Background jobs use a selectable time limit (10 minutes by default) and last only for the current app session. **Create project from this CSV** copies the current in-memory data and view, including unsaved edits, while leaving the original CSV open. Exporting a table produces a CSV and does not save the project.
 
 ## Project explorer
 
@@ -120,7 +126,7 @@ The left sidebar contains one folder tree for tables, Markdown documents, and Py
 
 Drag an item onto a folder or the project root, or use **⋯ → Mover a…**. Use **Renombrar** or F2 to rename, and **Quitar carpeta y conservar contenido** to lift children to the parent without deleting documents. Sibling folder-name conflicts and invalid moves are rejected before changing the project. Item menus also export content or duplicate a table. Expansion is remembered locally per project, and breadcrumbs show the active item's logical path. Scripts still edit beside the active table; returning to the explorer retains its state. **Funciones del proyecto** remains a fixed project-wide tool.
 
-Folders live inside the portable `.tablune` project. They do not create local directories, alter Python imports, or change script input bindings. Old projects open with their items at the root; their next save writes format 6.
+Folders live inside the portable `.tablune` project. They do not create local directories, alter Python imports, or change script input bindings. Old projects open with their items at the root; their next save writes format 9.
 
 ## Python in cells
 
@@ -157,5 +163,5 @@ independent document plus its resources without saving the project.
 HTML, front matter and unsupported rich-text syntax stay in source mode. Remote
 images and paths outside an imported document's directory tree are retained as
 references but are not loaded; use Insert image to embed them locally. Projects
-saved by this version use format 6 and require an application supporting format 6.
+saved by this version use format 9 and require an application supporting format 9.
 See [Markdown behavior and validation](docs/markdown.md).

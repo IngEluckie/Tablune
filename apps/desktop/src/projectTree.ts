@@ -1,12 +1,13 @@
 import type { ProjectSummary } from "./types";
 
-export type ProjectEntryKind = "folder" | "table" | "markdown" | "script";
+export type ProjectEntryKind = "folder" | "table" | "markdown" | "script" | "canvas";
 export interface ProjectEntry { id: string; name: string; kind: ProjectEntryKind; parentId: string | null; }
 export function projectEntries(project: ProjectSummary): ProjectEntry[] {
   const organization = project.organization;
   const parent = (id: string) => organization?.itemFolders[id] ?? null;
   return [
     ...(organization?.folders ?? []).map(f => ({ ...f, kind: "folder" as const })),
+    ...(project.canvases ?? []).map(c => ({id:c.id,name:c.name,kind:"canvas" as const,parentId:parent(c.id)})),
     ...project.tables.map(t => ({ id: t.id, name: t.document.displayName, kind: "table" as const, parentId: parent(t.id) })),
     ...(project.markdown ?? []).map(d => ({ id: d.id, name: d.name, kind: "markdown" as const, parentId: parent(d.id) })),
     ...project.scripts.map(s => ({ id: s.id, name: s.name, kind: "script" as const, parentId: parent(s.id) })),

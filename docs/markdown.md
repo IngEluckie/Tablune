@@ -52,7 +52,7 @@ allows choosing a PNG/JPEG anywhere through the file picker. No remote image
 fetching is required for document rendering.
 
 The project archive shares image resources with cells. Markdown sources live in
-`documents/<persistent-id>.md`; image mappings live in the format-6 manifest.
+`documents/<persistent-id>.md`; image mappings live in the project manifest (current format 7).
 Export resolves real image nodes, including reference syntax, without rewriting
 image examples in code fences. Export never clears project dirty state.
 

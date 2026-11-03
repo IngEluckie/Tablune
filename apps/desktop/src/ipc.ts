@@ -240,3 +240,20 @@ export const readMarkdownImage = (projectId: number | null, documentId: string, 
 
 export const getStyleSummary = (documentId: number, range: import("./types").CellRange, expectedRevision: number) =>
   invoke<import("./types").StyleSummary>("sheet_style_summary", { documentId, range, expectedRevision });
+
+export const importCanvasImage = (projectId: number, path: string | null, bytes: number[] | null = null) => invoke<string>("canvas_image_import", {projectId,path,bytes});
+export const readCanvasImage = (projectId: number, assetId: string) => invoke<ArrayBuffer>("canvas_image_read", {projectId,assetId});
+export const writeCanvasExport = (path: string, bytes: number[]) => invoke<void>("canvas_export", {path,bytes});
+
+export const newStandaloneCanvas = () => invoke<import("./types").ProjectSummary>("canvas_new");
+
+export const getPythonJobs = () => invoke<import("./types").PythonJob[]>("python_jobs");
+export const getPythonJob = (jobId: number) => invoke<import("./types").PythonJobDetail>("python_job_detail", { jobId });
+export const startProjectPythonJob = (projectId: number, scriptId: string, timeoutSeconds: number | null) =>
+  invoke<import("./types").PythonJob>("python_start_project_job", { projectId, scriptId, timeoutSeconds });
+export const startPythonJob = (documentId: number, code: string, sourcePath: string | null, expectedRevision: number, timeoutSeconds: number | null) =>
+  invoke<import("./types").PythonJob>("python_start_job", { documentId, code, sourcePath, expectedRevision, timeoutSeconds });
+export const cancelPythonJob = (jobId: number) => invoke<void>("python_cancel_job", { jobId });
+export const discardPythonJob = (jobId: number) => invoke<void>("python_discard_job", { jobId });
+export const acceptPythonJob = (jobId: number) =>
+  invoke<{ project: import("./types").ProjectSummary | null; document: DocumentSummary | null }>("python_accept_job", { jobId });

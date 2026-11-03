@@ -99,6 +99,8 @@ export default function ProjectFunctionsEditor({
       <div className="project-code">
         <Suspense fallback={<p>Loading editor…</p>}>
           <Editor
+            historyId={`functions:${project.projectId}`}
+            historyScope={`project:${project.projectId}`}
             label="Functions code"
             value={code}
             disabled={disabled}

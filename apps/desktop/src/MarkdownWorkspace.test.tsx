@@ -12,7 +12,7 @@ vi.mock("./ipc");
 let backend: WorkspaceSummary;
 const doc = (id: string): MarkdownDocument => ({ id, name: `${id}.md`, content: "# Original", revision: 0, path: null, dirty: true, images: {} });
 beforeEach(() => {
-  vi.clearAllMocks();
+  vi.clearAllMocks(); vi.mocked(ipc.getPythonJobs).mockResolvedValue([]);
   backend = { documents: [], markdown: [doc("a")], projects: [{ projectId: 1, persistentId: "p", name: "Research", path: "/tmp/research.tablune", dirty: false, revision: "0", tables: [], scripts: [], markdown: [doc("b")] }] };
   vi.mocked(ipc.getWorkspaceSummary).mockImplementation(async () => structuredClone(backend));
   vi.mocked(ipc.getRecentFiles).mockResolvedValue([]);
@@ -28,7 +28,7 @@ beforeEach(() => {
   });
   vi.mocked(ipc.saveProject).mockImplementation(async () => { backend.projects![0].dirty = false; return structuredClone(backend.projects![0]); });
 });
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.useRealTimers(); });
 it("opens md files through Markdown sessions rather than the CSV parser", async () => {
   const { result } = renderHook(useWorkspace); await waitFor(() => expect(result.current.ready).toBe(true));
   await act(async () => { await result.current.openPath("/tmp/notes.md"); });
@@ -73,4 +73,80 @@ it("application exit includes standalone documents in unsaved-change protection"
   const { result } = renderHook(useWorkspace); await waitFor(() => expect(result.current.ready).toBe(true));
   await act(async () => { await result.current.requestClose("app"); });
   expect(result.current.closeRequest).toBe("app"); expect(ipc.exitApplication).not.toHaveBeenCalled();
+});
+
+it("autosaves standalone and project Markdown without confirming the active cell or opening a dialog", async () => {
+  backend.markdown![0].path = "/tmp/a.md";
+  const { result } = renderHook(useWorkspace);
+  await waitFor(() => expect(result.current.ready).toBe(true));
+  vi.useFakeTimers();
+  const flushCell = vi.fn(); document.addEventListener("tablune-flush-cell-edits", flushCell);
+  try {
+    act(() => {
+      result.current.editMarkdown(null, "a", "standalone edit");
+      result.current.editMarkdown(1, "b", "project edit");
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2500); });
+    expect(backend.markdown![0].content).toBe("standalone edit");
+    expect(backend.markdown![0].dirty).toBe(false);
+    expect(backend.projects![0].markdown![0].content).toBe("project edit");
+    expect(ipc.saveProject).toHaveBeenCalledWith(1, "/tmp/research.tablune");
+    expect(save).not.toHaveBeenCalled(); expect(flushCell).not.toHaveBeenCalled();
+  } finally { document.removeEventListener("tablune-flush-cell-edits", flushCell); }
+});
+
+it("keeps untitled documents in recovery and keeps recovery enabled when autosave is off", async () => {
+  const { result } = renderHook(useWorkspace);
+  await waitFor(() => expect(result.current.ready).toBe(true));
+  vi.useFakeTimers();
+  act(() => {
+    result.current.saves.setEnabled("project:1", false);
+    result.current.editMarkdown(null, "a", "untitled draft");
+    result.current.editMarkdown(1, "b", "manual save only");
+  });
+  await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+  expect(ipc.writeWorkspaceRecovery).toHaveBeenCalled();
+  expect(ipc.saveProject).not.toHaveBeenCalled(); expect(save).not.toHaveBeenCalled();
+  expect(backend.markdown![0].dirty).toBe(true);
+  expect(result.current.saves.status("markdown:a")?.state).toBe("location");
+});
+
+it("flushes pending autosave on exit and keeps the close dialog after a disk failure", async () => {
+  backend.markdown![0].path = "/tmp/a.md";
+  const { result } = renderHook(useWorkspace);
+  await waitFor(() => expect(result.current.ready).toBe(true));
+  act(() => result.current.editMarkdown(null, "a", "close immediately"));
+  const action = vi.mocked(ipc.markdownAction).getMockImplementation()!;
+  vi.mocked(ipc.markdownAction).mockImplementation((pid, id, request) => {
+    if (request.kind === "save") return Promise.reject(new Error("Disk full"));
+    return action(pid, id, request);
+  });
+  await act(async () => { await result.current.requestClose("app"); });
+  expect(result.current.closeRequest).toBe("app");
+  expect(ipc.exitApplication).not.toHaveBeenCalled();
+  expect(backend.markdown![0].content).toBe("close immediately");
+  expect(backend.markdown![0].dirty).toBe(true);
+  act(() => result.current.cancelClose());
+  vi.mocked(ipc.markdownAction).mockImplementation(action);
+  await act(async () => { await result.current.requestClose("app"); });
+  expect(backend.markdown![0].dirty).toBe(false);
+  expect(ipc.exitApplication).toHaveBeenCalledOnce();
+  expect(ask).not.toHaveBeenCalled();
+});
+it("flushes canvas drafts before saving and retains failed canvas updates for retry", async () => {
+  const content = { nodes: [], edges: [] };
+  backend.projects![0].canvases = [{ id:"canvas",name:"Mapa",revision:0,content }];
+  vi.mocked(ipc.projectAction).mockImplementation(async (_, action) => {
+    if(action.kind === "updateCanvas") {const c=backend.projects![0].canvases![0];expect(action.expectedRevision).toBe(c.revision);c.content=action.content;c.revision++;backend.projects![0].dirty=true;}
+    return structuredClone(backend.projects![0]);
+  });
+  const { result } = renderHook(useWorkspace);await waitFor(()=>expect(result.current.ready).toBe(true));
+  act(()=>result.current.editCanvas(1,"canvas",content));
+  vi.mocked(ipc.projectAction).mockRejectedValueOnce(new Error("write failed"));
+  await act(async()=>{await expect(result.current.saveProjectById(1)).rejects.toThrow("write failed");});
+  expect(result.current.canvasDrafts["1:canvas"]).toEqual(content);expect(ipc.saveProject).not.toHaveBeenCalled();
+  await act(async()=>{await result.current.saveProjectById(1);});
+  expect(result.current.canvasDrafts["1:canvas"]).toBeUndefined();expect(backend.projects![0].canvases![0].revision).toBe(1);
 });

@@ -33,6 +33,10 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 }));
 vi.mock("./ipc", async (original) => ({
   ...(await original<typeof import("./ipc")>()),
+  getPythonJobs: vi.fn().mockResolvedValue([]),
+  getPythonJob: vi.fn(),
+  startProjectPythonJob: vi.fn(),
+  acceptPythonJob: vi.fn(),
   getWorkspaceSummary: vi.fn(),
   getRecentFiles: vi.fn(),
   recoveryAvailable: vi.fn(),
@@ -88,6 +92,7 @@ const project = (id: number): ProjectSummary => ({
 let backend: WorkspaceSummary;
 beforeEach(() => {
   vi.resetAllMocks();
+  vi.mocked(ipc.getPythonJobs).mockResolvedValue([]);
   localStorage.clear();
   vi.mocked(listen).mockResolvedValue(vi.fn());
   backend = { documents: [], projects: [] };
@@ -149,7 +154,7 @@ beforeEach(() => {
     return structuredClone(p);
   });
 });
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.useRealTimers(); });
 const sheet = (id: number, name: string) => ({
   id: `sheet-${id}`,
   document: {
@@ -243,30 +248,33 @@ describe("Python editing beside project tables", () => {
     expect(screen.getByRole("combobox", { name: "Input table" })).toHaveProperty("value", "sheet-20");
     expect(screen.queryByRole("tab", { name: "Imported.py" })).toBeNull();
   });
-  it("flushes a sidebar draft before preview and opens its result while retaining the editor", async () => {
+  it("flushes the draft before starting a background job and creates its result from the panel", async () => {
     backend.projects = [scriptProject()];
     vi.mocked(ask).mockResolvedValue(true);
     vi.mocked(ipc.getPythonStatus).mockResolvedValue({ available: true, path: "/usr/bin/python3", version: "3.12", error: null });
-    vi.mocked(ipc.previewProjectScript).mockImplementation(async () => {
+    const job: import("./types").PythonJob = { id: 1, projectId: 1, documentId: 10, scriptId: "clean", scriptName: "Clean.py", scriptRevision: 1, inputName: "Orders", inputRevision: 0, interpreter: "/usr/bin/python3", timeoutSeconds: 600, state: "succeeded", createdAt: 0, startedAt: 0, finishedAt: 1, error: null, resultAvailable: true };
+    vi.mocked(ipc.startProjectPythonJob).mockImplementation(async () => {
       expect(backend.projects![0].scripts[0].code).toBe("print('latest')");
-      return { id: "preview", baseRevision: 0, rowsBefore: 2, rowsAfter: 2, columnsBefore: 2, columnsAfter: 2, changedCells: 1, headerChanged: false, estimatedUndoBytes: 0, canApply: true, blockedReason: null, stdout: "latest", stderr: "", samples: [] };
+      vi.mocked(ipc.getPythonJobs).mockResolvedValue([job]);
+      return job;
     });
-    vi.mocked(ipc.createProjectResult).mockImplementation(async () => {
+    vi.mocked(ipc.getPythonJob).mockResolvedValue({ summary: job, stdout: "latest", stderr: "", preview: { id: "preview", baseRevision: 0, rowsBefore: 2, rowsAfter: 2, columnsBefore: 2, columnsAfter: 2, changedCells: 1, headerChanged: false, estimatedUndoBytes: 0, canApply: true, blockedReason: null, stdout: "", stderr: "", samples: [] } });
+    vi.mocked(ipc.acceptPythonJob).mockImplementation(async () => {
       backend.projects![0].tables.push(sheet(30, "Result"));
-      return structuredClone(backend.projects![0]);
+      return { project: structuredClone(backend.projects![0]), document: null };
     });
     render(<App />);
     await screen.findByRole("tab", { name: "Orders" });
     fireEvent.click(screen.getByRole("treeitem", { name: "Script Clean.py" }));
     fireEvent.change(await screen.findByRole("textbox", { name: "Python code" }), { target: { value: "print('latest')" } });
-    fireEvent.click(screen.getByRole("button", { name: "Run Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Run in background" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Create result table" }).hasAttribute("disabled")).toBe(false));
     expect(screen.getByRole("tab", { name: "Orders" }).getAttribute("aria-selected")).toBe("true");
     fireEvent.click(screen.getByRole("button", { name: "Create result table" }));
     expect(await screen.findByRole("tab", { name: "Result" })).toHaveProperty("ariaSelected", "true");
     expect(screen.getByRole("region", { name: "Script Clean.py" })).toBeTruthy();
     expect(screen.getByRole("textbox", { name: "Python code" })).toHaveProperty("value", "print('latest')");
-    expect(ipc.createProjectResult).toHaveBeenCalledWith(1, "clean", "preview");
+    expect(ipc.acceptPythonJob).toHaveBeenCalledWith(1);
   });
   it("deletes the edited script without deleting or closing the visible table", async () => {
     backend.projects = [scriptProject()];
@@ -441,7 +449,7 @@ describe("Home and project lifecycle", () => {
     backend.projects = [project(1)];
     const { result } = renderHook(() => useWorkspace());
     await waitFor(() => expect(result.current.ready).toBe(true));
-    act(() => result.current.setRunningProject(1));
+    vi.mocked(ipc.getPythonJobs).mockResolvedValue([{ id: 1, projectId: 1, state: "running" } as import("./types").PythonJob]);
     await expect(result.current.requestClose(1)).rejects.toThrow("Cancel");
     expect(ipc.closeProject).not.toHaveBeenCalled();
   });
@@ -508,6 +516,35 @@ describe("Home and project lifecycle", () => {
     });
     expect(backend.projects[0].functions.applied).toBe("def old(): return 1");
     expect(ipc.applyFunctions).not.toHaveBeenCalled();
+  });
+  it("keeps editing available during autosave and preserves a newer script after an older acknowledgement", async () => {
+    backend.projects = [{ ...scriptProject(), path: "/tmp/project.tablune", dirty: false }];
+    const { result } = renderHook(useWorkspace);
+    await waitFor(() => expect(result.current.ready).toBe(true));
+    vi.useFakeTimers();
+    let finish!: (project: ProjectSummary) => void;
+    let snapshot!: ProjectSummary;
+    vi.mocked(ipc.saveProject).mockImplementationOnce(async () => {
+      snapshot = structuredClone(backend.projects![0]);
+      snapshot.dirty = false;
+      return new Promise(resolve => { finish = resolve; });
+    });
+    const script = backend.projects[0].scripts[0];
+    act(() => result.current.editScript(1, script.id, { ...script, code: "before save" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2500); });
+    expect(ipc.saveProject).toHaveBeenCalledTimes(1);
+    expect(result.current.savingProjects).toEqual([]);
+    expect(result.current.busy).toBe(false);
+    act(() => result.current.editScript(1, script.id, { ...script, code: "while saving" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+    await act(async () => { finish(snapshot); await result.current.saves.wait("project:1"); });
+    expect(result.current.workspace.projects![0].scripts[0].code).toBe("while saving");
+    expect(result.current.workspace.projects![0].dirty).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(2500); });
+    expect(ipc.saveProject).toHaveBeenCalledTimes(2);
+    expect(result.current.workspace.projects![0].dirty).toBe(false);
+    expect(save).not.toHaveBeenCalled();
   });
   it("automatically requests calculation after an edit without an activation dialog", async () => {
     backend.projects = [

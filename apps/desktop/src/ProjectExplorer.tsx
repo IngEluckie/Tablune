@@ -5,14 +5,14 @@ import type { ProjectAction, ProjectSummary } from "./types";
 import type { ProjectTab } from "./useWorkspace";
 
 const DRAG_TYPE = "application/x-tablune-project-item";
-const labels = { folder: "Carpeta", table: "Tabla", markdown: "Documento", script: "Script" };
+const labels = { folder: "Carpeta", table: "Tabla", markdown: "Documento", script: "Script", canvas: "Lienzo" };
 type Dialog = { kind: "create" | "rename" | "move"; id: string | null; parentId: string | null };
 function readState(key: string): { expanded: string[]; selected: string | null; restored: boolean } {
   try { const state = JSON.parse(localStorage.getItem(key) ?? "null"); if (Array.isArray(state?.expanded)) return { expanded: state.expanded.filter((id: unknown) => typeof id === "string"), selected: typeof state.selected === "string" ? state.selected : null, restored: true }; } catch { /* Use an empty explorer when storage is unavailable. */ }
   return { expanded: [], selected: null, restored: false };
 }
 function ItemIcon({ kind, open }: { kind: ProjectEntryKind; open?: boolean }) {
-  return kind === "folder" ? <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true"><path d={open ? "M2 7V4.5h6l2 2h7v2M2 8.5h16l-2 7H3z" : "M2 5h6l2 2h7v9H2z"} /></svg> : <span aria-hidden="true">{kind === "table" ? "▤" : kind === "markdown" ? "▧" : "⌘"}</span>;
+  return kind === "folder" ? <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true"><path d={open ? "M2 7V4.5h6l2 2h7v2M2 8.5h16l-2 7H3z" : "M2 5h6l2 2h7v9H2z"} /></svg> : <span aria-hidden="true">{kind === "canvas" ? "◇" : kind === "table" ? "▤" : kind === "markdown" ? "▧" : "⌘"}</span>;
 }
 export default function ProjectExplorer({ project, active, editor, disabled, onAction, onOpen, onCreate, onImport, onRename, onDelete, onExport, onDuplicate, onFunctions }: {
   project: ProjectSummary;
@@ -132,7 +132,7 @@ export default function ProjectExplorer({ project, active, editor, disabled, onA
         onContextMenu={event => { event.preventDefault(); if (locked) return; setSelected(entry.id); setMenu({ id: entry.id, x: event.clientX, y: event.clientY }); }}>
         <button role="treeitem" data-entry-id={entry.id} aria-level={entry.depth + 1} aria-selected={selected === entry.id} aria-expanded={entry.kind === "folder" ? expanded.has(entry.id) : undefined}
           tabIndex={tabStop === entry.id ? 0 : -1} title={path(entry.id)} aria-label={`${labels[entry.kind]} ${entry.name}`} draggable={!locked}
-          onDragStart={event => { if (locked) { event.preventDefault(); return; } event.dataTransfer.setData(DRAG_TYPE, JSON.stringify({ projectId: project.projectId, id: entry.id })); event.dataTransfer.effectAllowed = "move"; }} onDragEnd={() => setDropTarget(undefined)}
+          onDragStart={event => { if (locked) { event.preventDefault(); return; } event.dataTransfer.setData(DRAG_TYPE, JSON.stringify({ projectId: project.projectId, id: entry.id })); event.dataTransfer.effectAllowed = "copyMove"; }} onDragEnd={() => setDropTarget(undefined)}
           onClick={() => openEntry(entry)} onKeyDown={event => keyboard(event, entry)}>
           <span className="project-tree-chevron" aria-hidden="true">{entry.kind === "folder" ? expanded.has(entry.id) ? "⌄" : "›" : ""}</span><ItemIcon kind={entry.kind} open={expanded.has(entry.id)} /><span className="project-tree-name">{entry.name}</span>
         </button>
@@ -147,13 +147,14 @@ export default function ProjectExplorer({ project, active, editor, disabled, onA
     }}>
       <span>{menuEntry?.name ?? (parentId ? path(parentId) : project.name)}</span>
       {!menuEntry && <><button role="menuitem" disabled={locked} onClick={() => startDialog("create", undefined)}>Nueva carpeta</button>
-        {(["table", "markdown", "script"] as const).map(kind => <button role="menuitem" disabled={locked} key={kind} onClick={() => { setMenu(null); onCreate(kind, parentId); }}>{kind === "table" ? "Nueva tabla" : kind === "markdown" ? "Nuevo documento" : "Nuevo script"}</button>)}
+        {(["table", "markdown", "script", "canvas"] as const).map(kind => <button role="menuitem" disabled={locked} key={kind} onClick={() => { setMenu(null); onCreate(kind, parentId); }}>{kind === "canvas" ? "Nuevo lienzo" : kind === "table" ? "Nueva tabla" : kind === "markdown" ? "Nuevo documento" : "Nuevo script"}</button>)}
         <hr />{(["table", "markdown", "script"] as const).map(kind => <button role="menuitem" disabled={locked} key={kind} onClick={() => { setMenu(null); onImport(kind, parentId); }}>{kind === "table" ? "Importar CSV…" : kind === "markdown" ? "Importar Markdown…" : "Importar .py…"}</button>)}</>}
       {menuEntry && <><button role="menuitem" disabled={locked} onClick={() => startDialog("move", menuEntry)}>Mover a…</button><button role="menuitem" disabled={locked} onClick={() => { if (menuEntry.kind === "folder") startDialog("rename", menuEntry); else { setMenu(null); onRename({ kind: menuEntry.kind, id: menuEntry.id }); } }}>Renombrar</button>
-        {menuEntry.kind !== "folder" && <button role="menuitem" disabled={locked} onClick={() => { setMenu(null); onExport({ kind: menuEntry.kind as "table" | "markdown" | "script", id: menuEntry.id }); }}>Exportar {menuEntry.kind === "table" ? "CSV" : menuEntry.kind === "markdown" ? "Markdown" : ".py"}…</button>}
+        {menuEntry.kind !== "folder" && menuEntry.kind !== "canvas" && <button role="menuitem" disabled={locked} onClick={() => { setMenu(null); onExport({ kind: menuEntry.kind as "table" | "markdown" | "script" | "canvas", id: menuEntry.id }); }}>Exportar {menuEntry.kind === "table" ? "CSV" : menuEntry.kind === "markdown" ? "Markdown" : ".py"}…</button>}
+        {menuEntry.kind === "canvas" && <button role="menuitem" disabled={locked} onClick={() => { setMenu(null); void run({kind:"duplicateCanvas",canvasId:menuEntry.id}); }}>Duplicar lienzo</button>}
         {menuEntry.kind === "table" && <button role="menuitem" disabled={locked} onClick={() => { setMenu(null); onDuplicate(menuEntry.id); }}>Duplicar tabla</button>}
         {menuEntry.kind === "folder" ? <button role="menuitem" disabled={locked} onClick={() => { setMenu(null); void run({ kind: "removeFolder", folderId: menuEntry.id }).then(next => { if (next) setSelected(menuEntry.parentId); }); }}>Quitar carpeta y conservar contenido</button>
-          : <button role="menuitem" disabled={locked} onClick={() => { setMenu(null); onDelete({ kind: menuEntry.kind as "table" | "markdown" | "script", id: menuEntry.id }); }}>Eliminar elemento…</button>}</>}
+          : <button role="menuitem" disabled={locked} onClick={() => { setMenu(null); onDelete({ kind: menuEntry.kind as "table" | "markdown" | "script" | "canvas", id: menuEntry.id }); }}>Eliminar elemento…</button>}</>}
     </div>, treeRef.current?.closest(".product-shell") ?? document.body)}
   </div>;
 }

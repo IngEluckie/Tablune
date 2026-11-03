@@ -34,6 +34,7 @@ pub(super) fn item_ids(data: &ProjectData) -> impl Iterator<Item = &String> {
         .iter()
         .map(|t| &t.id)
         .chain(data.scripts.iter().map(|s| &s.id))
+        .chain(data.canvases.iter().map(|c| &c.id))
         .chain(data.markdown.iter().map(|d| &d.id))
 }
 

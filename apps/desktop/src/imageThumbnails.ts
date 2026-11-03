@@ -41,7 +41,7 @@ export function useImageThumbnails(documentId: number, windowData: GridWindow | 
   useEffect(() => () => cache.clear(), [cache]);
   useEffect(() => {
     let stale = false;
-    const ids = [...new Set(windowData?.documentId === documentId ? windowData.rows.flatMap(row => row.inputs?.flatMap(cell => cell.image ? [cell.image.assetId] : []) ?? []) : [])];
+    const ids = [...new Set(windowData?.documentId === documentId ? [...windowData.rows.flatMap(row => row.inputs??[]),...(windowData.mergedCells??[])].flatMap(cell=>cell.image?[cell.image.assetId]:[]) : [])];
     const current = new Map<string, HTMLImageElement>();
     const queue: string[] = [];
     for (const id of ids) { const image = cache.get(id); if (image) current.set(id, image); else queue.push(id); }

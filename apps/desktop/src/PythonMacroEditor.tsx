@@ -1,13 +1,16 @@
 import { closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
-import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
+import { defaultKeymap, history, historyKeymap, indentWithTab, undo, redo, undoDepth, redoDepth } from "@codemirror/commands";
 import { HighlightStyle, LanguageSupport, indentUnit, syntaxHighlighting } from "@codemirror/language";
 import { pythonLanguage } from "@codemirror/lang-python";
 import { Annotation, Compartment, EditorState, Prec } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { tags } from "@lezer/highlight";
-import { useLayoutEffect, useRef } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
+import { useEditorHistory } from "./editorHistory";
 
 interface PythonMacroEditorProps {
+  historyId?: string;
+  historyScope?: string;
   label?: string;
   value: string;
   disabled: boolean;
@@ -35,12 +38,17 @@ function editableExtensions(disabled: boolean) {
   ];
 }
 
-export default function PythonMacroEditor({ value, disabled, onChange, label = "Macro code" }: PythonMacroEditorProps) {
+export default function PythonMacroEditor({ value, disabled, onChange, label = "Macro code", historyId = "", historyScope = "" }: PythonMacroEditorProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
   const editableCompartmentRef = useRef(new Compartment());
   onChangeRef.current = onChange;
+  const [historyState, setHistoryState] = useState({ canUndo: false, canRedo: false });
+  const binding = useEditorHistory({ id: historyId, scope: historyScope, ...historyState, disabled,
+    undo: () => { if (viewRef.current && !disabled) { undo(viewRef.current); viewRef.current.focus(); } },
+    redo: () => { if (viewRef.current && !disabled) { redo(viewRef.current); viewRef.current.focus(); } },
+  });
 
   useLayoutEffect(() => {
     const host = hostRef.current;
@@ -75,6 +83,7 @@ export default function PythonMacroEditor({ value, disabled, onChange, label = "
         ]),
         editableCompartment.of(editableExtensions(disabled)),
         EditorView.updateListener.of((update) => {
+          if (update.docChanged) setHistoryState({ canUndo: undoDepth(update.state) > 0, canRedo: redoDepth(update.state) > 0 });
           if (
             update.docChanged
             && !update.transactions.some((transaction) => transaction.annotation(externalUpdate))
@@ -109,5 +118,5 @@ export default function PythonMacroEditor({ value, disabled, onChange, label = "
     });
   }, [disabled]);
 
-  return <div ref={hostRef} className="python-macro-editor" />;
+  return <div {...binding} ref={element => { hostRef.current = element; binding.ref(element); }} className="python-macro-editor" />;
 }

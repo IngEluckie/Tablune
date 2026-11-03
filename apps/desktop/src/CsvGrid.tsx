@@ -1,3 +1,5 @@
+import {drawCellText,measureWrappedRows,measureCellText} from "./cellTextLayout";
+import {mergeAt,mergeAnchor,expandMergedSelection,intersectsRange,enclosesRange} from "./mergedCells";
 import { writeMarkedClipboard, clipboardHasMarker } from "./clipboardMarker";
 import { cellFont, cellTextColor, sharedBorder, drawBorder } from "./cellStyles";
 import { clampSheetZoom, useSheetZoom, zoomAxis } from "./sheetZoom";
@@ -40,6 +42,7 @@ import {
 } from "./ipc";
 import { GRID_PALETTES, type ThemeMode } from "./theme";
 import type {
+  CellRange,
   CellStyle,
   StylePatch,
   StyleSummary,
@@ -57,13 +60,17 @@ import type {
   SelectionRange,
 } from "./types";
 
-const pendingCellEdits = new Set<Promise<void>>();
+const pendingCellEdits = new Map<Promise<void>, string>();
+// Background persistence waits for confirmed edits without pressing Enter in the cell editor.
+export async function waitForCellEdits(targetId?: string) {
+  await Promise.all([...pendingCellEdits].filter(([, id]) => !targetId || id === targetId).map(([operation]) => operation));
+}
 export async function flushCellEdits() {
   const requests: Promise<void>[] = [];
   document.dispatchEvent(
     new CustomEvent("tablune-flush-cell-edits", { detail: requests }),
   );
-  await Promise.all([...requests, ...pendingCellEdits]);
+  await Promise.all([...requests, ...pendingCellEdits.keys()]);
 }
 let internalClipboard: {
   documentId: number;
@@ -71,6 +78,7 @@ let internalClipboard: {
   generation: number | null;
   marker: string | null;
   inputs: CellInfo[][];
+  merges: CellRange[];
 } | null = null;
 const MIN_ROWS = 100;
 const MIN_COLUMNS = 26;
@@ -138,6 +146,7 @@ export function columnName(index: number): string {
 }
 
 export function normalizeSelection(selection: SelectionRange) {
+  if(selection.extent)return selection.extent;
   return {
     startRow: Math.min(selection.anchor.row, selection.focus.row),
     endRow: Math.max(selection.anchor.row, selection.focus.row),
@@ -335,7 +344,7 @@ export default function CsvGrid({
   const viewportFrame = useRef<number | null>(null);
   const selectAllStage = useRef(0);
   const [windowData, setWindowData] = useState<GridWindow | null>(null);
-  const [selection, setSelection] = useState<SelectionRange>(initialSelection);
+  const [selection, setSelection] = useState<SelectionRange>(()=>expandMergedSelection(initialSelection,summary.merges??[]));
   const [editing, setEditing] = useState<EditingCell | null>(null);
   const editingRef = useRef(editing);
   editingRef.current = editing;
@@ -381,8 +390,8 @@ export default function CsvGrid({
     null,
   );
 
-  const columnCount = Math.max(MIN_COLUMNS, summary.columnCount, summary.styledColumnCount ?? 0);
-  const rowCount = Math.max(MIN_ROWS, summary.visibleRowCount || 1, !summary.filtersActive && summary.sortCount === 0 ? summary.styledRowCount ?? 0 : 0);
+  const columnCount = Math.max(MIN_COLUMNS, summary.columnCount, summary.styledColumnCount ?? 0,...(summary.merges??[]).map(m=>m.endColumn+1));
+  const rowCount = Math.max(MIN_ROWS,...(summary.merges??[]).map(m=>m.endRow+1), summary.visibleRowCount || 1, !summary.filtersActive && summary.sortCount === 0 ? summary.styledRowCount ?? 0 : 0);
   const activeSizing = useMemo<GridSizingState>(() => {
     if (!resizeState) return initialSizing;
     if (resizeState.axis === "column") {
@@ -415,11 +424,21 @@ export default function CsvGrid({
       ), zoom),
     [activeSizing.columnWidths, columnCount, zoom],
   );
-  const rowMetrics = useMemo(
-    () =>
-      zoomAxis(createAxisMetrics(rowCount, DEFAULT_ROW_HEIGHT, { ...Object.fromEntries((summary.imageRows ?? []).map(row => [row, 96])), ...activeSizing.rowHeights }), zoom),
-    [activeSizing.rowHeights, rowCount, summary.imageRows, zoom],
-  );
+  const baseRowHeights=useMemo<Record<number,number>>(()=>({...Object.fromEntries((summary.imageRows??[]).map(row=>[row,96])),...activeSizing.rowHeights}),[summary.imageRows,activeSizing.rowHeights]);
+  const wrapKey=JSON.stringify([summary.documentId,summary.revision,summary.calculationRevision,summary.viewRevision,activeSizing.columnWidths,baseRowHeights]);
+  const [wrappedSizing,setWrappedSizing]=useState<{key:string;heights:Record<number,number>}>({key:"",heights:{}});
+  const wrappedHeights=wrappedSizing.key===wrapKey?wrappedSizing.heights:{};
+  const rowMetrics = useMemo(()=>{
+    const heights={...baseRowHeights};
+    for(const [row,height] of Object.entries(wrappedHeights))heights[Number(row)]=Math.max(height,heights[Number(row)]??DEFAULT_ROW_HEIGHT);
+    return zoomAxis(createAxisMetrics(rowCount,DEFAULT_ROW_HEIGHT,heights),zoom);
+  },[baseRowHeights,wrappedSizing,wrapKey,rowCount,zoom]);
+  useLayoutEffect(()=>{
+    if(!windowData||windowData.documentId!==summary.documentId||windowData.revision!==summary.revision||windowData.viewRevision!==summary.viewRevision||(windowData.calculationRevision!==undefined&&windowData.calculationRevision!==(summary.calculationRevision??0)))return;
+    const next=measureWrappedRows(windowData,summary.merges??[],baseRowHeights,wrappedHeights,(a,b)=>columnMetrics.rangeSize(a,b+1)/zoom,measureCellText);
+    if(wrappedSizing.key!==wrapKey||JSON.stringify(next)!==JSON.stringify(wrappedHeights))setWrappedSizing({key:wrapKey,heights:next});
+  },[windowData,wrapKey,baseRowHeights,columnMetrics,zoom,wrappedSizing,summary.merges]);
+  const merges=useMemo(()=>summary.merges??[],[summary.merges]);
   const totalWidth = ROW_HEADER_WIDTH + columnMetrics.totalSize;
   const totalHeight = COLUMN_HEADER_HEIGHT + rowMetrics.totalSize;
 
@@ -427,12 +446,14 @@ export default function CsvGrid({
     (next: SelectionRange) => {
       formulaOperation.current++;
       setAutoSum(null);
-      setSelection(next);
-      onSelectionChange(next);
+      const expanded=expandMergedSelection(next,merges);
+      setSelection(expanded);
+      onSelectionChange(expanded);
     },
-    [onSelectionChange],
+    [onSelectionChange,merges],
   );
 
+  useEffect(()=>{const next=expandMergedSelection({...selection,extent:undefined},merges);if(JSON.stringify(next)!==JSON.stringify(selection)){setSelection(next);onSelectionChange(next);}},[merges]);
   const loadVisibleWindow = useCallback(async () => {
     const viewport = viewportRef.current;
     if (!viewport || resizeState) return;
@@ -491,7 +512,9 @@ export default function CsvGrid({
     setImagePreview(null);
     setEditing(null);
     setContextMenu(null);
-    setSelection(initialSelection);
+    const restored=expandMergedSelection(initialSelection,merges);
+    setSelection(restored);
+    if(merges.length)onSelectionChange(restored);
     // Selection is echoed by the workspace after every click. Restore it only
     // when changing documents, without resetting an edit or its loaded cells.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -693,13 +716,7 @@ export default function CsvGrid({
           context.drawImage(bitmap, x + (columnWidth - w) / 2, y + (rowHeight - h) / 2, w, h);
         } else {
           const text = cellImage ? `▧ ${cellImage.name}` : getCell(row, column);
-          const tx = style?.alignment === "center" ? x + columnWidth / 2 : style?.alignment === "right" ? x + columnWidth - 8 * zoom : x + 8 * zoom;
-          context.fillText(text, tx, y + rowHeight / 2);
-          if (style?.underline && text) {
-            const textWidth = context.measureText(text).width;
-            const start = style.alignment === "center" ? tx - textWidth / 2 : style.alignment === "right" ? tx - textWidth : tx;
-            context.fillRect(start, y + rowHeight / 2 + 6 * zoom, textWidth, Math.max(1, zoom));
-          }
+          drawCellText(context,text,style,x,y,columnWidth,rowHeight,zoom,COLUMN_HEADER_HEIGHT,height);
         }
         context.restore();
       }
@@ -759,6 +776,34 @@ export default function CsvGrid({
     }
     context.restore();
 
+    context.save();context.beginPath();context.rect(ROW_HEADER_WIDTH,COLUMN_HEADER_HEIGHT,Math.max(0,width-ROW_HEADER_WIDTH),Math.max(0,height-COLUMN_HEADER_HEIGHT));context.clip();
+    for(const m of merges){
+      if(m.endRow<firstRow||m.startRow>lastRow||m.endColumn<firstColumn||m.startColumn>lastColumn)continue;
+      const info=windowData?.mergedCells?.find(c=>c.row===m.startRow&&c.column===m.startColumn)??cachedRow(m.startRow)?.inputs?.[m.startColumn-(windowData?.columnStart??0)];
+      const style=info?.style;
+      const x=ROW_HEADER_WIDTH+columnMetrics.offsetAt(m.startColumn)-viewport.scrollLeft,y=COLUMN_HEADER_HEIGHT+rowMetrics.offsetAt(m.startRow)-viewport.scrollTop;
+      const w=columnMetrics.rangeSize(m.startColumn,m.endColumn+1),h=rowMetrics.rangeSize(m.startRow,m.endRow+1);
+      context.fillStyle=style?.background||palette.background;context.fillRect(x,y,w,h);
+      if(intersectsRange(range,m)){context.save();context.fillStyle=palette.selectionFill;if(style?.background)context.globalAlpha=.25;context.fillRect(x,y,w,h);context.restore();}
+      context.strokeStyle=palette.gridLine;context.lineWidth=1;context.strokeRect(x+.5,y+.5,w,h);
+      // Preserve each perimeter segment's style while suppressing all interior borders.
+      for(let c=Math.max(m.startColumn,firstColumn);c<=Math.min(m.endColumn,lastColumn);c++){
+        const sx=ROW_HEADER_WIDTH+columnMetrics.offsetAt(c)-viewport.scrollLeft,cw=columnMetrics.sizeAt(c);
+        drawBorder(context,sharedBorder(styleAt(m.startRow,c)?.top,styleAt(m.startRow-1,c)?.bottom),sx,y,sx+cw,y,zoom);
+        drawBorder(context,sharedBorder(styleAt(m.endRow,c)?.bottom,styleAt(m.endRow+1,c)?.top),sx,y+h,sx+cw,y+h,zoom);
+      }
+      for(let r=Math.max(m.startRow,firstRow);r<=Math.min(m.endRow,lastRow);r++){
+        const sy=COLUMN_HEADER_HEIGHT+rowMetrics.offsetAt(r)-viewport.scrollTop,rh=rowMetrics.sizeAt(r);
+        drawBorder(context,sharedBorder(styleAt(r,m.startColumn)?.left,styleAt(r,m.startColumn-1)?.right),x,sy,x,sy+rh,zoom);
+        drawBorder(context,sharedBorder(styleAt(r,m.endColumn)?.right,styleAt(r,m.endColumn+1)?.left),x+w,sy,x+w,sy+rh,zoom);
+      }
+      context.save();context.beginPath();context.rect(x+6*zoom,y,Math.max(0,w-12*zoom),h);context.clip();context.fillStyle=info?.error?"#b94141":cellTextColor(style,palette.cellText);context.font=cellFont(style,zoom);context.textAlign=style?.alignment??"left";
+      const bitmap=info?.image?thumbnails.get(info.image.assetId):undefined;
+      if(bitmap){const scale=Math.min((w-16*zoom)/bitmap.width,(h-8*zoom)/bitmap.height);context.drawImage(bitmap,x+(w-bitmap.width*scale)/2,y+(h-bitmap.height*scale)/2,bitmap.width*scale,bitmap.height*scale);}
+      else {drawCellText(context,info?.display??getCell(m.startRow,m.startColumn),style,x,y,w,h,zoom,COLUMN_HEADER_HEIGHT,height);}
+      context.restore();
+    }
+    context.restore();
     const selectedX =
       ROW_HEADER_WIDTH +
       columnMetrics.offsetAt(range.startColumn) -
@@ -786,7 +831,8 @@ export default function CsvGrid({
     COLUMN_HEADER_HEIGHT,
     cachedRow,
     thumbnails,
-    windowData?.columnStart,
+    windowData,
+    merges,
     columnMetrics,
     getCell,
     rowMetrics,
@@ -874,8 +920,7 @@ export default function CsvGrid({
       };
     }
     return {
-      row: rowMetrics.indexAt(absoluteY - COLUMN_HEADER_HEIGHT),
-      column: columnMetrics.indexAt(absoluteX - ROW_HEADER_WIDTH),
+      ...mergeAnchor(merges,{row:rowMetrics.indexAt(absoluteY - COLUMN_HEADER_HEIGHT),column:columnMetrics.indexAt(absoluteX - ROW_HEADER_WIDTH)}),
       mode: "cells",
     };
   };
@@ -990,6 +1035,7 @@ export default function CsvGrid({
   };
 
   const beginEditing = async (target: GridTarget) => {
+    target={...target,...mergeAnchor(merges,target)};
     if (readOnly) return;
     if (target.mode === "columns" && summary.headerEnabled && !isSheet) {
       setDraft(summary.headerValues[target.column] ?? "");
@@ -1044,7 +1090,7 @@ export default function CsvGrid({
       ? pendingEdit.current.then(() => onApplyEdit(command))
       : onApplyEdit(command);
     pendingEdit.current = operation;
-    pendingCellEdits.add(operation);
+    pendingCellEdits.set(operation, summary.projectId != null ? `project:${summary.projectId}` : `csv:${summary.documentId}`);
     void operation.then(
       () => {
         if (pendingEdit.current === operation) pendingEdit.current = null;
@@ -1188,6 +1234,8 @@ export default function CsvGrid({
     viewportRef.current?.focus({ preventScroll: true });
   };
   const copySelection = async () => {
+    const copyRange=normalizeSelection(selection);
+    if(merges.some(m=>intersectsRange(copyRange,m)&&!enclosesRange(copyRange,m)))throw new Error("Selecciona las combinaciones completas antes de copiar");
     const { matrix, inputs } = await fetchSelectionMatrix();
     const text = encodeClipboardMatrix(matrix);
     const imageIds = [...new Set(inputs.flat().flatMap(cell => cell.image ? [cell.image.assetId] : []))];
@@ -1202,12 +1250,14 @@ export default function CsvGrid({
           generation: await clipboardGeneration().catch(() => null),
           inputs,
           marker,
+          merges: merges.filter(m=>intersectsRange(normalizeSelection(selection),m)).map(m=>({startRow:m.startRow-normalizeSelection(selection).startRow,endRow:m.endRow-normalizeSelection(selection).startRow,startColumn:m.startColumn-normalizeSelection(selection).startColumn,endColumn:m.endColumn-normalizeSelection(selection).startColumn})),
         }
       : null;
   };
 
   const clearSelection = async () => {
     const range = normalizeSelection(selection);
+    if(merges.some(m=>intersectsRange(range,m)&&!enclosesRange(range,m)))throw new Error("Selecciona las combinaciones completas antes de borrar");
     const { sourceRows } = await fetchSelectionMatrix();
     const cells = sourceRows.flatMap((row) =>
       Array.from(
@@ -1269,6 +1319,7 @@ export default function CsvGrid({
         columnOffset < columnAmount;
         columnOffset += 1
       ) {
+        if(scalarFill){const m=mergeAt(merges,{row:sourceRow,column:range.startColumn+columnOffset});if(m&&(sourceRow!==m.startRow||range.startColumn+columnOffset!==m.startColumn))continue;}
         const original =
           copied?.inputs[scalarFill ? 0 : rowOffset]?.[
             scalarFill ? 0 : columnOffset
@@ -1303,7 +1354,9 @@ export default function CsvGrid({
       });
     }
     if (cells.length) {
-      const command: EditCommand = { kind: isSheet ? "setSheetCells" : "setCells", cells };
+      const pasteRange={startRow:range.startRow,startColumn:range.startColumn,endRow:range.startRow+rowAmount-1,endColumn:range.startColumn+columnAmount-1};
+      if(merges.some(m=>intersectsRange(pasteRange,m)&&!enclosesRange(pasteRange,m)))throw new Error("El pegado corta una combinación existente");
+      const command: EditCommand = copied && !scalarFill && ((copied.merges??[]).length>0||merges.some(m=>intersectsRange(pasteRange,m))) ? {kind:"pasteMergedCells",cells,range:pasteRange,merges:(copied.merges??[]).map(m=>({startRow:m.startRow+range.startRow,endRow:m.endRow+range.startRow,startColumn:m.startColumn+range.startColumn,endColumn:m.endColumn+range.startColumn}))} : { kind: isSheet ? "setSheetCells" : "setCells", cells };
       if (imageIds.length) await onApplyEdit(command, pasteTarget);
       else await onApplyEdit(command);
     }
@@ -1321,11 +1374,14 @@ export default function CsvGrid({
         return;
       const command = typeof detail === "string" ? detail : detail.command;
       if (readOnly && command !== "copy") return;
-      const operation =
+      const operation = ["merge","center","split"].includes(command) ? async()=>{
+        await commitEdit(); const current=await getSessionSummary(summary.documentId);
+        await onApplyEdit(command==="split"?{kind:"unmergeCells",range:normalizeSelection(selection)}:{kind:"mergeCells",range:normalizeSelection(selection),center:command==="center"},{documentId:summary.documentId,revision:current.revision});
+      } :
         command === "format" && typeof detail !== "string" && detail.patch ? () => {
           const task = formatQueue.current.catch(() => {}).then(() => formatSelection(detail.patch!));
           formatQueue.current = task;
-          pendingCellEdits.add(task);
+          pendingCellEdits.set(task, summary.projectId != null ? `project:${summary.projectId}` : `csv:${summary.documentId}`);
           void task.finally(() => pendingCellEdits.delete(task)).catch(() => {});
           return task;
         } :
@@ -1397,6 +1453,8 @@ export default function CsvGrid({
 
   const moveSelection = (key: string, extend: boolean) => {
     const next = { ...selection.focus };
+    const merged=mergeAt(merges,next);
+    if(merged){if(key==="ArrowDown")next.row=merged.endRow;if(key==="ArrowRight"||(key==="Tab"&&!extend))next.column=merged.endColumn;}
     if (key === "ArrowUp") next.row = Math.max(0, next.row - 1);
     else if (key === "ArrowDown") next.row = Math.min(rowCount - 1, next.row + 1);
     else if (key === "ArrowLeft") next.column = Math.max(0, next.column - 1);
@@ -1922,11 +1980,11 @@ export default function CsvGrid({
                 : COLUMN_HEADER_HEIGHT +
                   rowMetrics.offsetAt(editing.viewRow) +
                   1,
-              width: columnMetrics.sizeAt(editing.column) - 2,
+              width: columnMetrics.rangeSize(editing.column,(mergeAt(merges,{row:editing.viewRow,column:editing.column})?.endColumn??editing.column)+1) - 2,
               height:
                 (editing.header
                   ? COLUMN_HEADER_HEIGHT
-                  : rowMetrics.sizeAt(editing.viewRow)) - 2,
+                  : rowMetrics.rangeSize(editing.viewRow,(mergeAt(merges,{row:editing.viewRow,column:editing.column})?.endRow??editing.viewRow)+1)) - 2,
             }}
             onChange={(event) => setDraft(event.target.value)}
             onDoubleClick={() => setEditing({ ...editing, mode: "edit" })}

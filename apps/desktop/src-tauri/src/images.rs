@@ -109,6 +109,12 @@ pub fn retain_referenced(data: &mut session::projects::ProjectData) {
             .iter()
             .flat_map(|d| d.images.values().cloned()),
     );
+    ids.extend(
+        data.canvases
+            .iter()
+            .flat_map(|c| c.content["nodes"].as_array().into_iter().flatten())
+            .filter_map(|n| n["assetId"].as_str().map(str::to_owned)),
+    );
     data.assets.retain(|id, _| ids.contains(id));
 }
 fn store(state: &WorkspaceState, document_id: u64) -> Result<SharedAssets, String> {

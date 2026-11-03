@@ -1,4 +1,5 @@
 import FormatToolbar, { type FormatControls } from "./FormatToolbar";
+import { HistoryButtons } from "./DocumentActions";
 import { clampSheetZoom, MIN_SHEET_ZOOM, MAX_SHEET_ZOOM } from "./sheetZoom";
 import {
   type FocusEvent,
@@ -345,8 +346,7 @@ export default function RibbonHeader({
 
             {activeMenu === "edit" && (
               <div className="ribbon-group" aria-label="Edit actions">
-                <button onClick={onUndo} disabled={busy || mutationsLocked || !canUndo}>Undo</button>
-                <button onClick={onRedo} disabled={busy || mutationsLocked || !canRedo}>Redo</button>
+                <HistoryButtons history={{ canUndo: !!canUndo, canRedo: !!canRedo, disabled: busy || mutationsLocked, undo: () => onUndo?.(), redo: () => onRedo?.() }} />
                 <span className="ribbon-divider" aria-hidden="true" />
                 <button onClick={onCut} disabled={busy || mutationsLocked}>Cut</button>
                 <button onClick={onCopy} disabled={busy}>Copy</button>

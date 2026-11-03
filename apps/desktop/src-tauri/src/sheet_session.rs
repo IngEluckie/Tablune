@@ -281,6 +281,26 @@ impl DocumentSession {
         else {
             return;
         };
+        for m in &mut sheet.merges {
+            let (start, end) = if rows {
+                (&mut m.start_row, &mut m.end_row)
+            } else {
+                (&mut m.start_column, &mut m.end_column)
+            };
+            if if delete {
+                index.saturating_add(count) <= *start
+            } else {
+                index <= *start
+            } {
+                if delete {
+                    *start -= count;
+                    *end -= count;
+                } else {
+                    *start += count;
+                    *end += count;
+                }
+            }
+        }
         sheet.styles = std::mem::take(&mut sheet.styles)
             .into_iter()
             .filter_map(|(k, style)| {
@@ -323,6 +343,13 @@ impl DocumentSession {
             .collect();
     }
     pub(super) fn edit_sheet_cells(&mut self, cells: Vec<SheetCellInput>) -> Result<(), String> {
+        self.edit_sheet_cells_with_merges(cells, None)
+    }
+    pub(super) fn edit_sheet_cells_with_merges(
+        &mut self,
+        cells: Vec<SheetCellInput>,
+        merges: Option<Vec<CellRange>>,
+    ) -> Result<(), String> {
         if self.project_id.is_none() {
             return Err("Formulas belong to project sheets".into());
         }
@@ -333,6 +360,9 @@ impl DocumentSession {
             return Err("Cell address exceeds sheet limits".into());
         }
         let mut after = self.sheet.clone();
+        if let Some(merges) = merges {
+            after.merges = merges;
+        }
         let mut before_values = Vec::new();
         let mut after_values = Vec::new();
         // A paste can target the same cell multiple times; its final value wins.
@@ -340,8 +370,29 @@ impl DocumentSession {
             .into_iter()
             .map(|c| (formulas::key((c.row, c.column)), c))
             .collect();
+        for m in &after.merges {
+            for row in m.start_row..=m.end_row {
+                for col in m.start_column..=m.end_column {
+                    if row == m.start_row && col == m.start_column {
+                        continue;
+                    }
+                    let key = formulas::key((row, col));
+                    if !cells.contains_key(&key) && !self.raw_cell(row, col).is_empty() {
+                        return Err("La combinación ocultaría datos existentes".into());
+                    }
+                }
+            }
+        }
         let mut changed = Vec::new();
         for (k, mut c) in cells {
+            if after.merges.iter().any(|m| {
+                m.contains(c.row, c.column) && (c.row != m.start_row || c.column != m.start_column)
+            }) && (!c.value.is_empty() || c.image.is_some())
+            {
+                return Err(
+                    "El pegado contiene datos en celdas cubiertas por una combinación".into(),
+                );
+            }
             if let Some(image) = &c.image {
                 image.validate()?;
                 if !self
@@ -392,11 +443,8 @@ impl DocumentSession {
             after.cells.insert(k, meta);
         }
         if changed.is_empty() {
-            let change = SheetChange {
-                cells: vec![],
-                styles: styles::style_changes(&self.sheet.styles, &after.styles),
-            };
-            if !change.styles.is_empty() {
+            let change = SheetChange::new(&self.sheet, &after);
+            if !change.styles.is_empty() || change.merges.is_some() {
                 return self.commit(
                     EditRecord {
                         sheet: Some(change),

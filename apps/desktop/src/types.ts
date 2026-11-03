@@ -7,6 +7,7 @@ export interface Selection {
 }
 
 export interface DocumentSummary {
+  merges?: CellRange[];
   styledRowCount?: number;
   styledColumnCount?: number;
   imageCount?: number;
@@ -52,6 +53,8 @@ export interface GridRow {
 }
 
 export interface GridWindow {
+  calculationRevision?: number;
+  mergedCells?: CellInfo[];
   documentId: DocumentId;
   revision: number;
   viewRevision: number;
@@ -68,6 +71,7 @@ export interface CellCoordinate {
 export type SelectionMode = "cells" | "rows" | "columns";
 
 export interface SelectionRange {
+  extent?: CellRange;
   anchor: CellCoordinate;
   focus: CellCoordinate;
   mode: SelectionMode;
@@ -90,6 +94,9 @@ export interface CellInput {
 }
 
 export type EditCommand =
+  | {kind:"mergeCells";range:CellRange;center:boolean}
+  | {kind:"unmergeCells";range:CellRange}
+  | {kind:"pasteMergedCells";cells:SheetCellInput[];range:CellRange;merges:CellRange[]}
   | { kind: "formatCells"; range: CellRange; patch: StylePatch }
   | { kind: "setSheetCells"; cells: SheetCellInput[] }
   | { kind: "setCellTypes"; cells: CellCoordinate[]; cellType: CellType }
@@ -231,6 +238,8 @@ export interface ProjectTableSummary {
   document: DocumentSummary;
 }
 export interface ProjectSummary {
+  standaloneCanvas?: boolean;
+  canvases?: import("./canvasModel").CanvasDocument[];
   organization?: ProjectOrganization;
   markdown?: MarkdownDocument[];
   functions?: FunctionsData;
@@ -248,9 +257,14 @@ export interface ProjectFolder { id: string; name: string; parentId: string | nu
 export interface ProjectOrganization { folders: ProjectFolder[]; itemFolders: Record<string, string>; }
 export interface RecentFile {
   path: string;
-  kind: "csv" | "project" | "markdown";
+  kind: "csv" | "project" | "markdown" | "canvas";
 }
 export type ProjectAction =
+  | { kind: "newCanvas"; name: string; folderId?: string | null }
+  | { kind: "updateCanvas"; canvasId: string; content: import("./canvasModel").CanvasContent; expectedRevision: number }
+  | { kind: "renameCanvas"; canvasId: string; name: string }
+  | { kind: "duplicateCanvas"; canvasId: string }
+  | { kind: "deleteCanvas"; canvasId: string }
   | { kind: "createFolder"; name: string; parentId: string | null }
   | { kind: "renameFolder"; folderId: string; name: string }
   | { kind: "moveItem"; itemId: string; folderId: string | null }
@@ -329,13 +343,40 @@ export type MarkdownAction =
 export interface CellRange { startRow: number; endRow: number; startColumn: number; endColumn: number; }
 export interface CellBorder { color: string; width: 1 | 2 | 3; line: "solid" | "dashed"; }
 export interface CellStyle {
+  wrapText?: boolean;
   bold?: boolean; italic?: boolean; underline?: boolean;
   textColor?: string; background?: string; alignment?: "left" | "center" | "right";
   top?: CellBorder | null; right?: CellBorder | null; bottom?: CellBorder | null; left?: CellBorder | null;
 }
 export interface StylePatch {
+  wrapText?: boolean;
   reset?: boolean; bold?: boolean; italic?: boolean; underline?: boolean;
   textColor?: string; background?: string; alignment?: "left" | "center" | "right";
   borders?: { preset: "all" | "outer" | "inner" | "top" | "right" | "bottom" | "left" | "none"; border: CellBorder | null };
 }
-export interface StyleSummary { bold: boolean | null; italic: boolean | null; underline: boolean | null; textColor: string | null; background: string | null; alignment: "left" | "center" | "right" | null; }
+export interface StyleSummary { wrapText?: boolean | null; bold: boolean | null; italic: boolean | null; underline: boolean | null; textColor: string | null; background: string | null; alignment: "left" | "center" | "right" | null; }
+
+export interface PythonJob {
+  id: number;
+  projectId: number | null;
+  documentId: number;
+  scriptId: string | null;
+  scriptName: string;
+  scriptRevision: number | null;
+  inputName: string;
+  inputRevision: number;
+  interpreter: string;
+  timeoutSeconds: number | null;
+  state: "queued" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled";
+  createdAt: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+  error: string | null;
+  resultAvailable: boolean;
+}
+export interface PythonJobDetail {
+  summary: PythonJob;
+  stdout: string;
+  stderr: string;
+  preview: MacroPreview | null;
+}

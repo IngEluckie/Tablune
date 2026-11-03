@@ -48,6 +48,10 @@ vi.mock("./ipc", () => ({
   exitApplication: vi.fn().mockResolvedValue(undefined),
   exportSessionView: vi.fn(),
   getSessionSummary: vi.fn(),
+  getPythonJobs: vi.fn().mockResolvedValue([]),
+  getPythonJob: vi.fn(),
+  startProjectPythonJob: vi.fn(),
+  acceptPythonJob: vi.fn(),
   getWorkspaceSummary: vi.fn(),
   newSession: vi.fn(),
   openSession: vi.fn(),
@@ -94,6 +98,7 @@ vi.mock("./RibbonHeader", () => ({
 }));
 
 vi.mock("./CsvGrid", () => ({
+  flushCellEdits: vi.fn().mockResolvedValue(undefined),
   default: (props: {
     summary: DocumentSummary;
     initialSelection: SelectionRange;

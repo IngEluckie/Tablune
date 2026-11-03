@@ -29,9 +29,17 @@ crates/tablune-history
 
 The desktop backend may launch a user-selected Python 3.10+ interpreter as a child process. A bundled standard-library runner exchanges versioned JSON files through a temporary directory, invokes `run(rows, context)` or `transform(rows, context)`, and writes a validated result. Python never writes the open CSV or mutates the Rust document directly.
 
-Macro execution produces a revision-bound preview. Rust retains the transformed rows, sends only summary metrics and bounded samples to React, and applies an accepted result as one undoable transaction. Cell-only transformations use compact cell edits; structural transformations replace the document atomically. Results requiring more than the 64 MiB history budget cannot be applied.
+The legacy CSV macro workflow produces a revision-bound preview. Rust retains the transformed rows, sends only summary metrics and bounded samples to React, and applies an accepted result as one undoable transaction. Cell-only transformations use compact cell edits; structural transformations replace the document atomically. Results requiring more than the 64 MiB history budget cannot be applied.
 
 Python code runs with the current user's normal permissions. Script selection accepts `.py` files only. Tablune creates private temporary directories and terminates the launched process tree on timeout or cancellation, but the prototype is not a security sandbox and does not install interpreters or packages.
+
+## Background Python jobs
+
+`python_jobs.rs` owns a managed, session-local registry with monotonically increasing job IDs. Each submission captures code, source directory, input rows/metadata and a resolved interpreter. Project locks and CSV file-operation reservations coordinate submission with close. The scheduler starts at most two independent script processes and takes queued jobs in ID order; up to 32 active/finished jobs are retained. No background job acquires `PYTHON_QUEUE` or uses the calculation runtime.
+
+Each job has its own `RuntimeInner`, cancellation flag, bounded console buffers and pending result. `run_macro` starts Python unbuffered (`-u`), drains stdout/stderr pipes on separate readers and retains at most 1 MiB of each stream. A process guard covers early failures; cancellation registration and spawn share the runtime lock. The configured timeout applies after process launch, not while queued. Cancelling one job never touches another runtime. Application exit requests cancellation of all jobs and the legacy runtime.
+
+`PythonJobsPanel` polls job summaries independently of editors, and the selected job's console/preview every 350 ms while expanded. Polls never overlap and late responses are ignored after selection/unmount. The list stays available across workspace navigation. Only summaries, bounded logs and sample previews cross IPC; transformed rows remain in Rust. A result is consumed after successful incorporation, or released by explicit discard. CSV application checks the captured identity/header/revision and undo budget. Project application creates a new table using captured metadata even when the source script/table has changed or been removed. Jobs/results are not archived or recovered.
 
 ## Performance direction
 
@@ -65,9 +73,9 @@ Duplicating a saved document snapshots its current in-memory rows and dialect, w
 
 `useWorkspace` owns Home navigation, open spaces, recent files, script drafts, and project lifecycle. Table tabs and the selected sidebar Python editor are tracked independently per project. `ProjectSidebar` switches between the navigator and Python editing while keeping the table workspace visible. `CsvWorkspace` supplies the shared table editing experience. Its targeted grid commands include a document ID so a command cannot reach another mounted workspace, and its global shortcuts ignore events from the sidebar editor. Script editors remain mounted while navigating; drafts are flushed through a serialized queue before saving or running.
 
-Rust stores project ownership above `DocumentSession`. Persistent IDs identify projects, tables, and scripts in the archive; runtime IDs identify open sessions, allowing separate copies of one project to remain independent. A table directory resolves project grid queries without acquiring another project's long-lived save lock. Project save locks its scripts and tables for a coherent snapshot. Parsing, compression, large project actions, and recovery writes run on blocking workers; the frontend disables only the project being saved.
+Rust stores project ownership above `DocumentSession`. Persistent IDs identify projects, tables, and scripts in the archive; runtime IDs identify open sessions, allowing separate copies of one project to remain independent. A table directory resolves project grid queries independently. Project save briefly locks its scripts and tables to capture a coherent snapshot, then releases the edit locks before compression and atomic replacement. A separate save lock prevents overlapping file operations. Completion acknowledges the captured signature and table states; edits and calculation results received during I/O remain dirty. CSV saves use the same snapshot/checkpoint principle on blocking workers. Manual project saves retain their existing UI lock; autosave leaves the editors available.
 
-The archive codec lives separately from the CSV parser. Project saves replace one ZIP atomically. Project previews bind the project, script revision, selected table, and document revision. Accepting a preview creates a new table and uses no input-table undo entry. CSV macros continue to use the existing undoable apply operation.
+The archive codec lives separately from the CSV parser. Project saves replace one ZIP atomically. Project jobs record the script and input revisions for provenance. Accepting a completed job creates a new table from its captured input and uses no input-table undo entry. CSV macros continue to use the existing undoable apply operation.
 
 Project crash recovery has its own versioned manifest (`projects-recovery.json`) alongside the compatible CSV recovery manifest. It includes dirty projects and script drafts acknowledged by Rust; it excludes running processes, previews, Python environments, and undo history. Clean projects appear in recent files instead of reopening automatically.
 
@@ -79,9 +87,9 @@ Project crash recovery has its own versioned manifest (`projects-recovery.json`)
 
 `calculation.rs` snapshots pending formulas and referenced values, binds requests to project generation, sheet identity, calculation input revision, and applied-functions revision, and rejects stale publication. A separate runtime input revision advances on edits/undo/redo/type changes, allowing view changes during calculation without discarding valid results. `calculation_worker.rs` owns a reusable subprocess and exchanges bounded JSON through private temporary files. The worker interprets validated trees rather than evaluating raw cell text. User Functions code is explicitly activated Python code with normal interpreter permissions. Each generation builds a new module namespace; source edits only update the persisted draft until successful application.
 
-Calculations and macros share an async mutex covering execution and publication. Project state is locked only for preparation/publication; Python runs outside document locks. Worker reservation and generation checks share the project lock so cancellation cannot miss a job during startup. Interpreter changes join the same queue and invalidate cached results. Formula results are published through `tablune-calculation` project summaries, and grid windows include displayed values plus editable cell information. React batches confirmed edits before scheduling a new generation.
+Calculations, interpreter changes and legacy CSV previews share an async mutex covering execution and publication. Background jobs use independent runtimes and a separate two-process scheduler. Project state is locked only for preparation/publication; Python runs outside document locks. Worker reservation and generation checks share the project lock so cancellation cannot miss a job during startup. Interpreter changes join the same queue and invalidate cached results. Formula results are published through `tablune-calculation` project summaries, and grid windows include displayed values plus editable cell information. React batches confirmed edits before scheduling a new generation.
 
-Format 2 stores raw rows plus sparse sheet metadata in each table entry, and keeps Functions draft/applied source separately. Recovery uses the same metadata and reads older formats. Loaded caches retain their saved pending status; no calculation process starts on opening or recovery. A runtime calculation checkpoint tracks sheet input revisions and applied-functions revision. Automatic requests are ignored until these inputs change; view changes and unmodified pending results cannot start a job. Attempts consume that checkpoint so errors and cancellation cannot loop. Recalculate-all explicitly bypasses it. Calculation revisions participate in the project save/recovery signature, including results published after a save. Export and transformation snapshots materialize current results and check calculation revision when accepting previews.
+Format 2 stores raw rows plus sparse sheet metadata in each table entry, and keeps Functions draft/applied source separately. Recovery uses the same metadata and reads older formats. Loaded caches retain their saved pending status; no calculation process starts on opening or recovery. A runtime calculation checkpoint tracks sheet input revisions and applied-functions revision. Automatic requests are ignored until these inputs change; view changes and unmodified pending results cannot start a job. Attempts consume that checkpoint so errors and cancellation cannot loop. Recalculate-all explicitly bypasses it. Calculation revisions participate in the project save/recovery signature, including results published after a save. Export and transformation snapshots materialize current results. Legacy previews check current revisions on acceptance; independent project jobs retain their captured results across subsequent edits.
 
 On macOS, grid clipboard reads/writes use small NSPasteboard IPC commands to avoid WebKit's additional paste authorization prompt. Clipboard generation still guards formula-aware copies; other platforms retain the browser clipboard fallback.
 
@@ -106,16 +114,40 @@ AST nodes fall back to source.
 `useWorkspace.flushDrafts` drains editor transactions and image uploads before
 revision-checked text updates, save or close. Standalone recovery is versioned
 separately; project recovery format 6 includes Markdown alongside existing data.
-Archive format 6 stores source in `documents/<id>.md` and still reads formats 1–5.
+Archive format 7 stores Markdown source in `documents/<id>.md` and still reads formats 1–6.
+
+## Shared save and editor capabilities
+
+`SaveCoordinator` schedules persistence by destination, independently of the visible editor. `useWorkspace` registers standalone CSV/TSV/text tables, standalone Markdown, and project targets. A project target includes every table, document, script and Functions draft. New document types implement `SaveTarget` (`id`, preference key, path, dirty/revision state and a save callback); they do not introduce timers in their UI. Saves are debounced for 2 seconds with a 10-second maximum wait during continuous confirmed edits. Manual Save, Save As and autosave share the destination queue. Background failures retain dirty state and retry with bounded backoff; other destinations continue saving.
+
+Autosave defaults to enabled. Preferences are local and remembered by file path, with session choices carried to the first Save or Save As. Untitled targets remain in recovery until the user chooses a path; background work never opens a file dialog. Recovery is independent of the switch. Background draft flushing waits for confirmed cell transactions and Markdown image imports without committing an active cell editor. Explicit save/close still commits the active cell. Close suspends scheduling, waits for writes already in flight, and saves enabled targets immediately. Remaining dirty documents (untitled, disabled or failed saves) retain the save/discard dialog; scheduling stays suspended during that decision.
+
+`useEditorHistory` registers each editor's own history implementation with a stable editor ID and destination scope. `DocumentActions` resolves the last focused visible editor, with the selected document as fallback, and exposes accessible SVG arrows plus save state. Tables retain Rust transactions, Markdown retains its bounded source history across visual/source mode changes, and Python/Functions retain CodeMirror history. Save acknowledgements do not recreate editors or add undo entries. Histories are session-local; crash recovery restores document content, not undo stacks.
 
 ## Project organization (format 5)
 
 `ProjectData.organization` defaults to empty when reading formats 1–4. Folder records have stable IDs, names and parent IDs; a sparse item-to-folder map places existing tables, scripts and Markdown. ZIP payload paths remain ID-based. `project_tree.rs` validates a candidate organization before committing changes, including missing parents/items, folder ID collisions, sibling name collisions, cycles, depth (64) and count (10,000). Creation/import validates the destination first and records placement under the same project lock. Folder removal lifts children to the parent; deletion cleans up item placements.
 
-Archive and recovery writers use version 6. Organization is included in the project signature, so structural edits participate in dirty tracking and recovery without changing script input IDs or invalidating Python modules. `ProjectExplorer` provides a mixed tree with keyboard navigation, project-scoped drag payloads, and locally remembered expansion/selection by persistent project ID. Breadcrumbs and input-table choices use the same logical path helpers. Scripts and Functions retain their side-editor lifecycle.
+Archive writers use version 7; the recovery envelope remains version 6 with versioned project data. Organization is included in the project signature, so structural edits participate in dirty tracking and recovery without changing script input IDs or invalidating Python modules. `ProjectExplorer` provides a mixed tree with keyboard navigation, project-scoped drag payloads, and locally remembered expansion/selection by persistent project ID. Breadcrumbs and input-table choices use the same logical path helpers. Scripts and Functions retain their side-editor lifecycle.
 
 ## Cell formatting (format 6)
 
 `session::styles` validates formatting patches and maps visible selections to source rows. `SheetData.styles` is sparse and independent of formula/type/cache metadata, including for empty cells. Style-only history records update display revision and dirty state without changing the calculation input revision or overwriting asynchronously published results. Structural edits shift styles; applied sorting moves them by stable row IDs.
 
 `FormatToolbar` emits queued `formatCells` edits through `CsvGrid`; save/close waits for that queue. `sheet_style_summary` supplies mixed-selection state. The windowed canvas renders fills, font emphasis, alignment and shared-edge borders. Normal internal paste carries explicit styles; values-only paste preserves destination styles. Native clipboard generation, or a per-copy HTML marker when unavailable, prevents reusing internal metadata for unrelated external text.
+
+
+## Project canvas documents
+
+`CanvasEditor` owns interactive SVG editing and bounded undo snapshots, using the
+shared active-editor history registry. `useWorkspace` holds immediate canvas
+drafts and flushes revision-checked `updateCanvas` actions before project save,
+close, or recovery. Failed updates retain drafts. Pending image operations share
+the editor flush registry so save waits for their resulting nodes. Viewport and
+grid preferences are local UI state keyed by persistent project/canvas identity.
+
+Rust validates geometry, IDs, styles, endpoints and image references before
+replacing a canvas. Format 7 archives separate each canvas scene into JSON;
+resource retention includes canvas image nodes. Missing linked documents are
+valid references rendered as unavailable cards. SVG/PNG export uses the same
+node/edge drawing components and embeds images, independently of project saving.

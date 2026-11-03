@@ -4,17 +4,20 @@ import CsvWorkspace from "./CsvWorkspace";
 import { flushCellEdits } from "./CsvGrid";
 import { newFunctionDraft } from "./formulaCatalog";
 import RibbonHeader from "./RibbonHeader";
+import DocumentActions from "./DocumentActions";
 import ProjectSidebar from "./ProjectSidebar";
 import ProjectExplorer from "./ProjectExplorer";
 import { projectEntries, projectItemPath } from "./projectTree";
 import ProjectTabs from "./ProjectTabs";
 import ProjectFunctionsEditor from "./ProjectFunctionsEditor";
 import ProjectScriptEditor from "./ProjectScriptEditor";
+import PythonJobsPanel from "./PythonJobsPanel";
 import { useWorkspace, type ProjectTab } from "./useWorkspace";
 import { readThemePreference, writeThemePreference } from "./theme";
 import * as ipc from "./ipc";
 import type { DocumentSummary, MarkdownDocument, ProjectSummary } from "./types";
 
+const CanvasEditor = lazy(() => import("./CanvasEditor"));
 const MarkdownEditor = lazy(() => import("./MarkdownEditor"));
 
 export default function App() {
@@ -31,6 +34,19 @@ export default function App() {
       setNameRequest({ title, value, resolve }),
     );
   const project = w.workspace.projects?.find((p) => p.projectId === w.space);
+  useEffect(() => {
+    const saveShortcut = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || !(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "s" || w.space === "home") return;
+      event.preventDefault();
+      if (w.busy || w.closeRequest !== null) return;
+      const operation = typeof w.space === "number" ? () => w.saveProjectById(w.space as number, event.shiftKey)
+        : w.space === "csv" ? () => w.saveCsv(w.selectedCsv, event.shiftKey)
+        : () => w.selectedMarkdown ? w.saveMarkdown(w.selectedMarkdown, event.shiftKey) : Promise.resolve(false);
+      void operation().catch(w.report);
+    };
+    window.addEventListener("keydown", saveShortcut);
+    return () => window.removeEventListener("keydown", saveShortcut);
+  });
   const changeTheme = (next: typeof theme) => {
     setTheme(next);
     writeThemePreference(next);
@@ -157,6 +173,11 @@ export default function App() {
     w.guard(async () => {
       const table = p.tables.find((t) => t.id === tab.id);
       const script = p.scripts.find((s) => s.id === tab.id);
+      if (tab.kind === "canvas") {
+        const name = await requestName("Renombrar lienzo", p.canvases?.find(c=>c.id===tab.id)?.name ?? "");
+        if (name) await w.perform(p.projectId,{kind:"renameCanvas",canvasId:tab.id,name});
+        return;
+      }
       if (tab.kind === "markdown") {
         const doc = p.markdown?.find(d => d.id === tab.id);
         const name = await requestName("Rename document", doc?.name ?? "");
@@ -191,6 +212,10 @@ export default function App() {
         ))
       )
         return;
+      if (tab.kind === "canvas") {
+        await w.flushDrafts(); await w.perform(p.projectId,{kind:"deleteCanvas",canvasId:tab.id});
+        w.closeTab(p.projectId,tab); return;
+      }
       if (tab.kind === "markdown") {
         await w.actMarkdown(p.projectId, tab.id, { kind: "delete", discard: true });
         w.closeTab(p.projectId, tab); return;
@@ -229,12 +254,13 @@ export default function App() {
       else if (script) await ipc.writeMacroScript(path, script.code);
     });
   const tabName = (p: ProjectSummary, t: ProjectTab) =>
-    t.kind === "markdown" ? p.markdown?.find(d => d.id === t.id)?.name : t.kind === "functions"
+    t.kind === "canvas" ? p.canvases?.find(c=>c.id===t.id)?.name : t.kind === "markdown" ? p.markdown?.find(d => d.id === t.id)?.name : t.kind === "functions"
       ? "Functions"
       : t.kind === "table"
         ? p.tables.find((x) => x.id === t.id)?.document.displayName
         : p.scripts.find((x) => x.id === t.id)?.name;
   const hasDrafts = (id: number) =>
+    Object.keys(w.canvasDrafts).some(key=>key.startsWith(`${id}:`)) ||
     Object.keys(w.drafts).some((key) => key.startsWith(`${id}:`)) ||
     w.functionDrafts[id] !== undefined || Object.keys(w.markdownDrafts).some(key => key.startsWith(`${id}:`));
   const dirtyItems = [
@@ -249,6 +275,14 @@ export default function App() {
   const tableRibbonVisible = w.space === "csv"
     ? w.workspace.documents.length > 0
     : Boolean(project?.tables.some((t) => w.selected[project.projectId]?.kind === "table" && w.selected[project.projectId]?.id === t.id));
+  const saveTargetId = project ? `project:${project.projectId}` : w.space === "csv" && w.selectedCsv ? `csv:${w.selectedCsv}` : w.space === "markdown" && w.selectedMarkdown ? `markdown:${w.selectedMarkdown}` : null;
+  const activeTab = project ? w.selected[project.projectId] : null;
+  const activeEditorId = project && activeTab ? activeTab.kind === "table"
+    ? `table:${project.tables.find(t => t.id === activeTab.id)?.document.documentId}`
+    : activeTab.kind === "canvas" ? `canvas:${project.projectId}:${activeTab.id}`
+    : activeTab.kind === "markdown" ? `markdown:${project.projectId}:${activeTab.id}`
+    : activeTab.kind === "script" ? `script:${project.projectId}:${activeTab.id}` : `functions:${project.projectId}`
+    : w.space === "csv" ? `table:${w.selectedCsv}` : `markdown:file:${w.selectedMarkdown}`;
   const navigation = (<>
         <button
           className="home-button"
@@ -285,11 +319,7 @@ export default function App() {
             ))}
           </select>
         </label>
-        {w.runningProject !== null && (
-          <button onClick={() => void ipc.cancelPythonMacro().catch(w.report)}>
-            Python running · Cancel
-          </button>
-        )}
+        {saveTargetId && <DocumentActions coordinator={w.saves} targetId={saveTargetId} editorId={activeEditorId} disabled={w.busy || w.closeRequest !== null} />}
       </>);
   const fileActions = (<>
         {project && (
@@ -298,7 +328,7 @@ export default function App() {
               disabled={w.busy || w.savingProjects.includes(project.projectId)}
               onClick={() => void saveProject(project)}
             >
-              Save project
+              {project.standaloneCanvas ? "Save canvas" : "Save project"}
             </button>
             <button
               disabled={w.busy || w.savingProjects.includes(project.projectId)}
@@ -313,7 +343,7 @@ export default function App() {
                 void w.guard(() => w.requestClose(project.projectId))
               }
             >
-              Close project
+              {project.standaloneCanvas ? "Close canvas" : "Close project"}
             </button>
           </>
         )}
@@ -351,7 +381,7 @@ export default function App() {
         value={w.markdownDrafts[key] ?? doc.content} disabled={locked}
         linkTargets={projectId === null ? [] : (() => {
           const current = w.workspace.projects?.find(p => p.projectId === projectId);
-          return current ? projectEntries(current).filter((entry): entry is typeof entry & { kind: "markdown" | "table" | "script" } => entry.kind !== "folder" && entry.id !== doc.id).map(entry => ({ ...entry, path: projectItemPath(current, entry.id) })) : [];
+          return current ? projectEntries(current).filter((entry): entry is typeof entry & { kind: "markdown" | "table" | "script" } => entry.kind !== "folder" && entry.kind !== "canvas" && entry.id !== doc.id).map(entry => ({ ...entry, path: projectItemPath(current, entry.id) })) : [];
         })()}
         onOpenLink={link => void w.guard(async () => {
           if (link.kind === "file") { await w.openPath(link.value); return; }
@@ -396,6 +426,7 @@ export default function App() {
               </div>
             </div>
             <div className="home-start">
+              <button disabled={!w.ready || w.busy} onClick={()=>void w.guard(w.newCanvas)}><strong>New canvas</strong><span>Draw shapes and connectors in a standalone canvas</span></button>
               <button disabled={!w.ready || w.busy} onClick={() => void w.guard(() => w.newMarkdown())}><strong>New document</strong><span>Write a Markdown document with images</span></button>
               <button
                 disabled={!w.ready || w.busy}
@@ -416,7 +447,7 @@ export default function App() {
                 onClick={() => void w.guard(w.openFiles)}
               >
                 <strong>Open…</strong>
-                <span>CSV, TSV, Markdown or a .tablune project</span>
+                <span>CSV, TSV, Markdown, canvas or a .tablune project</span>
               </button>
             </div>
             {(w.workspace.documents.length > 0 ||
@@ -435,7 +466,7 @@ export default function App() {
                       key={p.projectId}
                       onClick={() => w.setSpace(p.projectId)}
                     >
-                      {p.name} · {p.tables.length} tables
+                      {p.name} · {p.standaloneCanvas ? "Canvas" : `${p.tables.length} tables`}
                       {p.dirty || hasDrafts(p.projectId) ? " · Unsaved" : ""}
                     </button>
                   ))}
@@ -457,14 +488,14 @@ export default function App() {
                         onClick={() => void w.guard(() => w.openPath(r.path))}
                       >
                         <span className="recent-kind">
-                          {r.kind === "project" ? "◆" : "▤"}
+                          {r.kind === "project" ? "◆" : r.kind === "canvas" ? "◇" : "▤"}
                         </span>
                         <span>
                           <strong>{r.path.split(/[\\/]/).at(-1)}</strong>
                           <small>
                             {r.kind === "project"
                               ? "Tablune project"
-                              : r.kind === "markdown" ? "Markdown document" : "CSV file"}{" "}
+                              : r.kind === "canvas" ? "Canvas document" : r.kind === "markdown" ? "Markdown document" : "CSV file"}{" "}
                             · {r.path}
                           </small>
                         </span>
@@ -532,6 +563,8 @@ export default function App() {
           <div className="grid-host" hidden={!w.workspace.documents.length}>
             <CsvWorkspace
               managed
+              saves={w.saves}
+              onSaveDocument={w.saveCsv}
               ribbonTarget={ribbonTarget}
               ribbonVisible={w.space === "csv" && tableRibbonVisible}
               ribbonControls={{ navigation, fileActions }}
@@ -592,21 +625,17 @@ export default function App() {
                           script={s}
                           draft={w.drafts[`${p.projectId}:${s.id}`]}
                           disabled={locked || w.closeRequest !== null}
-                          runningProject={w.runningProject}
                           onEdit={(draft) => w.editScript(p.projectId, s.id, draft)}
                           onFlush={w.flushDrafts}
-                          onRunning={w.setRunningProject}
                           onError={w.report}
-                          onResult={(next) => {
-                            w.updateProject(next);
-                            w.openTab(p.projectId, {
-                              kind: "table",
-                              id: next.tables.at(-1)!.id,
-                            });
-                          }}
+
                         />
                       </div>
                     ));
+          if(p.standaloneCanvas) return <section key={p.projectId} className="standalone-canvas space-pane" hidden={w.space!==p.projectId}>
+            <div className="markdown-file-actions"><strong>{p.path?.split(/[\\/]/).at(-1) ?? p.name}{p.dirty || hasDrafts(p.projectId) ? " •" : ""}</strong><button disabled={locked} onClick={()=>void saveProject(p)}>Save canvas</button><button disabled={locked} onClick={()=>void saveProject(p,true)}>Save as…</button><button disabled={locked} onClick={()=>void w.guard(()=>w.requestClose(p.projectId))}>Close canvas</button></div>
+            {p.canvases?.map(doc=><Suspense key={doc.id} fallback={<p>Cargando lienzo…</p>}><CanvasEditor document={doc} value={w.canvasDrafts[`${p.projectId}:${doc.id}`]??doc.content} project={p} active={w.space===p.projectId} disabled={locked||w.closeRequest!==null} onChange={content=>w.editCanvas(p.projectId,doc.id,content)} onOpen={()=>{}} onError={w.report}/></Suspense>)}
+          </section>;
           return (
             <section
               key={p.projectId}
@@ -658,7 +687,7 @@ export default function App() {
                         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M4 15v5h16v-5" /></svg>
                       </button>
                       <button
-                        disabled={locked || w.runningProject === p.projectId}
+                        disabled={locked}
                         className="danger"
                         title={`Delete ${actionItem.kind}…`}
                         aria-label={`Delete ${actionItem.kind}…`}
@@ -680,6 +709,11 @@ export default function App() {
                   onCreate={(kind, folderId) => {
                     if (kind === "table") void newTable(p, folderId);
                     else if (kind === "script") void newScript(p, folderId);
+                    else if (kind === "canvas") void w.guard(async () => {
+                      await w.flushDrafts();
+                      const next = await w.perform(p.projectId,{kind:"newCanvas",name:"Lienzo",folderId});
+                      w.openTab(p.projectId,{kind:"canvas",id:next.canvases!.at(-1)!.id});
+                    });
                     else void w.guard(async () => {
                       const next = await w.perform(p.projectId, { kind: "newDocument", name: "Untitled.md", folderId });
                       w.openTab(p.projectId, { kind: "markdown", id: next.markdown!.at(-1)!.id });
@@ -732,6 +766,11 @@ export default function App() {
                     </div>
                   </div>
                 )}
+                {p.canvases?.map(doc => <div className="canvas-pane" hidden={active?.kind!=="canvas" || active.id!==doc.id} key={doc.id}>
+                  <Suspense fallback={<p>Cargando lienzo…</p>}><CanvasEditor document={doc} value={w.canvasDrafts[`${p.projectId}:${doc.id}`] ?? doc.content} project={p}
+                    active={w.space===p.projectId && active?.kind==="canvas" && active.id===doc.id} disabled={locked || w.closeRequest!==null}
+                    onChange={content=>w.editCanvas(p.projectId,doc.id,content)} onOpen={target=>w.openTab(p.projectId,{kind:target.kind,id:target.id},"main")} onError={w.report}/></Suspense>
+                </div>)}
                 {p.markdown?.map(doc => markdownPane(doc, p.projectId, active?.kind === "markdown" && active.id === doc.id))}
                 {scriptPanes.filter((_, index) => mainScriptIds.has(p.scripts[index].id))}
                 <div className="grid-host" hidden={!table}>
@@ -804,6 +843,16 @@ export default function App() {
           );
         })}
       </div>
+      <PythonJobsPanel workspace={w.workspace} disabled={w.busy || w.closeRequest !== null}
+        onProject={next => {
+          w.updateProject(next);
+          w.setSpace(next.projectId);
+          w.openTab(next.projectId, { kind: "table", id: next.tables.at(-1)!.id });
+        }}
+        onDocument={next => {
+          w.commit({ ...w.workspaceRef.current, documents: w.workspaceRef.current.documents.map(d => d.documentId === next.documentId ? next : d) });
+          window.dispatchEvent(new CustomEvent("tablune-job-applied", { detail: next.documentId }));
+        }} />
       {nameRequest && (
         <div className="unsaved-backdrop">
           <form

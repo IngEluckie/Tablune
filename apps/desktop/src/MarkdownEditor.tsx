@@ -12,7 +12,7 @@ import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { markdown } from "@codemirror/lang-markdown";
 import { open } from "@tauri-apps/plugin-dialog";
 import * as ipc from "./ipc";
-import { registerMarkdownEditor, trackMarkdownOperation } from "./markdownPending";
+import { registerMarkdownEditor, trackMarkdownOperation as trackOperation } from "./markdownPending";
 import { fileLink, insertDocumentLink, linkTrigger, markdownLink, parseTabluneLink, projectLink, type MarkdownLinkTarget } from "./markdownLinks";
 import { completionDatePlugin } from "./markdownTaskDates";
 import { hasUnsupportedMarkdown, isMarkdownBreakHtml, requiresSourceMode } from "./markdownSupport";
@@ -20,6 +20,7 @@ export { requiresSourceMode } from "./markdownSupport";
 import "@milkdown/crepe/theme/common/style.css";
 import "@milkdown/crepe/theme/classic.css";
 import "./markdown.css";
+import { useEditorHistory } from "./editorHistory";
 
 interface Props {
   documentId: string;
@@ -33,6 +34,8 @@ interface Props {
   onOpenLink: (link: { kind: "project" | "file"; value: string }) => void;
 }
 export default function MarkdownEditor(props: Props) {
+  const saveTargetId = props.projectId === null ? `markdown:${props.documentId}` : `project:${props.projectId}`;
+  const trackMarkdownOperation = <T,>(operation: Promise<T>) => trackOperation(operation, saveTargetId);
   const [mode, setMode] = useState<"visual" | "source">(() => requiresSourceMode(props.value) ? "source" : "visual");
   const [linkQuery, setLinkQuery] = useState<string | null>(null);
   const linkRange = useRef<{ from: number; to: number } | null>(null);
@@ -74,7 +77,7 @@ export default function MarkdownEditor(props: Props) {
     }
     text.current = value; latest.current.onChange(value); setHistoryRevision(r => r + 1);
   };
-  useEffect(() => registerMarkdownEditor(() => flushRef.current()), []);
+  useEffect(() => registerMarkdownEditor(() => flushRef.current(), saveTargetId), [saveTargetId]);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; for (const url of blobUrls.current) URL.revokeObjectURL(url); blobUrls.current.clear(); urls.current.clear(); }; }, []);
   // Parent acknowledgements do not reset the selection, history or unconfirmed input.
   useEffect(() => { if (!editor.current && !source.current) text.current = props.value; }, [props.value]);
@@ -224,7 +227,16 @@ export default function MarkdownEditor(props: Props) {
     else if (editor.current) { editor.current.editor.action(replaceAll(next)); flushRef.current(); }
     publish(next); replaying.current = false;
     setHistoryRevision(r => r + 1);
+    if (source.current) source.current.focus();
+    else editor.current?.editor.action(ctx => ctx.get(editorViewCtx).focus());
   };
+  const historyBinding = useEditorHistory({
+    id: `markdown:${props.projectId ?? "file"}:${props.documentId}`,
+    scope: props.projectId === null ? `markdown:${props.documentId}` : `project:${props.projectId}`,
+    canUndo: historyState.current.undo.length > 0, canRedo: historyState.current.redo.length > 0,
+    disabled: props.disabled || (mode === "visual" && loading),
+    undo: () => replay(false), redo: () => replay(true),
+  });
   const switchMode = (next: typeof mode) => { flushRef.current(); historyState.current.last = 0; setMode(next); };
   const findNext = () => {
     if (!query) return;
@@ -282,7 +294,7 @@ export default function MarkdownEditor(props: Props) {
     const path = await open({ title: "Vincular archivo", filters: [{ name: "Documentos", extensions: ["md", "markdown", "csv", "tsv", "txt", "tablune"] }] });
     if (typeof path === "string") insertLink(path.split(/[\\/]/).at(-1) ?? path, fileLink(path));
   };
-  return <section className="markdown-editor" data-history={historyRevision} onClickCapture={event => {
+  return <section {...historyBinding} className="markdown-editor" data-history={historyRevision} onClickCapture={event => {
     // Links remain text-editing targets; never navigate the desktop WebView away.
     const anchor = (event.target as HTMLElement).closest("a[href]");
     if (anchor) {
@@ -303,8 +315,6 @@ export default function MarkdownEditor(props: Props) {
       <button aria-pressed={mode === "visual"} title="Type / for blocks · Select text to format" onClick={() => switchMode("visual")}>Visual</button>
       <button aria-pressed={mode === "source"} title="Markdown source · Ctrl/Cmd+S to save" onClick={() => switchMode("source")}>Markdown code</button>
       <span className="toolbar-divider" />
-      <button disabled={props.disabled || !historyState.current.undo.length} onClick={() => replay(false)}>Undo</button>
-      <button disabled={props.disabled || !historyState.current.redo.length} onClick={() => replay(true)}>Redo</button>
       <button disabled={props.disabled || (mode === "visual" && loading)} onClick={insertImage}>Insert image…</button>
       {mode === "visual" && selectedImage && <label className="markdown-image-alt">Image description <input aria-label="Image description" value={selectedImage.alt} disabled={props.disabled} onChange={event => {
         const alt = event.target.value;

@@ -38,3 +38,14 @@ it("explains CSV persistence and offers conversion, and respects read-only contr
   expect(screen.getByRole("button",{name:"Negrita"})).toHaveProperty("disabled",true);
   expect(onApply).not.toHaveBeenCalled();
 });
+it("dispatches merging, centering and splitting from the Format section",()=>{
+  const onMerge=vi.fn();render(<FormatToolbar disabled={false} controls={{available:true,summary,onApply:vi.fn(),onMerge}}/>);
+  fireEvent.click(screen.getByRole("button",{name:"Combinar celdas"}));expect(onMerge).toHaveBeenLastCalledWith("merge");
+  fireEvent.click(screen.getByRole("button",{name:"Combinar y centrar"}));expect(onMerge).toHaveBeenLastCalledWith("center");
+  fireEvent.click(screen.getByRole("button",{name:"Separar celdas"}));expect(onMerge).toHaveBeenLastCalledWith("split");
+});
+it("toggles text wrapping and resolves mixed selections to enabled",()=>{
+ const onApply=vi.fn();const {rerender}=render(<FormatToolbar disabled={false} controls={{available:true,summary:{...summary,wrapText:null},onApply}}/>);
+ const button=screen.getByRole("button",{name:"Ajustar texto"});expect(button.getAttribute("aria-pressed")).toBe("mixed");fireEvent.click(button);expect(onApply).toHaveBeenLastCalledWith({wrapText:true});
+ rerender(<FormatToolbar disabled={false} controls={{available:true,summary:{...summary,wrapText:true},onApply}}/>);fireEvent.click(button);expect(onApply).toHaveBeenLastCalledWith({wrapText:false});
+});

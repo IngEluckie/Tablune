@@ -1,0 +1,26 @@
+.canvas-editor{display:flex;flex-direction:column;min-height:0;flex:1;background:var(--surface);color:var(--text);overflow:hidden}
+.canvas-pane{display:flex;flex:1;min-height:0;overflow:hidden}.canvas-pane[hidden]{display:none}
+.canvas-toolbar{display:flex;gap:5px;align-items:center;flex-wrap:wrap;padding:7px 10px;border-bottom:1px solid var(--border);background:var(--panel-background)}
+.canvas-editor button,.canvas-editor select,.canvas-editor input,.canvas-editor textarea{color:var(--text);background:var(--control-background);border:1px solid var(--border-control);border-radius:4px;padding:5px 8px;font:inherit}
+.canvas-editor button:hover{background:var(--accent-hover)}.canvas-editor button[aria-pressed=true]{background:var(--accent-soft);border-color:var(--accent-border)}
+.canvas-editor button:disabled{opacity:.5}.canvas-editor input[type=checkbox]{width:auto}.canvas-editor input[type=color]{padding:2px;min-width:40px;height:30px}
+.canvas-host{flex:1;min-height:140px;position:relative;overflow:hidden;background:var(--grid-background)}
+.canvas-surface{width:100%;height:100%;display:block;touch-action:none;user-select:none}.canvas-pan{cursor:grab}.canvas-pan:active{cursor:grabbing}
+.canvas-grid-dot{fill:var(--border-control)}.canvas-selected-edge{fill:none;stroke:var(--focus-soft);stroke-width:8}
+.canvas-port{fill:var(--surface);stroke:var(--focus);stroke-width:1.5;cursor:crosshair}.canvas-resize{fill:var(--focus);cursor:nwse-resize}
+.canvas-marquee{fill:var(--focus-soft);stroke:var(--focus);stroke-width:1;pointer-events:none}
+.canvas-properties,.canvas-link-picker{position:absolute;right:14px;top:14px;width:246px;max-width:calc(100% - 28px);max-height:calc(100% - 28px);overflow:auto;background:var(--panel-background);border:1px solid var(--border-control);border-radius:8px;box-shadow:0 6px 22px var(--menu-shadow);z-index:3}
+.canvas-properties header,.canvas-link-picker header{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border)}
+.canvas-properties fieldset{margin:0;padding:12px;border:0;display:flex;flex-direction:column;gap:10px;min-width:0}
+.canvas-properties label{display:flex;flex-wrap:wrap;align-items:center;gap:5px;font-size:12px}.canvas-properties label>textarea{width:100%;min-height:60px;resize:vertical}.canvas-properties label>select{width:100%}
+.canvas-properties input[type=number]{width:100%;min-width:0}.canvas-prop-row{display:flex;gap:6px;flex-wrap:wrap}.canvas-prop-row>label{flex:1;min-width:60px;display:flex;flex-direction:column;align-items:stretch}.canvas-prop-row>select{min-width:0;max-width:100%}
+.canvas-target{display:flex;flex-direction:column;gap:7px;overflow-wrap:anywhere}.canvas-target small{color:var(--text-muted)}
+.canvas-link-picker{z-index:4;padding-bottom:10px;left:14px;right:auto;width:300px}.canvas-link-picker>input{width:calc(100% - 20px);margin:10px}.canvas-link-picker>button{display:block;text-align:left;width:calc(100% - 20px);margin:3px 10px}.canvas-link-picker small{display:block;color:var(--text-muted)}.canvas-link-picker p{padding:10px}
+.canvas-footer{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:5px 10px;border-top:1px solid var(--border);font-size:12px}.canvas-footer>span{flex:1;min-width:100px;color:var(--text-muted)}.canvas-footer label{display:flex;align-items:center;gap:3px}
+.canvas-empty{position:absolute;left:50%;top:45%;transform:translate(-50%,-50%);display:flex;flex-direction:column;gap:12px;text-align:center;max-width:90%;width:350px;pointer-events:none}.canvas-empty button{pointer-events:auto;align-self:center}.canvas-empty span{color:var(--text-muted)}
+.canvas-show-props{position:absolute;right:12px;top:12px}.canvas-export{position:relative;margin-left:auto}.canvas-export summary{padding:5px 8px;cursor:default}.canvas-export>div{position:absolute;right:0;top:100%;z-index:5;background:var(--panel-background);border:1px solid var(--border);padding:12px;min-width:200px;border-radius:6px;box-shadow:0 5px 18px var(--menu-shadow)}.canvas-export label{display:flex;align-items:center;gap:6px;margin-bottom:8px}
+@media(max-width:650px){.canvas-properties{width:220px}.canvas-toolbar{font-size:12px}.canvas-footer{gap:4px}}
+
+.standalone-canvas{display:flex;flex-direction:column;min-height:0;overflow:hidden}.standalone-canvas[hidden]{display:none}
+
+.canvas-draw{cursor:crosshair}

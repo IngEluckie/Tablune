@@ -1,8 +1,12 @@
+import { showPythonJobs } from "./pythonJobs";
+import PythonJobOptions from "./PythonJobOptions";
+import { flushCellEdits } from "./CsvGrid";
 import MacroPreviewResults from "./MacroPreviewResults";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import { join } from "@tauri-apps/api/path";
 import { Suspense, lazy, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
+  startPythonJob,
   applyPythonPreview,
   cancelPythonMacro,
   getPythonMacroFolder,
@@ -73,6 +77,7 @@ export default function PythonMacroPanel({
   const [savedCode, setSavedCode] = useState(STARTER_MACRO);
   const [preview, setPreview] = useState<MacroPreview | null>(null);
   const [running, setRunning] = useState(false);
+  const [timeout, setTimeoutLimit] = useState<number | null>(600);
   const [working, setWorking] = useState(false);
   const [consoleError, setConsoleError] = useState("");
   const [resultTab, setResultTab] = useState<"preview" | "console">("preview");
@@ -301,6 +306,21 @@ export default function PythonMacroPanel({
     } finally {
       setRunning(false);
     }
+  };
+
+  const runBackground = async () => {
+    setWorking(true);
+    try {
+      if (!trustAcknowledged) {
+        if (!(await ask("Python macros run with your normal user permissions and can access files or start programs. Run this code?", { title: "Trust Python macros", kind: "warning" }))) return;
+        onTrustAcknowledged();
+      }
+      await flushCellEdits();
+      const job = await startPythonJob(summary.documentId, code, sourcePath, summary.revision, timeout);
+      showPythonJobs(job.id);
+      setConsoleError("");
+    } catch (reason) { setConsoleError(String(reason)); }
+    finally { setWorking(false); }
   };
 
   const cancelRun = async () => {
@@ -574,6 +594,9 @@ export default function PythonMacroPanel({
       </div>
 
       <footer className="macro-actions">
+        <PythonJobOptions value={timeout} onChange={setTimeoutLimit} disabled={working || running} />
+        <button className="primary" disabled={working || running || !python?.available || !code.trim()} onClick={() => void runBackground()}>Run in background</button>
+        <button onClick={() => showPythonJobs()}>View jobs</button>
         {running ? (
           <button className="danger" onClick={() => void cancelRun()}>Cancel</button>
         ) : (

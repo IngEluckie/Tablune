@@ -28,6 +28,7 @@ pub struct Border {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct CellStyle {
+    pub wrap_text: bool,
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
@@ -93,6 +94,7 @@ pub struct BorderPatch {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct StylePatch {
+    pub wrap_text: Option<bool>,
     pub reset: bool,
     pub bold: Option<bool>,
     pub italic: Option<bool>,
@@ -105,6 +107,7 @@ pub struct StylePatch {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StyleSummary {
+    pub wrap_text: Option<bool>,
     pub bold: Option<bool>,
     pub italic: Option<bool>,
     pub underline: Option<bool>,
@@ -155,6 +158,9 @@ impl DocumentSession {
                 continue;
             };
             for column in range.start_column..=range.end_column {
+                if self.covered(source, column) {
+                    continue;
+                }
                 let style = self
                     .sheet
                     .styles
@@ -162,6 +168,9 @@ impl DocumentSession {
                     .cloned()
                     .unwrap_or_default();
                 if let Some(r) = &mut result {
+                    if r.wrap_text != Some(style.wrap_text) {
+                        r.wrap_text = None;
+                    }
                     if r.bold != Some(style.bold) {
                         r.bold = None;
                     }
@@ -182,6 +191,7 @@ impl DocumentSession {
                     }
                 } else {
                     result = Some(StyleSummary {
+                        wrap_text: Some(style.wrap_text),
                         bold: Some(style.bold),
                         italic: Some(style.italic),
                         underline: Some(style.underline),
@@ -193,6 +203,7 @@ impl DocumentSession {
             }
         }
         Ok(result.unwrap_or(StyleSummary {
+            wrap_text: Some(false),
             bold: Some(false),
             italic: Some(false),
             underline: Some(false),
@@ -219,6 +230,9 @@ impl DocumentSession {
                 } else {
                     after.get(&key).cloned().unwrap_or_default()
                 };
+                if let Some(v) = patch.wrap_text {
+                    style.wrap_text = v;
+                }
                 if let Some(v) = patch.bold {
                     style.bold = v;
                 }
@@ -293,6 +307,7 @@ impl DocumentSession {
             }
         }
         let change = SheetChange {
+            merges: None,
             cells: vec![],
             styles: style_changes(&self.sheet.styles, &after),
         };
@@ -377,6 +392,35 @@ mod tests {
         }])
         .unwrap();
     }
+    #[test]
+    fn wrapping_is_undoable_without_recalculating_and_summaries_ignore_covered_cells() {
+        let mut s = sheet();
+        text(&mut s, 0, 0, "=21*2");
+        calculation::calculate_for_test(&mut s, "");
+        let input = s.calculation_input_revision;
+        s.format_cells(
+            range(0, 0, 0, 0),
+            patch(serde_json::json!({"wrapText":true})),
+        )
+        .unwrap();
+        assert_eq!(s.style_summary(range(0, 0, 0, 1)).unwrap().wrap_text, None);
+        s.merge_cells(range(0, 0, 0, 1), false, false).unwrap();
+        assert_eq!(
+            s.style_summary(range(0, 0, 0, 1)).unwrap().wrap_text,
+            Some(true)
+        );
+        assert_eq!(s.calculation_input_revision, input);
+        assert_eq!(s.cell_info(0, 0).display, "42");
+        s.undo().unwrap();
+        s.undo().unwrap();
+        assert!(!s.cell_info(0, 0).style.wrap_text);
+        s.redo().unwrap();
+        assert!(s.cell_info(0, 0).style.wrap_text);
+        s.format_cells(range(0, 0, 0, 0), patch(serde_json::json!({"reset":true})))
+            .unwrap();
+        assert!(!s.cell_info(0, 0).style.wrap_text);
+    }
+
     #[test]
     fn formatting_and_its_history_preserve_formula_results_and_input_revision() {
         let mut s = sheet();

@@ -2,6 +2,8 @@
 pub mod calculation;
 #[path = "markdown.rs"]
 pub mod markdown;
+#[path = "merged_cells.rs"]
+pub mod merges;
 #[path = "projects.rs"]
 pub mod projects;
 #[path = "sheet_session.rs"]
@@ -34,6 +36,51 @@ pub(crate) const MAX_HISTORY_BYTES: usize = HISTORY_BYTES;
 static NEXT_SESSION_IDENTITY: AtomicU64 = AtomicU64::new(1);
 static NEXT_ATOMIC_WRITE: AtomicU64 = AtomicU64::new(1);
 static WORKSPACE_RECOVERY_IO: Mutex<()> = Mutex::new(());
+static FILE_PATH_OPERATIONS: std::sync::LazyLock<Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+pub(super) struct FilePathOperation(String);
+impl FilePathOperation {
+    pub(super) fn acquire(path: &Path) -> Result<Self, String> {
+        let key = canonical_key(path);
+        if !FILE_PATH_OPERATIONS
+            .lock()
+            .map_err(|e| e.to_string())?
+            .insert(key.clone())
+        {
+            return Err("This file is being opened or saved; try again when it finishes".into());
+        }
+        Ok(Self(key))
+    }
+}
+impl Drop for FilePathOperation {
+    fn drop(&mut self) {
+        if let Ok(mut paths) = FILE_PATH_OPERATIONS.lock() {
+            paths.remove(&self.0);
+        }
+    }
+}
+static SESSION_FILE_OPERATIONS: std::sync::LazyLock<Mutex<HashSet<u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+pub(crate) struct SessionFileOperation(u64);
+impl SessionFileOperation {
+    pub(crate) fn acquire(id: u64) -> Result<Self, String> {
+        if !SESSION_FILE_OPERATIONS
+            .lock()
+            .map_err(|e| e.to_string())?
+            .insert(id)
+        {
+            return Err("Wait for this document's file operation to finish".into());
+        }
+        Ok(Self(id))
+    }
+}
+impl Drop for SessionFileOperation {
+    fn drop(&mut self) {
+        if let Ok(mut operations) = SESSION_FILE_OPERATIONS.lock() {
+            operations.remove(&self.0);
+        }
+    }
+}
 
 fn next_session_identity() -> u64 {
     NEXT_SESSION_IDENTITY.fetch_add(1, AtomicOrdering::Relaxed)
@@ -42,6 +89,7 @@ fn next_session_identity() -> u64 {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentSummary {
+    pub merges: Vec<CellRange>,
     pub styled_row_count: usize,
     pub styled_column_count: usize,
     pub image_count: usize,
@@ -98,6 +146,8 @@ pub struct GridRow {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GridWindow {
+    pub calculation_revision: u64,
+    pub merged_cells: Vec<sheets::CellInfo>,
     pub document_id: u64,
     pub revision: u64,
     pub view_revision: u64,
@@ -173,6 +223,19 @@ pub struct CellInput {
     rename_all_fields = "camelCase"
 )]
 pub enum EditCommand {
+    MergeCells {
+        range: CellRange,
+        #[serde(default)]
+        center: bool,
+    },
+    UnmergeCells {
+        range: CellRange,
+    },
+    PasteMergedCells {
+        cells: Vec<sheets::SheetCellInput>,
+        range: CellRange,
+        merges: Vec<CellRange>,
+    },
     FormatCells {
         range: CellRange,
         patch: styles::StylePatch,
@@ -228,7 +291,7 @@ fn default_search_limit() -> usize {
     10_000
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CellRange {
     pub start_row: usize,
@@ -427,6 +490,7 @@ struct EditRecord {
 /// Only changed metadata participates in undo; cached values elsewhere remain owned by the sheet.
 #[derive(Debug, Clone, Serialize)]
 struct SheetChange {
+    merges: Option<(Vec<CellRange>, Vec<CellRange>)>,
     styles: styles::StyleChanges,
     cells: Vec<(
         String,
@@ -449,11 +513,16 @@ impl SheetChange {
             }
         }
         Self {
+            merges: (before.merges != after.merges)
+                .then(|| (before.merges.clone(), after.merges.clone())),
             cells,
             styles: styles::style_changes(&before.styles, &after.styles),
         }
     }
     fn apply(&self, target: &mut SheetData, forward: bool) {
+        if let Some((before, after)) = &self.merges {
+            target.merges = if forward { after } else { before }.clone();
+        }
         for (key, before, after) in &self.styles {
             if let Some(style) = if forward { after } else { before } {
                 target.styles.insert(key.clone(), style.clone());
@@ -686,6 +755,7 @@ impl DocumentSession {
     pub(crate) fn summary(&self) -> DocumentSummary {
         let header_names = self.header_names();
         DocumentSummary {
+            merges: self.sheet.merges.clone(),
             styled_row_count: self
                 .sheet
                 .styles
@@ -920,6 +990,19 @@ impl DocumentSession {
             })
             .collect();
         GridWindow {
+            calculation_revision: self.calculation_revision,
+            merged_cells: self
+                .sheet
+                .merges
+                .iter()
+                .filter(|m| {
+                    m.start_row < row_start.saturating_add(row_count)
+                        && m.end_row >= row_start
+                        && m.start_column < column_start.saturating_add(column_count)
+                        && m.end_column >= column_start
+                })
+                .map(|m| self.cell_info(m.start_row, m.start_column))
+                .collect(),
             document_id: self.identity,
             revision: self.revision,
             view_revision: self.view_revision,
@@ -1160,6 +1243,9 @@ impl DocumentSession {
             ));
         }
         if let Some(change) = &record.sheet {
+            if let Some((_, after)) = &change.merges {
+                merges::validate(after)?;
+            }
             estimated_bytes += serde_json::to_vec(change).map_err(|e| e.to_string())?.len();
         }
         if estimated_bytes > HISTORY_BYTES {
@@ -1200,6 +1286,7 @@ impl DocumentSession {
                 expected_revision, self.revision
             ));
         }
+        self.check_merge_structure(&command)?;
         if self.project_id.is_some() {
             let structure = match &command {
                 EditCommand::InsertRows { index, count } if *index > self.document.row_count() => {
@@ -1238,7 +1325,7 @@ impl DocumentSession {
                     },
                 );
                 let change = SheetChange::new(&self.sheet, &after);
-                if change.cells.is_empty() && change.styles.is_empty() {
+                if change.cells.is_empty() && change.styles.is_empty() && change.merges.is_none() {
                     return Ok(());
                 }
                 return self.commit(
@@ -1253,6 +1340,13 @@ impl DocumentSession {
             }
         }
         match command {
+            EditCommand::MergeCells { range, center } => self.merge_cells(range, center, false)?,
+            EditCommand::UnmergeCells { range } => self.merge_cells(range, false, true)?,
+            EditCommand::PasteMergedCells {
+                cells,
+                range,
+                merges,
+            } => self.paste_merged_cells(cells, range, merges)?,
             EditCommand::FormatCells { range, patch } => self.format_cells(range, patch)?,
             EditCommand::SetSheetCells { cells } => {
                 self.edit_sheet_cells(cells)?;
@@ -1271,6 +1365,9 @@ impl DocumentSession {
                 let mut after = Vec::new();
                 let mut bytes = 0;
                 for cell in cells {
+                    if self.covered(cell.row, cell.column) && !cell.value.is_empty() {
+                        return Err("Edita el contenido desde la esquina superior izquierda de la combinación".into());
+                    }
                     let old = self.raw_cell(cell.row, cell.column).to_string();
                     if old != cell.value {
                         bytes += old.len() + cell.value.len() + 32;
@@ -2180,6 +2277,7 @@ pub fn session_open(
     path: String,
 ) -> Result<DocumentSummary, String> {
     let path_buf = PathBuf::from(&path);
+    let _path = FilePathOperation::acquire(&path_buf)?;
     projects::ensure_not_project_path(&state, &path_buf)?;
     markdown::ensure_unclaimed(&state, &path_buf)?;
     if let Some(handle) = find_document_by_path(&state, &path_buf, None)? {
@@ -2214,6 +2312,10 @@ pub fn session_close(
     document_id: u64,
     discard_unsaved: bool,
 ) -> Result<WorkspaceSummary, String> {
+    let _operation = SessionFileOperation::acquire(document_id)?;
+    if app.state::<crate::python_macros::jobs::PythonJobs>().has_active(None, Some(document_id))? {
+        return Err("Cancel this table’s jobs in Python jobs before closing".into());
+    }
     let handle = document_handle(&state, document_id)?;
     if lock_document(&handle)?.project_id.is_some() {
         return Err("Use the project commands for this table".into());
@@ -2227,38 +2329,54 @@ pub fn session_close(
 }
 
 #[tauri::command]
-pub fn session_save(
+pub async fn session_save(
     app: AppHandle,
-    state: State<'_, WorkspaceState>,
     document_id: u64,
     path: Option<String>,
 ) -> Result<DocumentSummary, String> {
-    let handle = document_handle(&state, document_id)?;
-    if lock_document(&handle)?.project_id.is_some() {
-        return Err("Use the project commands for this table".into());
-    }
-    let destination = {
-        let session = lock_document(&handle)?;
-        path.map(PathBuf::from)
-            .or_else(|| session.path.clone())
-            .ok_or_else(|| "a destination path is required".to_string())?
-    };
-    ensure_path_available(&state, &destination, document_id)?;
-    let summary = {
-        let mut session = lock_document(&handle)?;
-        tablune_csv::write_path(&destination, &session.document, session.dialect)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<WorkspaceState>();
+        let _operation = SessionFileOperation::acquire(document_id)?;
+        let handle = document_handle(&state, document_id)?;
+        if lock_document(&handle)?.project_id.is_some() {
+            return Err("Use the project commands for this table".into());
+        }
+        let destination = {
+            let session = lock_document(&handle)?;
+            path.map(PathBuf::from)
+                .or_else(|| session.path.clone())
+                .ok_or_else(|| "a destination path is required".to_string())?
+        };
+        let _path = FilePathOperation::acquire(&destination)?;
+        ensure_path_available(&state, &destination, document_id)?;
+        let (document, dialect, saved_state, header, types) = {
+            let session = lock_document(&handle)?;
+            (
+                session.document.clone(),
+                session.dialect,
+                session.current_state,
+                session.header_enabled,
+                session.column_types.clone(),
+            )
+        };
+        tablune_csv::write_path(&destination, &document, dialect)
             .map_err(|error| error.to_string())?;
-        finalize_successful_save(&mut session, destination, |session| {
-            save_file_preferences(&app, session)
-        })
-    };
-    if let Err(error) = write_workspace_recovery_internal(&app, &state, None) {
-        report_nonfatal("refreshing recovery after save", &error);
-    }
-    if let Some(path) = &summary.path {
-        projects::remember(&app, path, "csv");
-    }
-    Ok(summary)
+        let summary = {
+            let mut session = lock_document(&handle)?;
+            finalize_successful_save(&mut session, destination, saved_state, |session| {
+                save_file_preferences_for(&app, session.path.as_deref(), header, &types)
+            })
+        };
+        if let Err(error) = write_workspace_recovery_internal(&app, &state, None) {
+            report_nonfatal("refreshing recovery after save", &error);
+        }
+        if let Some(path) = &summary.path {
+            projects::remember(&app, path, "csv");
+        }
+        Ok(summary)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2315,6 +2433,7 @@ pub fn session_rename(
     document_id: u64,
     new_name: String,
 ) -> Result<DocumentSummary, String> {
+    let _operation = SessionFileOperation::acquire(document_id)?;
     let handle = document_handle(&state, document_id)?;
     if lock_document(&handle)?.project_id.is_some() {
         return Err("Use the project commands for this table".into());
@@ -2327,6 +2446,7 @@ pub fn session_rename(
         .parent()
         .ok_or_else(|| "the document does not have a parent folder".to_string())?
         .join(new_name.trim());
+    let _path = FilePathOperation::acquire(&destination)?;
     ensure_path_available(&state, &destination, document_id)?;
     let summary = {
         let mut session = lock_document(&handle)?;
@@ -2411,6 +2531,9 @@ pub fn session_set_view(
 ) -> Result<DocumentSummary, String> {
     let handle = document_handle(&state, document_id)?;
     let mut session = lock_document(&handle)?;
+    if !session.sheet.merges.is_empty() && (!view.sorts.is_empty() || !view.filters.is_empty()) {
+        return Err("Separa las celdas combinadas antes de ordenar o filtrar".into());
+    }
     session.view = view;
     if session.project_id.is_some() {
         session.revision += 1;
@@ -2763,10 +2886,11 @@ fn save_file_preferences_for(
 fn finalize_successful_save(
     session: &mut DocumentSession,
     destination: PathBuf,
+    saved_state: u64,
     persist_preferences: impl FnOnce(&DocumentSession) -> Result<(), String>,
 ) -> DocumentSummary {
     session.path = Some(destination);
-    session.saved_state = session.current_state;
+    session.saved_state = saved_state;
     if let Err(error) = persist_preferences(session) {
         report_nonfatal("saving preferences after the CSV was saved", &error);
     }
@@ -3404,13 +3528,45 @@ mod tests {
             )
             .unwrap();
         let destination = PathBuf::from("/tmp/saved.csv");
-        let summary = finalize_successful_save(&mut session, destination.clone(), |_| {
-            Err("simulated preferences failure".to_string())
-        });
+        let saved_state = session.current_state;
+        let summary =
+            finalize_successful_save(&mut session, destination.clone(), saved_state, |_| {
+                Err("simulated preferences failure".to_string())
+            });
 
         assert!(!summary.dirty);
         assert_eq!(session.path.as_ref(), Some(&destination));
         assert_eq!(session.saved_state, session.current_state);
+    }
+
+    #[test]
+    fn csv_save_acknowledges_only_the_written_state_and_preserves_history() {
+        let mut session = DocumentSession::default();
+        for value in ["snapshot", "later edit"] {
+            session
+                .apply_edit(
+                    EditCommand::SetCells {
+                        cells: vec![CellInput {
+                            row: 0,
+                            column: 0,
+                            value: value.into(),
+                        }],
+                    },
+                    session.revision,
+                )
+                .unwrap();
+        }
+        let summary =
+            finalize_successful_save(&mut session, PathBuf::from("/tmp/snapshot.csv"), 1, |_| {
+                Ok(())
+            });
+        assert!(summary.dirty);
+        assert!(summary.can_undo);
+        assert_eq!(session.cell_value(0, 0), "later edit");
+        session.undo().unwrap();
+        assert_eq!(session.cell_value(0, 0), "snapshot");
+        assert!(!session.summary().dirty);
+        assert!(session.summary().can_redo);
     }
 
     #[test]

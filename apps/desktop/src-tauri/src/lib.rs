@@ -39,6 +39,8 @@ struct ExitPermission(AtomicBool);
 
 #[tauri::command]
 fn exit_application(app: tauri::AppHandle) {
+    app.state::<python_macros::jobs::PythonJobs>().shutdown();
+    let _ = python_macros::python_cancel_macro(app.state::<python_macros::PythonRuntimeState>());
     python_macros::calculation_worker::shutdown();
     app.state::<ExitPermission>()
         .0
@@ -53,6 +55,7 @@ pub fn run() {
         .manage(ExitPermission::default())
         .manage(session::WorkspaceState::default())
         .manage(python_macros::PythonRuntimeState::default())
+        .manage(python_macros::jobs::PythonJobs::default())
         .menu(|app| {
             let menu = tauri::menu::Menu::default(app)?;
             // macOS's predefined Quit sends terminate: directly. Route our own
@@ -79,6 +82,17 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             exit_application,
+            python_macros::jobs::python_start_project_job,
+            python_macros::jobs::python_start_job,
+            python_macros::jobs::python_jobs,
+            python_macros::jobs::python_job_detail,
+            python_macros::jobs::python_cancel_job,
+            python_macros::jobs::python_discard_job,
+            python_macros::jobs::python_accept_job,
+            projects::canvas::canvas_new,
+            projects::canvas::canvas_image_import,
+            projects::canvas::canvas_image_read,
+            projects::canvas::canvas_export,
             session::markdown::markdown_action,
             session::markdown::markdown_image_import,
             session::markdown::markdown_image_read,

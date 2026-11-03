@@ -1,0 +1,21 @@
+.python-jobs { flex:none; min-height:30px; border-top:1px solid var(--border-control); background:var(--panel-background); font-size:12px; }
+.python-jobs.expanded { height:320px; max-height:48vh; display:flex; flex-direction:column; }
+.python-jobs-bar { display:flex; align-items:center; gap:16px; min-height:30px; padding:2px 8px; }
+.python-jobs button { border:1px solid var(--border-control); border-radius:4px; background:var(--control-background); padding:4px 8px; }
+.python-jobs button:disabled { opacity:.5; }
+.python-jobs-bar > button { border:0; background:transparent; font-weight:600; }
+.python-jobs-bar > span,.python-job-meta { color:var(--text-muted); }
+.python-jobs-content { display:grid; grid-template-columns:minmax(180px,260px) minmax(0,1fr); flex:1; min-height:0; }
+.python-jobs-list { overflow:auto; border-right:1px solid var(--border); padding:6px; }
+.python-jobs-list button { display:flex; flex-direction:column; align-items:flex-start; gap:4px; width:100%; margin-bottom:5px; text-align:left; overflow-wrap:anywhere; }
+.python-jobs-list button[aria-pressed="true"] { border-color:var(--accent); background:var(--accent-soft); }
+.python-job-detail { display:flex; flex-direction:column; min-width:0; min-height:0; padding:8px 12px; overflow:auto; }
+.python-job-heading { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.python-job-heading strong { margin-right:auto; }
+.python-job-meta { margin:6px 0; overflow-wrap:anywhere; }
+.python-job-tabs { display:flex; gap:5px; margin:4px 0; }
+.python-job-tabs [aria-selected="true"] { color:var(--accent); border-color:var(--accent); }
+.python-job-output { flex:1; min-height:70px; overflow:auto; }
+.python-job-output pre { margin:0; padding:8px; height:100%; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; background:var(--surface-subtle); font:12px/1.5 ui-monospace,monospace; }
+.python-jobs .shell-error,.python-jobs .macro-warning { margin:4px 0; white-space:pre-wrap; max-height:70px; overflow:auto; }
+@media (max-width:700px) { .python-jobs-bar > span { display:none; } .python-jobs-content { grid-template-columns:160px minmax(0,1fr); } }

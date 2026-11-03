@@ -4,6 +4,8 @@ import type { CellBorder, StylePatch, StyleSummary } from "./types";
 export interface FormatControls {
   available: boolean;
   summary: StyleSummary | null;
+  onMerge?: (action:"merge"|"center"|"split")=>void;
+  mergeDisabled?:boolean;
   onApply: (patch: StylePatch) => void;
   onCreateProject?: () => void;
 }
@@ -23,7 +25,7 @@ function ColorPicker({ label, value, onChange, disabled, reset }: { label: strin
 }
 export default function FormatToolbar({ controls, disabled }: { controls: FormatControls; disabled: boolean }) {
   const [border, setBorder] = useState<CellBorder>({ color: "#64748b", width: 1, line: "solid" });
-  if (!controls.available) return <div className="ribbon-group format-csv-notice"><span>CSV conserva datos, pero no estilos. Usa un proyecto .tablune para guardar formatos.</span>{controls.onCreateProject && <button disabled={disabled} onClick={controls.onCreateProject}>Crear proyecto desde este CSV…</button>}</div>;
+  if (!controls.available) return <div className="ribbon-group format-csv-notice"><span>CSV conserva datos, pero no estilos ni combinaciones. Usa un proyecto .tablune para guardar formatos.</span>{controls.onCreateProject && <button disabled={disabled} onClick={controls.onCreateProject}>Crear proyecto desde este CSV…</button>}</div>;
   const state = controls.summary;
   const locked = disabled || !state;
   return <div className="ribbon-group format-toolbar" aria-label="Formato de celdas" data-format-tools>
@@ -44,6 +46,12 @@ export default function FormatToolbar({ controls, disabled }: { controls: Format
     </div>
     <div className="format-section" role="group" aria-label="Alineación">
       {([['left', 'Izquierda', '⇤'], ['center', 'Centro', '↔'], ['right', 'Derecha', '⇥']] as const).map(([alignment, label, text]) => <button key={alignment} disabled={locked} title={label} aria-label={`Alinear: ${label}`} aria-pressed={state?.alignment === alignment} onClick={() => controls.onApply({ alignment })}>{text}</button>)}
+    </div>
+    <div className="format-section"><button disabled={locked} aria-label="Ajustar texto" aria-pressed={state?.wrapText===null?"mixed":state?.wrapText??false} onClick={()=>controls.onApply({wrapText:state?.wrapText!==true})}>Ajustar texto</button></div>
+    <div className="format-section" role="group" aria-label="Combinar celdas">
+      <button disabled={disabled||controls.mergeDisabled||!controls.onMerge} onClick={()=>controls.onMerge?.("merge")}>Combinar celdas</button>
+      <button disabled={disabled||controls.mergeDisabled||!controls.onMerge} onClick={()=>controls.onMerge?.("center")}>Combinar y centrar</button>
+      <button disabled={disabled||controls.mergeDisabled||!controls.onMerge} onClick={()=>controls.onMerge?.("split")}>Separar celdas</button>
     </div>
     <div className="format-section">
       <select disabled={locked} aria-label="Estilos rápidos" value="" onChange={e => { if (e.target.value) controls.onApply(STYLE_PRESETS[e.target.value]); }}><option value="" disabled>Estilos rápidos…</option>{Object.keys(STYLE_PRESETS).map(name => <option key={name}>{name}</option>)}</select>
